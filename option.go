@@ -1,6 +1,7 @@
 package mitmpgo
 
 import (
+	"context"
 	"crypto/x509"
 	"net"
 	"time"
@@ -23,6 +24,8 @@ func (f OptionFunc) apply(o *options) { f(o) }
 
 // options holds all configuration parameters for the MITM proxy handler.
 type options struct {
+	streamBaseCtx context.Context // Stream Base Context for h2 connection
+
 	proxy         string      // Upstream proxy URL (e.g., "http://127.0.0.1:8080")
 	caCertPath    string      // Path to the CA certificate file for TLS interception
 	caKeyPath     string      // Path to the CA private key file for TLS interception
@@ -60,11 +63,25 @@ func newOptions(opt ...Option) *options {
 	options := &options{
 		dialer:                &net.Dialer{Timeout: 15 * time.Second},
 		wsMaxFramesPerForward: 2048,
+		streamBaseCtx:         context.Background(),
 	}
 	for _, o := range opt {
 		o.apply(options)
 	}
 	return options
+}
+
+// WithStreamBaseContext configures h2 connection stream base context.
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithStreamBaseContext(context.Background()),
+//	)
+func WithStreamBaseContext(baseCtx context.Context) Option {
+	return OptionFunc(func(o *options) {
+		o.streamBaseCtx = baseCtx
+	})
 }
 
 // WithProxy configures an upstream proxy server for outbound connections.

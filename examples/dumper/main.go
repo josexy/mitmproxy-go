@@ -132,12 +132,15 @@ func main() {
 		)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	handler, err := mitmpgo.NewMitmProxyHandler(
 		mitmpgo.WithCACertPath(caCertPath),
 		mitmpgo.WithCAKeyPath(caKeyPath),
 		mitmpgo.WithHTTPInterceptor(httpInterceptor),
 		mitmpgo.WithWebsocketInterceptor(websocketInterceptor),
 		mitmpgo.WithErrorHandler(errHandler),
+		mitmpgo.WithStreamBaseContext(ctx),
 		// mitmpgo.WithClientCert("127.0.0.1", mitmpgo.ClientCert{
 		// 	CertPath: "certs/client.crt",
 		// 	KeyPath:  "certs/client.key",
@@ -158,6 +161,7 @@ func main() {
 
 	listenAddr := fmt.Sprintf("%s:%d", "127.0.0.1", port)
 	var closeFn func()
+
 	switch mitmMode {
 	case "socks5":
 		ln, err := net.Listen("tcp", listenAddr)
@@ -172,14 +176,15 @@ func main() {
 					return
 				}
 				go func() {
-					handler.ServeSOCKS5(context.Background(), conn)
+					handler.ServeSOCKS5(ctx, conn)
 				}()
 			}
 		}()
 	default:
 		server := &http.Server{
-			Addr:    listenAddr,
-			Handler: handler,
+			Addr:        listenAddr,
+			Handler:     handler,
+			BaseContext: func(l net.Listener) context.Context { return ctx },
 		}
 		closeFn = func() { server.Close() }
 		go func() {
@@ -197,7 +202,8 @@ func main() {
 	handler.Cleanup()
 	slog.Info("exit")
 	closeFn()
-	time.Sleep(time.Millisecond * 100)
+	cancel()
+	time.Sleep(time.Millisecond * 500)
 }
 
 func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {

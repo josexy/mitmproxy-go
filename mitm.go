@@ -660,7 +660,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		// and finally we only need to get the [http.Request] and process the [http.ResponseWriter].
 		// Early process http2
 		if state.NegotiatedProtocol == http2.NextProtoTLS {
-			newCtx, cancel := context.WithCancel(context.Background())
+			newCtx, cancel := context.WithCancel(r.streamBaseCtx)
 			go func() {
 				connCtx.local.waitClose()
 				cancel()
@@ -673,7 +673,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		}
 	}
 
-	ctx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, srcConn, dstConn, tlsRequest)
+	ctx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, srcConn, tlsRequest)
 	if err != nil || earlyDone {
 		return
 	}
@@ -691,7 +691,7 @@ func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.Respons
 			return false, err
 		}
 		connCtx := ctx.Value(connContextKey).(*biConnContext)
-		newCtx, cancel := context.WithCancel(context.Background())
+		newCtx, cancel := context.WithCancel(r.streamBaseCtx)
 		go func() {
 			connCtx.local.waitClose()
 			cancel()
@@ -711,7 +711,7 @@ func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.Respons
 			return false, err
 		}
 		connCtx := ctx.Value(connContextKey).(*biConnContext)
-		newCtx, cancel := context.WithCancel(context.Background())
+		newCtx, cancel := context.WithCancel(r.streamBaseCtx)
 		go func() {
 			connCtx.local.waitClose()
 			cancel()
@@ -727,7 +727,7 @@ func (r *mitmProxyHandler) handleH2CRequest(ctx context.Context, rw http.Respons
 	return false, nil
 }
 
-func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn, dstConn net.Conn, tlsRequest bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
+func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn net.Conn, tlsRequest bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
 	reqCtx, _ := FromRequestContext(ctx)
 
 	// Read the http request for https/wss via tls tunnel
@@ -859,13 +859,18 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	}
 
 	errCh := make(chan error, 2)
-	relayWSMessage := func(dir WSDirection, src, dst *websocket.Conn) {
+	relayWSMessage := func(ctx context.Context, dir WSDirection, src, dst *websocket.Conn) {
 		defer func() {
 			if fw != nil {
 				fw.close()
 			}
 		}()
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			msgType, buffer, err := readBufferFromWSConn(src)
 			if err != nil {
 				errCh <- err
@@ -885,8 +890,8 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 			}
 		}
 	}
-	go relayWSMessage(Send, wsSrcConn, wsDstConn)
-	go relayWSMessage(Receive, wsDstConn, wsSrcConn)
+	go relayWSMessage(ctx, Send, wsSrcConn, wsDstConn)
+	go relayWSMessage(ctx, Receive, wsDstConn, wsSrcConn)
 	err = <-errCh
 	cancel(err)
 	return
