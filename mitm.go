@@ -1,4 +1,4 @@
-package mitmpgo
+package mitmproxy
 
 import (
 	"bufio"
@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/josexy/mitmpgo/buf"
-	"github.com/josexy/mitmpgo/internal/cert"
-	"github.com/josexy/mitmpgo/internal/iocopy"
-	"github.com/josexy/mitmpgo/metadata"
+	"github.com/josexy/mitmproxy-go/buf"
+	"github.com/josexy/mitmproxy-go/internal/cert"
+	"github.com/josexy/mitmproxy-go/internal/iocopy"
+	"github.com/josexy/mitmproxy-go/metadata"
 	"github.com/josexy/websocket"
 	"golang.org/x/net/http2"
 )
@@ -38,7 +38,7 @@ type contextKey struct {
 	name string
 }
 
-func (k *contextKey) String() string { return "mitmpgo context value " + k.name }
+func (k *contextKey) String() string { return "mitmproxy-go context value " + k.name }
 
 var (
 	connContextKey = &contextKey{"connection-context"}

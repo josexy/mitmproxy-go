@@ -1,4 +1,4 @@
-package mitmpgo
+package mitmproxy
 
 import (
 	"crypto/rsa"
@@ -7,8 +7,8 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/josexy/mitmpgo/internal/cache"
-	"github.com/josexy/mitmpgo/internal/cert"
+	"github.com/josexy/mitmproxy-go/internal/cache"
+	"github.com/josexy/mitmproxy-go/internal/cert"
 )
 
 var errNoPriKey = errors.New("no available private key")

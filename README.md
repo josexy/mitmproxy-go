@@ -1,4 +1,4 @@
-# mitmpgo
+# mitmproxy-go 
 
 An easy-use and flexible Man-In-The-Middle (MITM) proxy library for Go that enables transparent interception and inspection of HTTP, HTTPS, HTTP/2, and WebSocket traffic.
 
@@ -22,7 +22,7 @@ An easy-use and flexible Man-In-The-Middle (MITM) proxy library for Go that enab
 ## Installation
 
 ```bash
-go get github.com/josexy/mitmpgo
+go get github.com/josexy/mitmproxy-go
 ```
 
 ## Quick Start
@@ -38,14 +38,14 @@ import (
     "log"
     "net/http"
 
-    "github.com/josexy/mitmpgo"
+    "github.com/josexy/mitmproxy-go"
 )
 
 func main() {
     // Create MITM proxy handler
-    handler, err := mitmpgo.NewMitmProxyHandler(
-        mitmpgo.WithCACertPath("certs/ca.crt"),
-        mitmpgo.WithCAKeyPath("certs/ca.key"),
+    handler, err := mitmproxy.NewMitmProxyHandler(
+        mitmproxy.WithCACertPath("certs/ca.crt"),
+        mitmproxy.WithCAKeyPath("certs/ca.key"),
     )
     if err != nil {
         log.Fatal(err)
@@ -60,7 +60,7 @@ func main() {
 ### With HTTP Interceptor
 
 ```go
-httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
     // Log request details
     fmt.Printf("→ %s %s\n", req.Method, req.URL)
     fmt.Printf("  Host: %s\n", req.Host)
@@ -78,17 +78,17 @@ httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.
     return resp, nil
 }
 
-handler, err := mitmpgo.NewMitmProxyHandler(
-    mitmpgo.WithCACertPath("certs/ca.crt"),
-    mitmpgo.WithCAKeyPath("certs/ca.key"),
-    mitmpgo.WithHTTPInterceptor(httpInterceptor),
+handler, err := mitmproxy.NewMitmProxyHandler(
+    mitmproxy.WithCACertPath("certs/ca.crt"),
+    mitmproxy.WithCAKeyPath("certs/ca.key"),
+    mitmproxy.WithHTTPInterceptor(httpInterceptor),
 )
 ```
 
 ### With WebSocket Interceptor
 
 ```go
-websocketInterceptor := func(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmpgo.WebsocketFramesWatcher) {
+websocketInterceptor := func(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
     // Log WebSocket messages
     log.Printf("WS url: %s", req.URL.String())
 
@@ -104,10 +104,10 @@ websocketInterceptor := func(ctx context.Context, req *http.Request, rsp *http.R
     }
 }
 
-handler, err := mitmpgo.NewMitmProxyHandler(
-    mitmpgo.WithCACertPath("certs/ca.crt"),
-    mitmpgo.WithCAKeyPath("certs/ca.key"),
-    mitmpgo.WithWebsocketInterceptor(websocketInterceptor),
+handler, err := mitmproxy.NewMitmProxyHandler(
+    mitmproxy.WithCACertPath("certs/ca.crt"),
+    mitmproxy.WithCAKeyPath("certs/ca.key"),
+    mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
 )
 ```
 
@@ -115,9 +115,9 @@ handler, err := mitmpgo.NewMitmProxyHandler(
 
 ```go
 func main() {
-    handler, err := mitmpgo.NewMitmProxyHandler(
-        mitmpgo.WithCACertPath("certs/ca.crt"),
-        mitmpgo.WithCAKeyPath("certs/ca.key"),
+    handler, err := mitmproxy.NewMitmProxyHandler(
+        mitmproxy.WithCACertPath("certs/ca.crt"),
+        mitmproxy.WithCAKeyPath("certs/ca.key"),
     )
     if err != nil {
         log.Fatal(err)
@@ -152,44 +152,44 @@ func main() {
 
 ```go
 // Specify CA certificate and key for TLS interception
-mitmpgo.WithCACertPath("path/to/ca.crt")
-mitmpgo.WithCAKeyPath("path/to/ca.key")
+mitmproxy.WithCACertPath("path/to/ca.crt")
+mitmproxy.WithCAKeyPath("path/to/ca.key")
 
 // Use an upstream proxy
-mitmpgo.WithProxy("http://127.0.0.1:8080")
+mitmproxy.WithProxy("http://127.0.0.1:8080")
 
 // Disable upstream proxy
-mitmpgo.WithDisableProxy()
+mitmproxy.WithDisableProxy()
 
 // Add custom root CA certificates
-mitmpgo.WithRootCAs("path/to/root-ca1.crt", "path/to/root-ca2.crt")
+mitmproxy.WithRootCAs("path/to/root-ca1.crt", "path/to/root-ca2.crt")
 
 // Configure certificate cache pool
-mitmpgo.WithCertCachePool(2048, 30, 15)
+mitmproxy.WithCertCachePool(2048, 30, 15)
 
 // Custom dialer with timeout
-mitmpgo.WithDialer(&net.Dialer{
+mitmproxy.WithDialer(&net.Dialer{
     Timeout: 30 * time.Second,
 })
 
 // Maximum channel size of WebSocket frames
-mitmpgo.WithMaxWebsocketFramesPerForward(4096)
+mitmproxy.WithMaxWebsocketFramesPerForward(4096)
 ```
 
 ### Interceptor Options
 
 ```go
 // Set HTTP interceptor
-mitmpgo.WithHTTPInterceptor(httpInterceptor)
+mitmproxy.WithHTTPInterceptor(httpInterceptor)
 
 // Set WebSocket interceptor
-mitmpgo.WithWebsocketInterceptor(websocketInterceptor)
+mitmproxy.WithWebsocketInterceptor(websocketInterceptor)
 
 // Chain multiple HTTP interceptors (executed in order)
-mitmpgo.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
+mitmproxy.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
 
 // Set error handler
-mitmpgo.WithErrorHandler(func(ec mitmpgo.ErrorContext) {
+mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {
     log.Printf("Error: %v", ec.Error)
 })
 ```
@@ -198,27 +198,27 @@ mitmpgo.WithErrorHandler(func(ec mitmpgo.ErrorContext) {
 
 ```go
 // Skip SSL verification when connecting to servers (not recommended for production)
-mitmpgo.WithSkipVerifySSLFromServer()
+mitmproxy.WithSkipVerifySSLFromServer()
 
 // mTLS client-authentication
-mitmpgo.WithClientCert("example.com", mitmpgo.ClientCert{CertPath: "certs/client.crt", KeyPath: "certs/client.key" })
+mitmproxy.WithClientCert("example.com", mitmproxy.ClientCert{CertPath: "certs/client.crt", KeyPath: "certs/client.key" })
 ```
 
 ### Protocol Options
 
 ```go
 // Disable HTTP/2 support (use HTTP/1.1 only)
-mitmpgo.WithDisableHTTP2()
+mitmproxy.WithDisableHTTP2()
 ```
 
 ### Domain Filtering
 
 ```go
 // Only intercept specific hosts (supports wildcards)
-mitmpgo.WithIncludeHosts("api.example.com", "*.example.org", "example.net")
+mitmproxy.WithIncludeHosts("api.example.com", "*.example.org", "example.net")
 
 // Exclude specific hosts from interception (supports wildcards)
-mitmpgo.WithExcludeHosts("*.cdn.com", "static.example.com")
+mitmproxy.WithExcludeHosts("*.cdn.com", "static.example.com")
 ```
 
 ## Metadata Access
@@ -226,7 +226,7 @@ mitmpgo.WithExcludeHosts("*.cdn.com", "static.example.com")
 Interceptors can access metadata from the context:
 
 ```go
-httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
     // Extract metadata from context
     mdCtx, _ := metadata.FromContext(ctx)
     md := mdCtx.MD()

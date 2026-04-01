@@ -1,10 +1,10 @@
-package mitmpgo
+package mitmproxy
 
 import (
 	"context"
 	"net/http"
 
-	"github.com/josexy/mitmpgo/buf"
+	"github.com/josexy/mitmproxy-go/buf"
 )
 
 // WSDirection indicates the direction of a WebSocket message

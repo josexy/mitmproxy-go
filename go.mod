@@ -1,4 +1,4 @@
-module github.com/josexy/mitmpgo
+module github.com/josexy/mitmproxy-go
 
 go 1.25.4
 

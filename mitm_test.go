@@ -1,4 +1,4 @@
-package mitmpgo_test
+package mitmproxy_test
 
 import (
 	"context"
@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmpgo"
-	"github.com/josexy/mitmpgo/internal/cert"
+	"github.com/josexy/mitmproxy-go"
+	"github.com/josexy/mitmproxy-go/internal/cert"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -111,7 +111,7 @@ func testHTTPRequest(typ, proxyAddr, targetAddr string) (statusCode int, proto s
 	if err != nil {
 		return
 	}
-	proxyDialer := mitmpgo.NewProxyDialer(u, nil)
+	proxyDialer := mitmproxy.NewProxyDialer(u, nil)
 	conn, err := proxyDialer.Dial("tcp", u2.Host)
 	if err != nil {
 		return
@@ -186,13 +186,13 @@ func genServerCertAndKey() {
 	os.WriteFile(serverKeyPath, keyPem, 0644)
 }
 
-func startmitmpgo(t *testing.T, interceptor mitmpgo.HTTPInterceptor) mitmpgo.MitmProxyHandler {
-	handler, err := mitmpgo.NewMitmProxyHandler(
-		mitmpgo.WithCACertPath(mitmCertPath),
-		mitmpgo.WithCAKeyPath(mitmKeyPath),
-		mitmpgo.WithRootCAs(serverCertPath),
-		mitmpgo.WithHTTPInterceptor(interceptor),
-		mitmpgo.WithErrorHandler(func(ec mitmpgo.ErrorContext) {
+func startmitmpgo(t *testing.T, interceptor mitmproxy.HTTPInterceptor) mitmproxy.MitmProxyHandler {
+	handler, err := mitmproxy.NewMitmProxyHandler(
+		mitmproxy.WithCACertPath(mitmCertPath),
+		mitmproxy.WithCAKeyPath(mitmKeyPath),
+		mitmproxy.WithRootCAs(serverCertPath),
+		mitmproxy.WithHTTPInterceptor(interceptor),
+		mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {
 			t.Log(ec.RemoteAddr, ec.Hostport, ec.Error)
 		}),
 	)
@@ -208,7 +208,7 @@ func TestMitmProxyHandler(t *testing.T) {
 	genServerCertAndKey()
 	defer os.RemoveAll(certdir)
 
-	handler := startmitmpgo(t, func(ctx context.Context, req *http.Request, hi mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+	handler := startmitmpgo(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
 		resp, err := hi.Invoke(req)
 		t.Logf("url: %s, req_proto: %s, rsp_proto: %s", req.URL, req.Proto, resp.Proto)
 		return resp, err

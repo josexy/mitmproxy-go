@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/josexy/mitmpgo"
+	"github.com/josexy/mitmproxy-go"
 )
 
 func main() {
@@ -23,10 +23,10 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
-	handler, err := mitmpgo.NewMitmProxyHandler(
-		mitmpgo.WithCACertPath(caCertPath),
-		mitmpgo.WithCAKeyPath(caKeyPath),
-		mitmpgo.WithChainHTTPInterceptor(httpInterceptor1, httpInterceptor2, httpInterceptor3),
+	handler, err := mitmproxy.NewMitmProxyHandler(
+		mitmproxy.WithCACertPath(caCertPath),
+		mitmproxy.WithCAKeyPath(caKeyPath),
+		mitmproxy.WithChainHTTPInterceptor(httpInterceptor1, httpInterceptor2, httpInterceptor3),
 	)
 	if err != nil {
 		panic(err)
@@ -37,7 +37,7 @@ func main() {
 	http.ListenAndServe(fmt.Sprintf("%s:%d", "127.0.0.1", port), handler)
 }
 
-func httpInterceptor1(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+func httpInterceptor1(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
 	slog.Debug("httpInterceptor1 before", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String()))
 	rsp, err := invoker.Invoke(req)
 	if err != nil {
@@ -47,7 +47,7 @@ func httpInterceptor1(ctx context.Context, req *http.Request, invoker mitmpgo.HT
 	return rsp, err
 }
 
-func httpInterceptor2(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+func httpInterceptor2(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
 	slog.Debug("httpInterceptor2 before", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String()))
 	rsp, err := invoker.Invoke(req)
 	if err != nil {
@@ -57,7 +57,7 @@ func httpInterceptor2(ctx context.Context, req *http.Request, invoker mitmpgo.HT
 	return rsp, err
 }
 
-func httpInterceptor3(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+func httpInterceptor3(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
 	slog.Debug("httpInterceptor3 before", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String()))
 	rsp, err := invoker.Invoke(req)
 	if err != nil {

@@ -1,4 +1,4 @@
-package mitmpgo
+package mitmproxy
 
 import (
 	"strings"

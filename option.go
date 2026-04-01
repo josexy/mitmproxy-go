@@ -1,4 +1,4 @@
-package mitmpgo
+package mitmproxy
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/josexy/mitmpgo/internal/cert"
+	"github.com/josexy/mitmproxy-go/internal/cert"
 )
 
 type ClientCert struct {

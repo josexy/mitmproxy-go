@@ -10,7 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/josexy/mitmpgo"
+	"github.com/josexy/mitmproxy-go"
 )
 
 func main() {
@@ -25,7 +25,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
-	httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+	httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
 		slog.Debug("request", slog.String("host", req.Host), slog.String("method", req.Method), slog.String("url", req.URL.String()))
 
 		rsp, err := invoker.Invoke(req)
@@ -37,10 +37,10 @@ func main() {
 		return rsp, err
 	}
 
-	handler, err := mitmpgo.NewMitmProxyHandler(
-		mitmpgo.WithCACertPath(caCertPath),
-		mitmpgo.WithCAKeyPath(caKeyPath),
-		mitmpgo.WithHTTPInterceptor(httpInterceptor),
+	handler, err := mitmproxy.NewMitmProxyHandler(
+		mitmproxy.WithCACertPath(caCertPath),
+		mitmproxy.WithCAKeyPath(caKeyPath),
+		mitmproxy.WithHTTPInterceptor(httpInterceptor),
 	)
 	if err != nil {
 		panic(err)

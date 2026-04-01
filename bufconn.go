@@ -1,11 +1,11 @@
-package mitmpgo
+package mitmproxy
 
 import (
 	"bufio"
 	"io"
 	"net"
 
-	"github.com/josexy/mitmpgo/buf"
+	"github.com/josexy/mitmproxy-go/buf"
 	"github.com/josexy/websocket"
 )
 

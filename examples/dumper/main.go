@@ -20,8 +20,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/josexy/mitmpgo"
-	"github.com/josexy/mitmpgo/metadata"
+	"github.com/josexy/mitmproxy-go"
+	"github.com/josexy/mitmproxy-go/metadata"
 )
 
 const CHUNK_SIZE = 512
@@ -124,7 +124,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
-	errHandler := func(ec mitmpgo.ErrorContext) {
+	errHandler := func(ec mitmproxy.ErrorContext) {
 		slog.Error("mitm proxy error",
 			slog.String("remote_addr", ec.RemoteAddr),
 			slog.String("hostport", ec.Hostport),
@@ -134,26 +134,26 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	handler, err := mitmpgo.NewMitmProxyHandler(
-		mitmpgo.WithCACertPath(caCertPath),
-		mitmpgo.WithCAKeyPath(caKeyPath),
-		mitmpgo.WithHTTPInterceptor(httpInterceptor),
-		mitmpgo.WithWebsocketInterceptor(websocketInterceptor),
-		mitmpgo.WithErrorHandler(errHandler),
-		mitmpgo.WithStreamBaseContext(ctx),
-		// mitmpgo.WithClientCert("127.0.0.1", mitmpgo.ClientCert{
+	handler, err := mitmproxy.NewMitmProxyHandler(
+		mitmproxy.WithCACertPath(caCertPath),
+		mitmproxy.WithCAKeyPath(caKeyPath),
+		mitmproxy.WithHTTPInterceptor(httpInterceptor),
+		mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
+		mitmproxy.WithErrorHandler(errHandler),
+		mitmproxy.WithStreamBaseContext(ctx),
+		// mitmproxy.WithClientCert("127.0.0.1", mitmproxy.ClientCert{
 		// 	CertPath: "certs/client.crt",
 		// 	KeyPath:  "certs/client.key",
 		// }),
-		// mitmpgo.WithRootCAs("certs/ca.crt"),
-		// mitmpgo.WithIncludeHosts("ifconfig.co", "*.example.com", "example.com", "*.bilibili.com"),
-		// mitmpgo.WithIncludeHosts("api.bilibili.com"),
-		// mitmpgo.WithExcludeHosts("www.baidu.com"),
-		// mitmpgo.WithProxy("http://127.0.0.1:7900"),
-		// mitmpgo.WithDisableProxy(),
-		// mitmpgo.WithDisableHTTP2(),
-		// mitmpgo.WithSkipVerifySSLFromServer(),
-		// mitmpgo.WithMaxWebsocketFramesPerForward(4096),
+		// mitmproxy.WithRootCAs("certs/ca.crt"),
+		// mitmproxy.WithIncludeHosts("ifconfig.co", "*.example.com", "example.com", "*.bilibili.com"),
+		// mitmproxy.WithIncludeHosts("api.bilibili.com"),
+		// mitmproxy.WithExcludeHosts("www.baidu.com"),
+		// mitmproxy.WithProxy("http://127.0.0.1:7900"),
+		// mitmproxy.WithDisableProxy(),
+		// mitmproxy.WithDisableHTTP2(),
+		// mitmproxy.WithSkipVerifySSLFromServer(),
+		// mitmproxy.WithMaxWebsocketFramesPerForward(4096),
 	)
 	if err != nil {
 		panic(err)
@@ -206,7 +206,7 @@ func main() {
 	time.Sleep(time.Millisecond * 500)
 }
 
-func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTTPDelegatedInvoker) (*http.Response, error) {
+func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
 	_md, _ := metadata.FromContext(ctx)
 	md := _md.MD()
 	slog.Debug("request",
@@ -267,7 +267,7 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmpgo.HTT
 	return rsp, err
 }
 
-func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmpgo.WebsocketFramesWatcher) {
+func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
 	_md, _ := metadata.FromContext(ctx)
 	md := _md.MD()
 	slog.Debug("request",

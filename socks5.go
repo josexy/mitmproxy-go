@@ -1,4 +1,4 @@
-package mitmpgo
+package mitmproxy
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/josexy/mitmpgo/buf"
+	"github.com/josexy/mitmproxy-go/buf"
 )
 
 var (
