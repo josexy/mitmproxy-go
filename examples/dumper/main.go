@@ -318,7 +318,7 @@ func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Resp
 		select {
 		case <-ctx.Done():
 			return
-		case frame, ok := <-fw.GetFrame():
+		case frame, ok := <-fw.Receive():
 			if !ok {
 				return
 			}

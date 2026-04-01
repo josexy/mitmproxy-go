@@ -810,7 +810,7 @@ type wsFramesWatcherImpl struct {
 	closed    atomic.Bool
 }
 
-func (w *wsFramesWatcherImpl) GetFrame() <-chan WsFrame { return w.framesCh }
+func (w *wsFramesWatcherImpl) Receive() <-chan WsFrame { return w.framesCh }
 
 func (w *wsFramesWatcherImpl) send(frame WsFrame) {
 	if w.closed.Load() {

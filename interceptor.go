@@ -48,7 +48,7 @@ type (
 		Invoke(msgType int, dataPtr *buf.Buffer) error
 	}
 	WebsocketFramesWatcher interface {
-		GetFrame() <-chan WsFrame
+		Receive() <-chan WsFrame
 	}
 )
 
