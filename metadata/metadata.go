@@ -2,7 +2,6 @@ package metadata
 
 import (
 	"context"
-	"net/netip"
 	"sync"
 	"time"
 )
@@ -25,12 +24,13 @@ func (m *metadata) get(key string) (val any) { val, _ = m.md.Load(key); return }
 func (m *metadata) MD() MD {
 	var md MD
 	md.StreamBody, _ = m.get(StreamBody).(bool)
-	md.ConnectionEstablishedTs, _ = m.get(ConnectionEstablishedTs).(time.Time)
+	md.LocalConnectionEstablishedTs, _ = m.get(LocalConnectionEstablishedTs).(time.Time)
+	md.RemoteConnectionEstablishedTs, _ = m.get(RemoteConnectionEstablishedTs).(time.Time)
 	md.RequestProcessedTs, _ = m.get(RequestReceivedTs).(time.Time)
 	md.SSLHandshakeCompletedTs, _ = m.get(SSLHandshakeCompletedTs).(time.Time)
 	md.RequestHostport, _ = m.get(RequestHostport).(string)
-	md.SourceAddr, _ = m.get(ConnectionSourceAddrPort).(netip.AddrPort)
-	md.DestinationAddr, _ = m.get(ConnectionDestinationAddrPort).(netip.AddrPort)
+	md.LocalAddrInfo, _ = m.get(LocalConnectionAddrInfo).(ConnectionAddrInfo)
+	md.RemoteAddrInfo, _ = m.get(RemoteConnectionAddrInfo).(ConnectionAddrInfo)
 	md.TLSState, _ = m.get(ConnectionTLSState).(*TLSState)
 	md.ServerCertificate, _ = m.get(ConnectionServerCertificate).(*ServerCertificate)
 	return md

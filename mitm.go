@@ -385,12 +385,13 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 			})
 		}
 	}()
-
+	localConnEstTs := time.Now()
 	dstConn, err := r.proxyDialer.DialTCPContext(ctx, reqCtx.Hostport)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("failed to connect to %s: %s", reqCtx.Hostport, err)
 	}
+	remoteConnEstTs := time.Now()
 
 	local := &localClientConn{
 		Conn:      conn,
@@ -406,8 +407,6 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 
 	defer local.Close()
 
-	nowTs := time.Now()
-
 	if reqCtx.HttpConnectMethod {
 		conn.Write(HttpResponseConnectionEstablished)
 	}
@@ -417,11 +416,18 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	}
 
 	md := metadata.NewMD()
-	md.Set(metadata.ConnectionEstablishedTs, nowTs)
-	md.Set(metadata.RequestReceivedTs, nowTs)
+	md.Set(metadata.LocalConnectionEstablishedTs, localConnEstTs)
+	md.Set(metadata.RemoteConnectionEstablishedTs, remoteConnEstTs)
+	md.Set(metadata.RequestReceivedTs, localConnEstTs)
 	md.Set(metadata.RequestHostport, reqCtx.Hostport)
-	md.Set(metadata.ConnectionSourceAddrPort, getAddrPortFromConn(conn))
-	md.Set(metadata.ConnectionDestinationAddrPort, getAddrPortFromConn(dstConn))
+	md.Set(metadata.LocalConnectionAddrInfo, metadata.ConnectionAddrInfo{
+		SourceAddr:      getRemoteAddrPortFromConn(conn),
+		DestinationAddr: getLocalAddrPortFromConn(conn),
+	})
+	md.Set(metadata.RemoteConnectionAddrInfo, metadata.ConnectionAddrInfo{
+		SourceAddr:      getLocalAddrPortFromConn(dstConn),
+		DestinationAddr: getRemoteAddrPortFromConn(dstConn),
+	})
 	ctx = context.WithValue(metadata.AppendToContext(ctx, md), connContextKey, connCtx)
 
 	return r.handleTunnelRequest(ctx, reqCtx.Request != nil)
@@ -1035,7 +1041,15 @@ func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Rea
 	return nil
 }
 
-func getAddrPortFromConn(conn net.Conn) (addrport netip.AddrPort) {
+func getLocalAddrPortFromConn(conn net.Conn) (addrport netip.AddrPort) {
+	if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+		addr, _ := netip.AddrFromSlice(tcpAddr.IP)
+		addrport = netip.AddrPortFrom(addr, uint16(tcpAddr.Port))
+	}
+	return
+}
+
+func getRemoteAddrPortFromConn(conn net.Conn) (addrport netip.AddrPort) {
 	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
 		addr, _ := netip.AddrFromSlice(tcpAddr.IP)
 		addrport = netip.AddrPortFrom(addr, uint16(tcpAddr.Port))
