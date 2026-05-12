@@ -154,6 +154,7 @@ func main() {
 		// mitmproxy.WithDisableHTTP2(),
 		// mitmproxy.WithSkipVerifySSLFromServer(),
 		// mitmproxy.WithMaxWebsocketFramesPerForward(4096),
+		// mitmproxy.WithIdleConnTimeout(time.Minute),
 	)
 	if err != nil {
 		panic(err)

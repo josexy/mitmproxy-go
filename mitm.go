@@ -200,7 +200,7 @@ type mitmProxyHandler struct {
 	serverCertPool *certPool
 	clientCertPool map[string]tls.Certificate
 	h2s            *http2.Server
-	transport      *UnifiedTransport
+	transport      http.RoundTripper
 	domainMatcher  struct {
 		include *trieNode
 		exclude *trieNode
@@ -260,7 +260,7 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	handler := &mitmProxyHandler{
 		options:        opts,
 		h2s:            &http2.Server{},
-		transport:      NewTransport(dialFn),
+		transport:      newTransport(dialFn, opts.idleConnTimeout),
 		proxyDialer:    NewProxyDialer(proxyURL, opts.dialer),
 		priKeyPool:     newPriKeyPool(opts.certCachePool.Capacity),
 		clientCertPool: clientCertPool,

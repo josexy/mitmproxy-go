@@ -37,6 +37,8 @@ type options struct {
 	rootCAs       []string    // Paths to additional root CA certificate files
 	dialer        *net.Dialer // Custom dialer for outbound connections
 
+	idleConnTimeout time.Duration // Idle timeout for connections
+
 	wsMaxFramesPerForward int // Max frames channel size per single websocket forward
 
 	clientCerts map[string]ClientCert // Client certificate configuration
@@ -211,6 +213,25 @@ func WithClientCert(hostname string, clientCert ClientCert) Option {
 func WithDialer(dialer *net.Dialer) Option {
 	return OptionFunc(func(o *options) {
 		o.dialer = dialer
+	})
+}
+
+// WithIdleConnTimeout sets the idle timeout for connections.
+// If a connection is idle (no data sent or received) for longer than this duration,
+// it will be closed by the proxy.
+//
+// This helps to free up resources and prevent hanging connections.
+//
+// If not specified, no idle timeout is applied.
+//
+// Example:
+//
+//	handler, err := NewMitmProxyHandler(
+//	    WithIdleConnTimeout(60 * time.Second), // Close connections idle for 60 seconds
+//	)
+func WithIdleConnTimeout(timeout time.Duration) Option {
+	return OptionFunc(func(o *options) {
+		o.idleConnTimeout = timeout
 	})
 }
 
