@@ -1,23 +1,18 @@
-# mitmproxy-go 
+# mitmproxy-go
 
-An easy-use and flexible Man-In-The-Middle (MITM) proxy library for Go that enables transparent interception and inspection of HTTP, HTTPS, HTTP/2, and WebSocket traffic.
+An easy-to-use and flexible MITM proxy library for Go that can intercept and inspect HTTP, HTTPS, HTTP/2, h2c, WebSocket, and WSS traffic.
 
 ## Features
 
-- **Multiple Protocol Support**
-  - HTTP/1.1 and HTTP/2 (including h2c - HTTP/2 over cleartext)
-  - HTTPS with transparent TLS interception
-  - WebSocket and secure WebSocket (WSS)
-
-- **Dual Proxy Modes**
-  - HTTP/HTTPS proxy mode
-  - SOCKS5 proxy mode
-
-- **Flexible Configuration**
-  - Upstream proxy support
-  - Custom CA certificates
-  - Configurable TLS verification
-  - HTTP/2 can be disabled if needed
+- HTTP/1.1, HTTP/2, and h2c support
+- HTTPS interception with custom CA certificates
+- WebSocket and secure WebSocket interception
+- HTTP proxy mode and SOCKS5 proxy mode
+- HTTP interceptor chaining
+- Host include/exclude filtering with wildcard matching
+- Upstream proxy support
+- Optional custom root CAs and client certificates for mTLS
+- Request metadata for TLS, timing, and connection details
 
 ## Installation
 
@@ -25,265 +20,318 @@ An easy-use and flexible Man-In-The-Middle (MITM) proxy library for Go that enab
 go get github.com/josexy/mitmproxy-go
 ```
 
-## Quick Start
+## Prerequisites
 
-### Basic HTTP Proxy
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log"
-    "net/http"
-
-    "github.com/josexy/mitmproxy-go"
-)
-
-func main() {
-    // Create MITM proxy handler
-    handler, err := mitmproxy.NewMitmProxyHandler(
-        mitmproxy.WithCACertPath("certs/ca.crt"),
-        mitmproxy.WithCAKeyPath("certs/ca.key"),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // Start HTTP proxy server
-    fmt.Println("Starting proxy on :8080")
-    http.ListenAndServe(":8080", handler)
-}
-```
-
-### With HTTP Interceptor
-
-```go
-httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
-    // Log request details
-    fmt.Printf("→ %s %s\n", req.Method, req.URL)
-    fmt.Printf("  Host: %s\n", req.Host)
-    fmt.Printf("  Proto: %s\n", req.Proto)
-
-    // Forward the request
-    resp, err := invoker.Invoke(req)
-    if err != nil {
-        return nil, err
-    }
-
-    // Log response details
-    fmt.Printf("← %s\n", resp.Status)
-
-    return resp, nil
-}
-
-handler, err := mitmproxy.NewMitmProxyHandler(
-    mitmproxy.WithCACertPath("certs/ca.crt"),
-    mitmproxy.WithCAKeyPath("certs/ca.key"),
-    mitmproxy.WithHTTPInterceptor(httpInterceptor),
-)
-```
-
-### With WebSocket Interceptor
-
-```go
-websocketInterceptor := func(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
-    // Log WebSocket messages
-    log.Printf("WS url: %s", req.URL.String())
-
-    for frame := range fw.GetFrame() {
-        dir := frame.Direction()
-        msgType := frame.MessageType()
-        dataBuf := frame.DataBuffer()
-        log.Printf("---> %s %d %s", dir, msgType, dataBuf.String())
-        if err := frame.Invoke(); err != nil {
-            log.Printf("frame invoke error: %v", err)
-        }
-        frame.Release()
-    }
-}
-
-handler, err := mitmproxy.NewMitmProxyHandler(
-    mitmproxy.WithCACertPath("certs/ca.crt"),
-    mitmproxy.WithCAKeyPath("certs/ca.key"),
-    mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
-)
-```
-
-### SOCKS5 Proxy Mode
-
-```go
-func main() {
-    handler, err := mitmproxy.NewMitmProxyHandler(
-        mitmproxy.WithCACertPath("certs/ca.crt"),
-        mitmproxy.WithCAKeyPath("certs/ca.key"),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // Listen on TCP port
-    ln, err := net.Listen("tcp", ":1080")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer ln.Close()
-
-    fmt.Println("SOCKS5 proxy listening on :1080")
-
-    for {
-        conn, err := ln.Accept()
-        if err != nil {
-            continue
-        }
-
-        go func(c net.Conn) {
-            defer c.Close()
-            handler.ServeSOCKS5(context.Background(), c)
-        }(conn)
-    }
-}
-```
-
-## Configuration Options
-
-### Basic Options
-
-```go
-// Specify CA certificate and key for TLS interception
-mitmproxy.WithCACertPath("path/to/ca.crt")
-mitmproxy.WithCAKeyPath("path/to/ca.key")
-
-// Use an upstream proxy
-mitmproxy.WithProxy("http://127.0.0.1:8080")
-
-// Disable upstream proxy
-mitmproxy.WithDisableProxy()
-
-// Add custom root CA certificates
-mitmproxy.WithRootCAs("path/to/root-ca1.crt", "path/to/root-ca2.crt")
-
-// Configure certificate cache pool
-mitmproxy.WithCertCachePool(2048, 30, 15)
-
-// Custom dialer with timeout
-mitmproxy.WithDialer(&net.Dialer{
-    Timeout: 30 * time.Second,
-})
-
-// Maximum channel size of WebSocket frames
-mitmproxy.WithMaxWebsocketFramesPerForward(4096)
-```
-
-### Interceptor Options
-
-```go
-// Set HTTP interceptor
-mitmproxy.WithHTTPInterceptor(httpInterceptor)
-
-// Set WebSocket interceptor
-mitmproxy.WithWebsocketInterceptor(websocketInterceptor)
-
-// Chain multiple HTTP interceptors (executed in order)
-mitmproxy.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
-
-// Set error handler
-mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {
-    log.Printf("Error: %v", ec.Error)
-})
-```
-
-### Security Options
-
-```go
-// Skip SSL verification when connecting to servers (not recommended for production)
-mitmproxy.WithSkipVerifySSLFromServer()
-
-// mTLS client-authentication
-mitmproxy.WithClientCert("example.com", mitmproxy.ClientCert{CertPath: "certs/client.crt", KeyPath: "certs/client.key" })
-```
-
-### Protocol Options
-
-```go
-// Disable HTTP/2 support (use HTTP/1.1 only)
-mitmproxy.WithDisableHTTP2()
-```
-
-### Domain Filtering
-
-```go
-// Only intercept specific hosts (supports wildcards)
-mitmproxy.WithIncludeHosts("api.example.com", "*.example.org", "example.net")
-
-// Exclude specific hosts from interception (supports wildcards)
-mitmproxy.WithExcludeHosts("*.cdn.com", "static.example.com")
-```
-
-## Metadata Access
-
-Interceptors can access metadata from the context:
-
-```go
-httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
-    // Extract metadata from context
-    mdCtx, _ := metadata.FromContext(ctx)
-    md := mdCtx.MD()
-
-    // Timing information
-    fmt.Printf("Connection established at: %v\n", md.ConnectionEstablishedTs)
-    fmt.Printf("SSL handshake duration: %v\n",
-        md.SSLHandshakeCompletedTs.Sub(md.ConnectionEstablishedTs))
-
-    // Connection details
-    fmt.Printf("Source: %s\n", md.SourceAddr)
-    fmt.Printf("Destination: %s\n", md.DestinationAddr)
-
-    // TLS information (if HTTPS)
-    if md.TLSState != nil {
-        fmt.Printf("ALPN: %s\n", md.TLSState.SelectedALPN)
-        fmt.Printf("TLS Version: %s\n", tls.VersionName(md.TLSState.SelectedTLSVersion))
-        fmt.Printf("Cipher Suite: %s\n", tls.CipherSuiteName(md.TLSState.SelectedCipherSuite))
-    }
-
-    // Server certificate (if HTTPS)
-    if md.ServerCertificate != nil {
-        fmt.Printf("Certificate Subject: %v\n", md.ServerCertificate.Subject)
-        fmt.Printf("Certificate Issuer: %v\n", md.ServerCertificate.Issuer)
-        fmt.Printf("DNS Names: %v\n", md.ServerCertificate.DNSNames)
-        fmt.Printf("SHA256 Fingerprint: %s\n", md.ServerCertificate.Sha256FingerprintHex())
-    }
-
-    return invoker.Invoke(req)
-}
-```
-
-## Examples
-
-A complete working example is available in `examples/dumper/main.go`. Run it with:
-
-```bash
-# HTTP proxy mode
-go run examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode http -port 10086
-
-# SOCKS5 proxy mode
-go run examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode socks5 -port 10086
-```
-
-## Generating CA Certificates
-
-For TLS interception to work, you need a CA certificate. Generate one with OpenSSL:
+HTTPS interception requires a CA certificate and private key:
 
 ```bash
 chmod +x ./tools/gen_cert.sh
 OUTDIR=certs ./tools/gen_cert.sh
 ```
 
+Clients that use the proxy must trust the generated CA certificate.
+
+## Quick Start
+
+### HTTP Proxy
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+
+	mitmproxy "github.com/josexy/mitmproxy-go"
+)
+
+func main() {
+	handler, err := mitmproxy.NewMitmProxyHandler(
+		mitmproxy.WithCACertPath("certs/ca.crt"),
+		mitmproxy.WithCAKeyPath("certs/ca.key"),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer handler.Cleanup()
+
+	fmt.Println("proxy listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", handler))
+}
+```
+
+### HTTP Interceptor
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	mitmproxy "github.com/josexy/mitmproxy-go"
+)
+
+func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+	fmt.Printf("-> %s %s\n", req.Method, req.URL)
+
+	resp, err := invoker.Invoke(req)
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("<- %s\n", resp.Status)
+	return resp, nil
+}
+```
+
+```go
+handler, err := mitmproxy.NewMitmProxyHandler(
+	mitmproxy.WithCACertPath("certs/ca.crt"),
+	mitmproxy.WithCAKeyPath("certs/ca.key"),
+	mitmproxy.WithHTTPInterceptor(httpInterceptor),
+)
+```
+
+### WebSocket Interceptor
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+
+	mitmproxy "github.com/josexy/mitmproxy-go"
+)
+
+func websocketInterceptor(ctx context.Context, req *http.Request, resp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
+	log.Printf("websocket upgrade %s -> %d", req.URL.String(), resp.StatusCode)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame, ok := <-fw.Receive():
+			if !ok {
+				return
+			}
+
+			log.Printf("%s %d %q", frame.Direction(), frame.MessageType(), frame.DataBuffer().String())
+			if err := frame.Invoke(); err != nil {
+				log.Printf("forward websocket frame: %v", err)
+			}
+		}
+	}
+}
+```
+
+```go
+handler, err := mitmproxy.NewMitmProxyHandler(
+	mitmproxy.WithCACertPath("certs/ca.crt"),
+	mitmproxy.WithCAKeyPath("certs/ca.key"),
+	mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
+)
+```
+
+### SOCKS5 Proxy
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+
+	mitmproxy "github.com/josexy/mitmproxy-go"
+)
+
+func main() {
+	handler, err := mitmproxy.NewMitmProxyHandler(
+		mitmproxy.WithCACertPath("certs/ca.crt"),
+		mitmproxy.WithCAKeyPath("certs/ca.key"),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer handler.Cleanup()
+
+	ln, err := net.Listen("tcp", ":1080")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+
+	fmt.Println("SOCKS5 proxy listening on :1080")
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+
+		go func() {
+			defer conn.Close()
+			_ = handler.ServeSOCKS5(context.Background(), conn)
+		}()
+	}
+}
+```
+
+## Options
+
+### Core Options
+
+```go
+mitmproxy.WithCACertPath("certs/ca.crt")
+mitmproxy.WithCAKeyPath("certs/ca.key")
+mitmproxy.WithStreamBaseContext(ctx)
+mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {})
+```
+
+### Upstream and Transport
+
+```go
+mitmproxy.WithProxy("http://127.0.0.1:8080")
+mitmproxy.WithDisableProxy()
+mitmproxy.WithDialer(&net.Dialer{Timeout: 30 * time.Second})
+mitmproxy.WithIdleConnTimeout(60 * time.Second)
+mitmproxy.WithDisableHTTP2()
+mitmproxy.WithSkipVerifySSLFromServer()
+```
+
+### TLS and Certificate Options
+
+```go
+mitmproxy.WithRootCAs("certs/internal-ca.crt", "certs/partner-ca.crt")
+mitmproxy.WithClientCert("example.com", mitmproxy.ClientCert{
+	CertPath: "certs/client.crt",
+	KeyPath:  "certs/client.key",
+})
+mitmproxy.WithCertCachePool(2048, 30, 15)
+```
+
+### Interceptors
+
+```go
+mitmproxy.WithHTTPInterceptor(httpInterceptor)
+mitmproxy.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
+mitmproxy.WithWebsocketInterceptor(websocketInterceptor)
+mitmproxy.WithMaxWebsocketFramesPerForward(4096)
+```
+
+### Host Filtering
+
+```go
+mitmproxy.WithIncludeHosts("api.example.com", "*.example.org")
+mitmproxy.WithExcludeHosts("*.cdn.com", "static.example.com")
+```
+
+`WithExcludeHosts` takes precedence over `WithIncludeHosts`.
+
+## Metadata
+
+Interceptors can read connection and TLS metadata from the request context:
+
+```go
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net/http"
+
+	mitmproxy "github.com/josexy/mitmproxy-go"
+	"github.com/josexy/mitmproxy-go/metadata"
+)
+
+func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+	mdCtx, _ := metadata.FromContext(ctx)
+	md := mdCtx.MD()
+
+	fmt.Printf("target: %s\n", md.RequestHostport)
+	fmt.Printf("local connected at: %v\n", md.LocalConnectionEstablishedTs)
+	fmt.Printf("remote connected at: %v\n", md.RemoteConnectionEstablishedTs)
+	fmt.Printf("request processed at: %v\n", md.RequestProcessedTs)
+
+	if md.TLSState != nil {
+		fmt.Printf("selected ALPN: %s\n", md.TLSState.SelectedALPN)
+		fmt.Printf("TLS version: %s\n", tls.VersionName(md.TLSState.SelectedTLSVersion))
+		fmt.Printf("cipher suite: %s\n", tls.CipherSuiteName(md.TLSState.SelectedCipherSuite))
+	}
+
+	if md.ServerCertificate != nil {
+		fmt.Printf("subject: %s\n", md.ServerCertificate.Subject.String())
+		fmt.Printf("issuer: %s\n", md.ServerCertificate.Issuer.String())
+		fmt.Printf("sha256: %s\n", md.ServerCertificate.Sha256FingerprintHex())
+	}
+
+	return invoker.Invoke(req)
+}
+```
+
+## Examples
+
+Current examples in this repository:
+
+- `examples/helloworld`: minimal HTTP proxy with request/response logging
+- `examples/dumper`: HTTP and WebSocket dumping example with metadata logging
+- `examples/modify-content`: modifies request headers and response body
+- `examples/chain-interceptors`: demonstrates ordered HTTP interceptor chaining
+
+Run them from the repository root.
+
+### Hello World
+
+```bash
+go run ./examples/helloworld/main.go -cacert certs/ca.crt -cakey certs/ca.key -port 10086
+```
+
+### Dumper
+
+```bash
+# HTTP proxy mode
+go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode http -port 10086
+
+# SOCKS5 proxy mode
+go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode socks5 -port 10086
+```
+
+### Modify Content
+
+```bash
+go run ./examples/modify-content/main.go -cacert certs/ca.crt -cakey certs/ca.key -port 10086
+```
+
+### Chain Interceptors
+
+```bash
+go run ./examples/chain-interceptors/main.go -cacert certs/ca.crt -cakey certs/ca.key -port 10086
+```
+
+## Notes
+
+- Call `handler.Cleanup()` before shutdown to stop background certificate cache cleanup.
+- `WithStreamBaseContext` is useful when you need shared cancellation for long-lived HTTP/2 streams.
+- If `WithIncludeHosts` is unset, traffic is intercepted by default unless excluded.
+
+## Development
+
+```bash
+go test -v ./...
+```
+
+Format modified Go files with:
+
+```bash
+gofmt -w <files>
+```
+
 ## License
 
 This project is available under the terms specified in the repository.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
