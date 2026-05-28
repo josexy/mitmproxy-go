@@ -152,7 +152,7 @@ func main() {
 		// mitmproxy.WithExcludeHosts("www.baidu.com"),
 		// mitmproxy.WithProxy("http://127.0.0.1:7900"),
 		// mitmproxy.WithDisableProxy(),
-		mitmproxy.WithDisableHTTP2(),
+		// mitmproxy.WithDisableHTTP2(),
 		// mitmproxy.WithSkipVerifySSLFromServer(),
 		// mitmproxy.WithMaxWebsocketFramesPerForward(4096),
 	)
