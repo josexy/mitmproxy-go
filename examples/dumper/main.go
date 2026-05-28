@@ -141,6 +141,7 @@ func main() {
 		mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
 		mitmproxy.WithErrorHandler(errHandler),
 		mitmproxy.WithStreamBaseContext(ctx),
+		mitmproxy.WithIdleConnTimeout(time.Second*30),
 		// mitmproxy.WithClientCert("127.0.0.1", mitmproxy.ClientCert{
 		// 	CertPath: "certs/client.crt",
 		// 	KeyPath:  "certs/client.key",
@@ -154,7 +155,6 @@ func main() {
 		// mitmproxy.WithDisableHTTP2(),
 		// mitmproxy.WithSkipVerifySSLFromServer(),
 		// mitmproxy.WithMaxWebsocketFramesPerForward(4096),
-		// mitmproxy.WithIdleConnTimeout(time.Minute),
 	)
 	if err != nil {
 		panic(err)

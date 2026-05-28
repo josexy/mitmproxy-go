@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/josexy/mitmproxy-go/internal/cache"
@@ -14,6 +15,7 @@ import (
 var errNoPriKey = errors.New("no available private key")
 
 type priKeyPool struct {
+	mu   sync.Mutex
 	rand *rand.Rand
 	keys []*rsa.PrivateKey
 }
@@ -30,6 +32,9 @@ func newPriKeyPool(maxSize int) *priKeyPool {
 }
 
 func (p *priKeyPool) Get() (*rsa.PrivateKey, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	var n, m = len(p.keys), cap(p.keys)
 	if m == 0 {
 		return nil, errNoPriKey

@@ -2,47 +2,114 @@ package mitmproxy
 
 import (
 	"context"
-	"crypto/tls"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
-type unifiedTransport struct {
-	defaultTransport http.RoundTripper
-	h2Transport      http.RoundTripper
-	h2cTransport     http.RoundTripper
-}
+type singleConnTransport struct {
+	hostport     string
+	dialFn       func(ctx context.Context, network, addr string) (net.Conn, error)
+	idleTimeout  time.Duration
+	disableHTTP2 bool
 
-func (t *unifiedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.ProtoMajor == 2 {
-		return t.h2Transport.RoundTrip(req)
-	}
-	return t.defaultTransport.RoundTrip(req)
+	mu         sync.Mutex
+	clientConn *http.ClientConn
+	closed     bool
 }
 
 func newTransport(
+	hostport string,
 	dialFn func(ctx context.Context, network, addr string) (net.Conn, error),
 	idleConnTimeout time.Duration,
-) http.RoundTripper {
-	// configure transport
-	return &unifiedTransport{
-		defaultTransport: &http.Transport{
-			DialContext:        dialFn,
-			DialTLSContext:     dialFn,
-			ForceAttemptHTTP2:  true,
-			DisableCompression: true,
-			IdleConnTimeout:    idleConnTimeout,
-		},
-		h2Transport: &http2.Transport{
-			AllowHTTP:          true,
-			DisableCompression: true,
-			IdleConnTimeout:    idleConnTimeout,
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-				return dialFn(ctx, network, addr)
-			},
-		},
+	disableHTTP2 bool,
+) *singleConnTransport {
+	return &singleConnTransport{
+		hostport:     hostport,
+		dialFn:       dialFn,
+		idleTimeout:  idleConnTimeout,
+		disableHTTP2: disableHTTP2,
 	}
+}
+
+func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clientConn, err := t.getClientConn(req.Context(), req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := clientConn.RoundTrip(req)
+	if err != nil {
+		_ = t.Close()
+	}
+	return resp, err
+}
+
+func (t *singleConnTransport) Close() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	clientConn := t.clientConn
+	t.clientConn = nil
+	t.mu.Unlock()
+
+	if clientConn != nil {
+		return clientConn.Close()
+	}
+	return nil
+}
+
+func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Request) (*http.ClientConn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.clientConn != nil {
+		return t.clientConn, nil
+	}
+
+	scheme := req.URL.Scheme
+	if scheme == "" {
+		return nil, errors.New("request URL scheme is empty")
+	}
+	if scheme != "http" && scheme != "https" {
+		return nil, fmt.Errorf("unsupported request URL scheme %q", scheme)
+	}
+
+	baseTransport := &http.Transport{
+		DialContext:        t.dialFn,
+		DialTLSContext:     t.dialFn,
+		DisableCompression: true,
+		IdleConnTimeout:    t.idleTimeout,
+		Protocols:          protocolsForRequest(scheme, req.ProtoMajor, t.disableHTTP2),
+	}
+	clientConn, err := baseTransport.NewClientConn(ctx, scheme, t.hostport)
+	if err != nil {
+		return nil, err
+	}
+	t.clientConn = clientConn
+	return clientConn, nil
+}
+
+func protocolsForRequest(scheme string, protoMajor int, disableHTTP2 bool) *http.Protocols {
+	protos := &http.Protocols{}
+	switch {
+	case scheme == "http" && protoMajor == 2 && !disableHTTP2:
+		protos.SetUnencryptedHTTP2(true)
+	case scheme == "https":
+		protos.SetHTTP1(true)
+		if !disableHTTP2 {
+			protos.SetHTTP2(true)
+		}
+	default:
+		protos.SetHTTP1(true)
+	}
+	return protos
 }
