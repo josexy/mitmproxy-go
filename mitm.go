@@ -14,8 +14,9 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strings"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/josexy/mitmproxy-go/buf"
@@ -168,8 +169,9 @@ func (c *remoteClientConn) Close() error {
 }
 
 type biConnContext struct {
-	local  *localClientConn
-	remote *remoteClientConn
+	local     *localClientConn
+	remote    *remoteClientConn
+	transport *singleConnTransport
 }
 
 type ErrorContext struct {
@@ -200,7 +202,6 @@ type mitmProxyHandler struct {
 	serverCertPool *certPool
 	clientCertPool map[string]tls.Certificate
 	h2s            *http2.Server
-	transport      http.RoundTripper
 	domainMatcher  struct {
 		include *trieNode
 		exclude *trieNode
@@ -237,16 +238,12 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 			}
 		}
 	}
+	if opts.certCachePool.Capacity > 0 && opts.certCachePool.Capacity%256 != 0 {
+		return nil, fmt.Errorf("cert cache capacity must be a multiple of %d", 256)
+	}
 	proxyURL, err := parseProxyFrom(opts.disableProxy, opts.proxy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse proxy url: %s", err)
-	}
-
-	dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if connCtx, ok := ctx.Value(connContextKey).(*biConnContext); ok {
-			return connCtx.remote.innerConn, nil
-		}
-		return nil, errors.New("connContextKey missing in context")
 	}
 
 	includeMatcher, excludeMatcher := newTrieNode(), newTrieNode()
@@ -260,7 +257,6 @@ func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
 	handler := &mitmProxyHandler{
 		options:        opts,
 		h2s:            &http2.Server{},
-		transport:      newTransport(dialFn, opts.idleConnTimeout),
 		proxyDialer:    NewProxyDialer(proxyURL, opts.dialer),
 		priKeyPool:     newPriKeyPool(opts.certCachePool.Capacity),
 		clientCertPool: clientCertPool,
@@ -316,9 +312,12 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		err = ErrHijackNotSupported
 		return
 	}
-	conn, _, err := hj.Hijack()
+	conn, rw, err := hj.Hijack()
 	if err != nil {
 		return
+	}
+	if rw != nil {
+		conn = newBufConnExt(conn, rw)
 	}
 	request := req
 	hostport, err = ParseHostPort(req)
@@ -400,15 +399,24 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	remote := &remoteClientConn{
 		Conn: dstConn,
 	}
-	connCtx := &biConnContext{local, remote}
+	connCtx := &biConnContext{local: local, remote: remote}
 	local.connCtx, remote.connCtx = connCtx, connCtx
 	conn, dstConn = local, remote
 	remote.innerConn = remote
+	connCtx.transport = newTransport(reqCtx.Hostport, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if connCtx.remote == nil || connCtx.remote.innerConn == nil {
+			return nil, errors.New("remote connection missing in context")
+		}
+		return connCtx.remote.innerConn, nil
+	}, r.idleConnTimeout, r.disableHTTP2)
 
 	defer local.Close()
+	defer connCtx.transport.Close()
 
 	if reqCtx.HttpConnectMethod {
-		conn.Write(HttpResponseConnectionEstablished)
+		if _, err = conn.Write(HttpResponseConnectionEstablished); err != nil {
+			return err
+		}
 	}
 
 	if r.shouldPassthroughRequest(reqCtx.Hostport) {
@@ -469,6 +477,14 @@ func (r *mitmProxyHandler) handleError(ec ErrorContext) {
 	if r.errHandler != nil && ec.Error != nil {
 		r.errHandler(ec)
 	}
+}
+
+func cloneMetadataContext(ctx context.Context) context.Context {
+	src, ok := metadata.FromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	return metadata.AppendToContext(ctx, src.Clone())
 }
 
 func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Context, chi *tls.ClientHelloInfo, conn net.Conn) (net.Conn, *tls.Config, error) {
@@ -591,8 +607,17 @@ func isTLS(data []byte) bool {
 	return data[0] == 0x16 && data[1] == 0x03 && data[2] <= 0x03
 }
 
+func setReadDeadlineForTimeout(conn net.Conn, timeout time.Duration) func() {
+	if timeout <= 0 {
+		return func() {}
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	return func() { _ = conn.SetReadDeadline(time.Time{}) }
+}
+
 func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequest bool) (err error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	reqCtx, _ := FromRequestContext(ctx)
 	var srcConn net.Conn = connCtx.local
 	var dstConn net.Conn = connCtx.remote
 
@@ -606,6 +631,8 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		}
 		srcConn = bufConn
 	}
+
+	fakerw := newFakeHttpResponseWriter(srcConn)
 
 	var tlsRequest bool
 	// Check if the common http/websocket request with tls
@@ -659,6 +686,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		dstConn = <-tlsConnCh
 		connCtx.remote.innerConn = dstConn
 		srcConn = tlsConn
+		fakerw = newFakeHttpResponseWriter(srcConn)
 
 		state := tlsConn.ConnectionState()
 		// If the result of the negotiation is http2,
@@ -679,14 +707,97 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		}
 	}
 
-	ctx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, srcConn, tlsRequest)
-	if err != nil || earlyDone {
-		return
+	request := reqCtx.Request
+	for {
+		reqCtx, _ := FromRequestContext(ctx)
+		nextCtx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest)
+		if err != nil || earlyDone {
+			if request == nil && isExpectedIdleReadClose(err) {
+				return nil
+			}
+			return err
+		}
+		request = nil
+
+		nextReqCtx, _ := FromRequestContext(nextCtx)
+		if !requestMatchesHostport(nextReqCtx.Request, reqCtx.Hostport) {
+			return fmt.Errorf("http keep-alive target changed from %s to %s", reqCtx.Hostport, nextReqCtx.Request.Host)
+		}
+		nextCtx = cloneMetadataContext(nextCtx)
+		if md, ok := metadata.FromContext(nextCtx); ok {
+			md.Set(metadata.RequestReceivedTs, time.Now())
+		}
+
+		if isWsUpgrade {
+			return r.relayConnForWS(nextCtx, srcConn, dstConn)
+		}
+		response, err := r.relayConnForHTTP(nextCtx, srcConn)
+		if err != nil {
+			return err
+		}
+		if shouldCloseHTTP1(nextReqCtx.Request, response) {
+			return nil
+		}
 	}
-	if isWsUpgrade {
-		return r.relayConnForWS(ctx, srcConn, dstConn)
+}
+
+func shouldCloseHTTP1(req *http.Request, response *http.Response) bool {
+	if req == nil || req.ProtoMajor != 1 {
+		return true
 	}
-	return r.relayConnForHTTP(ctx, srcConn)
+	if req.Close {
+		return true
+	}
+	return response != nil && response.Close
+}
+
+func requestMatchesHostport(req *http.Request, hostport string) bool {
+	if req == nil {
+		return false
+	}
+	requestHostport := req.Host
+	if requestHostport == "" && req.URL != nil {
+		requestHostport = req.URL.Host
+	}
+	host, port := splitHostOptionalPort(hostport)
+	requestHost, requestPort := splitHostOptionalPort(requestHostport)
+	if !strings.EqualFold(requestHost, host) {
+		return false
+	}
+	return port == "" || requestPort == "" || requestPort == port
+}
+
+func splitHostOptionalPort(hostport string) (string, string) {
+	host, port, err := net.SplitHostPort(hostport)
+	if err == nil {
+		return host, port
+	}
+	if strings.HasPrefix(hostport, "[") {
+		if end := strings.Index(hostport, "]"); end > 0 {
+			return hostport[1:end], ""
+		}
+	}
+	return hostport, ""
+}
+
+func isExpectedIdleReadClose(err error) bool {
+	if err == nil ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "connection was aborted") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw http.ResponseWriter, req *http.Request) (bool, error) {
@@ -733,12 +844,10 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 	return false, nil
 }
 
-func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn net.Conn, tlsRequest bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
+func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *fakeHttpResponseWriter, request *http.Request, tlsRequest bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
 	reqCtx, _ := FromRequestContext(ctx)
 
 	// Read the http request for https/wss via tls tunnel
-	fakerw := newFakeHttpResponseWriter(srcConn)
-	request := reqCtx.Request
 
 	// Need to read the request
 	if request == nil {
@@ -747,7 +856,9 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, srcConn n
 			retErr = err
 			return
 		}
+		clearDeadline := setReadDeadlineForTimeout(fakerw.conn, r.idleConnTimeout)
 		request, err = http.ReadRequest(rw.Reader)
+		clearDeadline()
 		if err != nil {
 			retErr = err
 			return
@@ -813,21 +924,21 @@ func (f *wsFrameImpl) Release() {
 type wsFramesWatcherImpl struct {
 	framesCh  chan WsFrame
 	closeOnce sync.Once
-	closed    atomic.Bool
 }
 
 func (w *wsFramesWatcherImpl) Receive() <-chan WsFrame { return w.framesCh }
 
-func (w *wsFramesWatcherImpl) send(frame WsFrame) {
-	if w.closed.Load() {
-		return
+func (w *wsFramesWatcherImpl) send(ctx context.Context, frame WsFrame) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case w.framesCh <- frame:
+		return true
 	}
-	w.framesCh <- frame
 }
 
 func (w *wsFramesWatcherImpl) close() {
 	w.closeOnce.Do(func() {
-		w.closed.Store(true)
 		close(w.framesCh)
 	})
 }
@@ -851,10 +962,17 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	}
 	wsSrcConn, err := websocket.UpgradeWithPreparedResponseAndNetConn(resp, srcConn)
 	if err != nil {
+		wsDstConn.Close()
 		return err
 	}
 
 	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(err)
+	go func() {
+		<-ctx.Done()
+		wsSrcConn.Close()
+		wsDstConn.Close()
+	}()
 
 	var fw *wsFramesWatcherImpl
 	if r.wsInt != nil {
@@ -865,12 +983,13 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	}
 
 	errCh := make(chan error, 2)
+	reportErr := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
 	relayWSMessage := func(ctx context.Context, dir WSDirection, src, dst *websocket.Conn) {
-		defer func() {
-			if fw != nil {
-				fw.close()
-			}
-		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -879,38 +998,69 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 			}
 			msgType, buffer, err := readBufferFromWSConn(src)
 			if err != nil {
-				errCh <- err
+				reportErr(err)
 				break
 			}
 			if fw != nil {
 				// MUST release buffer manually
-				fw.send(&wsFrameImpl{
+				frame := &wsFrameImpl{
 					dir:     dir,
 					msgType: msgType,
 					dataBuf: buffer,
 					invoker: wrapperInvoker(dst.WriteMessage),
-				})
+				}
+				if !fw.send(ctx, frame) {
+					frame.Release()
+					return
+				}
 			} else {
-				dst.WriteMessage(msgType, buffer.Bytes())
+				if err := dst.WriteMessage(msgType, buffer.Bytes()); err != nil {
+					releaseBuffer(buffer)
+					reportErr(err)
+					break
+				}
 				releaseBuffer(buffer)
 			}
 		}
 	}
-	go relayWSMessage(ctx, Send, wsSrcConn, wsDstConn)
-	go relayWSMessage(ctx, Receive, wsDstConn, wsSrcConn)
-	err = <-errCh
+
+	var wg sync.WaitGroup
+	wg.Go(func() { relayWSMessage(ctx, Send, wsSrcConn, wsDstConn) })
+	wg.Go(func() { relayWSMessage(ctx, Receive, wsDstConn, wsSrcConn) })
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+	select {
+	case err = <-errCh:
+		cancel(err)
+	case <-ctx.Done():
+		err = context.Cause(ctx)
+	case <-doneCh:
+		err = context.Cause(ctx)
+	}
+	if err == nil {
+		err = io.EOF
+	}
 	cancel(err)
+	<-doneCh
+	if fw != nil {
+		fw.close()
+	}
 	return
 }
 
-func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn net.Conn) (err error) {
+func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn net.Conn) (response *http.Response, err error) {
 	reqCtx, _ := FromRequestContext(ctx)
-	response, err := r.roundTripWithContext(ctx, reqCtx.Request)
+	response, err = r.roundTripWithContext(ctx, reqCtx.Request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer response.Body.Close()
-	response.Write(srcConn)
+	if err = response.Write(srcConn); err != nil {
+		return nil, err
+	}
 	return
 }
 
@@ -918,15 +1068,18 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
 	md, _ := metadata.FromContext(ctx)
+	if connCtx.transport == nil {
+		return nil, errors.New("transport missing in connection context")
+	}
 
 	reqCtx.Request = req
 	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
 	req = req.WithContext(context.WithValue(ctx, connContextKey, connCtx))
 	// Only one http interceptor will be invoked
 	if r.httpInt != nil {
-		response, err = r.httpInt(ctx, req, HTTPDelegatedInvokerFunc(r.transport.RoundTrip))
+		response, err = r.httpInt(ctx, req, HTTPDelegatedInvokerFunc(connCtx.transport.RoundTrip))
 	} else {
-		response, err = r.transport.RoundTrip(req)
+		response, err = connCtx.transport.RoundTrip(req)
 	}
 	if err != nil {
 		err = fmt.Errorf("transport RoundTrip %s failed: %s", reqCtx.Hostport, err)
@@ -936,28 +1089,15 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 
 func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 	reqCtx, _ := FromRequestContext(ctx)
-	md, _ := metadata.FromContext(ctx)
-	md.Set(metadata.StreamBody, true)
+	baseMD, _ := metadata.FromContext(ctx)
+	baseMD.Set(metadata.StreamBody, true)
 
 	// the http.ResponseWriter actually is net/http/h2_bundle.go http2responseWriter
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		streamCtx := cloneMetadataContext(ctx)
+		md, _ := metadata.FromContext(streamCtx)
 		md.Set(metadata.RequestReceivedTs, time.Now())
 
-		// Must be set scheme "https" to enable HTTP2 transport!!!
-		// This is different from HTTP1 transport!!!
-		/*
-			net/http/h2_bundle.go (*http2Transport).RoundTripOpt
-			switch req.URL.Scheme {
-			case "https":
-				// Always okay.
-			case "http":
-				if !t.AllowHTTP && !opt.allowHTTP {
-					return nil, errors.New("http2: unencrypted HTTP/2 not enabled")
-				}
-			default:
-				return nil, errors.New("http2: unsupported scheme")
-			}
-		*/
 		if req.URL.Scheme == "" {
 			if req.TLS != nil {
 				req.URL.Scheme = "https"
@@ -976,7 +1116,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 			req.Body = http.NoBody
 			req.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
 		}
-		response, err := r.roundTripWithContext(ctx, req)
+		response, err := r.roundTripWithContext(streamCtx, req)
 		if err != nil {
 			r.handleError(ErrorContext{
 				Hostport:   reqCtx.Hostport,
@@ -1005,7 +1145,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 			}
 		}
 
-		// Copy trailers for grpc
+		// Copy trailers
 		for k, vv := range response.Trailer {
 			for _, v := range vv {
 				rw.Header().Add(http2.TrailerPrefix+k, v)

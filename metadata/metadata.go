@@ -47,3 +47,12 @@ func FromContext(ctx context.Context) (*metadata, bool) {
 	}
 	return md, true
 }
+
+func (m *metadata) Clone() *metadata {
+	dst := NewMD()
+	m.md.Range(func(key, value any) bool {
+		dst.md.Store(key, value)
+		return true
+	})
+	return dst
+}
