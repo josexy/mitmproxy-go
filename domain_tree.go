@@ -43,22 +43,23 @@ func (node *trieNode) match(domain string) bool {
 	if domain == "" {
 		return false
 	}
-	parts := strings.Split(domain, ".")
-	return node.dfsMatch(parts, len(parts)-1)
+	return node.matchSuffix(domain, len(domain))
 }
 
-func (node *trieNode) dfsMatch(parts []string, index int) bool {
-	if index < 0 {
+func (node *trieNode) matchSuffix(domain string, end int) bool {
+	if end <= 0 {
 		return node.isEnd
 	}
-	part := parts[index]
+
+	start := strings.LastIndexByte(domain[:end], '.')
+	part := domain[start+1 : end]
 	if child, exists := node.children[part]; exists {
-		if child.dfsMatch(parts, index-1) {
+		if child.matchSuffix(domain, start) {
 			return true
 		}
 	}
 	if wildcardChild, exists := node.children["*"]; exists {
-		if wildcardChild.dfsMatch(parts, index-1) {
+		if wildcardChild.matchSuffix(domain, start) {
 			return true
 		}
 	}

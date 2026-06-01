@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"maps"
 	"sync"
 	"time"
 )
@@ -10,29 +11,248 @@ import (
 type metadataKey struct{}
 
 type metadata struct {
-	md sync.Map
+	mu sync.RWMutex
+
+	setFields uint16
+
+	streamBody                    bool
+	localConnectionEstablishedTs  time.Time
+	remoteConnectionEstablishedTs time.Time
+	requestReceivedTs             time.Time
+	sslHandshakeCompletedTs       time.Time
+	requestHostport               string
+	localConnectionAddrInfo       ConnectionAddrInfo
+	remoteConnectionAddrInfo      ConnectionAddrInfo
+	tlsState                      *TLSState
+	serverCertificate             *ServerCertificate
+
+	extra map[string]any
 }
+
+const (
+	fieldStreamBody uint16 = 1 << iota
+	fieldLocalConnectionEstablishedTs
+	fieldRemoteConnectionEstablishedTs
+	fieldRequestReceivedTs
+	fieldSSLHandshakeCompletedTs
+	fieldRequestHostport
+	fieldLocalConnectionAddrInfo
+	fieldRemoteConnectionAddrInfo
+	fieldConnectionTLSState
+	fieldConnectionServerCertificate
+)
 
 func NewMD() *metadata { return &metadata{} }
 
-func (m *metadata) Set(key string, val any) { m.md.Store(key, val) }
+func (m *metadata) Set(key string, val any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-func (m *metadata) Get(key string) (val any, ok bool) { val, ok = m.md.Load(key); return }
+	switch key {
+	case StreamBody:
+		if v, ok := val.(bool); ok {
+			m.streamBody = v
+			m.setKnownField(key, fieldStreamBody)
+			return
+		}
+	case LocalConnectionEstablishedTs:
+		if v, ok := val.(time.Time); ok {
+			m.localConnectionEstablishedTs = v
+			m.setKnownField(key, fieldLocalConnectionEstablishedTs)
+			return
+		}
+	case RemoteConnectionEstablishedTs:
+		if v, ok := val.(time.Time); ok {
+			m.remoteConnectionEstablishedTs = v
+			m.setKnownField(key, fieldRemoteConnectionEstablishedTs)
+			return
+		}
+	case RequestReceivedTs:
+		if v, ok := val.(time.Time); ok {
+			m.requestReceivedTs = v
+			m.setKnownField(key, fieldRequestReceivedTs)
+			return
+		}
+	case SSLHandshakeCompletedTs:
+		if v, ok := val.(time.Time); ok {
+			m.sslHandshakeCompletedTs = v
+			m.setKnownField(key, fieldSSLHandshakeCompletedTs)
+			return
+		}
+	case RequestHostport:
+		if v, ok := val.(string); ok {
+			m.requestHostport = v
+			m.setKnownField(key, fieldRequestHostport)
+			return
+		}
+	case LocalConnectionAddrInfo:
+		if v, ok := val.(ConnectionAddrInfo); ok {
+			m.localConnectionAddrInfo = v
+			m.setKnownField(key, fieldLocalConnectionAddrInfo)
+			return
+		}
+	case RemoteConnectionAddrInfo:
+		if v, ok := val.(ConnectionAddrInfo); ok {
+			m.remoteConnectionAddrInfo = v
+			m.setKnownField(key, fieldRemoteConnectionAddrInfo)
+			return
+		}
+	case ConnectionTLSState:
+		if v, ok := val.(*TLSState); ok {
+			m.tlsState = v
+			m.setKnownField(key, fieldConnectionTLSState)
+			return
+		}
+	case ConnectionServerCertificate:
+		if v, ok := val.(*ServerCertificate); ok {
+			m.serverCertificate = v
+			m.setKnownField(key, fieldConnectionServerCertificate)
+			return
+		}
+	}
 
-func (m *metadata) get(key string) (val any) { val, _ = m.md.Load(key); return }
+	m.clearKnownField(key)
+	if m.extra == nil {
+		m.extra = make(map[string]any)
+	}
+	m.extra[key] = val
+}
+
+func (m *metadata) setKnownField(key string, field uint16) {
+	m.setFields |= field
+	if m.extra != nil {
+		delete(m.extra, key)
+	}
+}
+
+func (m *metadata) clearKnownField(key string) {
+	switch key {
+	case StreamBody:
+		m.setFields &^= fieldStreamBody
+	case LocalConnectionEstablishedTs:
+		m.setFields &^= fieldLocalConnectionEstablishedTs
+	case RemoteConnectionEstablishedTs:
+		m.setFields &^= fieldRemoteConnectionEstablishedTs
+	case RequestReceivedTs:
+		m.setFields &^= fieldRequestReceivedTs
+	case SSLHandshakeCompletedTs:
+		m.setFields &^= fieldSSLHandshakeCompletedTs
+	case RequestHostport:
+		m.setFields &^= fieldRequestHostport
+	case LocalConnectionAddrInfo:
+		m.setFields &^= fieldLocalConnectionAddrInfo
+	case RemoteConnectionAddrInfo:
+		m.setFields &^= fieldRemoteConnectionAddrInfo
+	case ConnectionTLSState:
+		m.setFields &^= fieldConnectionTLSState
+	case ConnectionServerCertificate:
+		m.setFields &^= fieldConnectionServerCertificate
+	}
+}
+
+func (m *metadata) Get(key string) (val any, ok bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	switch key {
+	case StreamBody:
+		if m.setFields&fieldStreamBody == 0 {
+			return m.getExtra(key)
+		}
+		return m.streamBody, true
+	case LocalConnectionEstablishedTs:
+		if m.setFields&fieldLocalConnectionEstablishedTs == 0 {
+			return m.getExtra(key)
+		}
+		return m.localConnectionEstablishedTs, true
+	case RemoteConnectionEstablishedTs:
+		if m.setFields&fieldRemoteConnectionEstablishedTs == 0 {
+			return m.getExtra(key)
+		}
+		return m.remoteConnectionEstablishedTs, true
+	case RequestReceivedTs:
+		if m.setFields&fieldRequestReceivedTs == 0 {
+			return m.getExtra(key)
+		}
+		return m.requestReceivedTs, true
+	case SSLHandshakeCompletedTs:
+		if m.setFields&fieldSSLHandshakeCompletedTs == 0 {
+			return m.getExtra(key)
+		}
+		return m.sslHandshakeCompletedTs, true
+	case RequestHostport:
+		if m.setFields&fieldRequestHostport == 0 {
+			return m.getExtra(key)
+		}
+		return m.requestHostport, true
+	case LocalConnectionAddrInfo:
+		if m.setFields&fieldLocalConnectionAddrInfo == 0 {
+			return m.getExtra(key)
+		}
+		return m.localConnectionAddrInfo, true
+	case RemoteConnectionAddrInfo:
+		if m.setFields&fieldRemoteConnectionAddrInfo == 0 {
+			return m.getExtra(key)
+		}
+		return m.remoteConnectionAddrInfo, true
+	case ConnectionTLSState:
+		if m.setFields&fieldConnectionTLSState == 0 {
+			return m.getExtra(key)
+		}
+		return m.tlsState, true
+	case ConnectionServerCertificate:
+		if m.setFields&fieldConnectionServerCertificate == 0 {
+			return m.getExtra(key)
+		}
+		return m.serverCertificate, true
+	default:
+		return m.getExtra(key)
+	}
+}
+
+func (m *metadata) getExtra(key string) (any, bool) {
+	if m.extra == nil {
+		return nil, false
+	}
+	val, ok := m.extra[key]
+	return val, ok
+}
 
 func (m *metadata) MD() MD {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	var md MD
-	md.StreamBody, _ = m.get(StreamBody).(bool)
-	md.LocalConnectionEstablishedTs, _ = m.get(LocalConnectionEstablishedTs).(time.Time)
-	md.RemoteConnectionEstablishedTs, _ = m.get(RemoteConnectionEstablishedTs).(time.Time)
-	md.RequestProcessedTs, _ = m.get(RequestReceivedTs).(time.Time)
-	md.SSLHandshakeCompletedTs, _ = m.get(SSLHandshakeCompletedTs).(time.Time)
-	md.RequestHostport, _ = m.get(RequestHostport).(string)
-	md.LocalAddrInfo, _ = m.get(LocalConnectionAddrInfo).(ConnectionAddrInfo)
-	md.RemoteAddrInfo, _ = m.get(RemoteConnectionAddrInfo).(ConnectionAddrInfo)
-	md.TLSState, _ = m.get(ConnectionTLSState).(*TLSState)
-	md.ServerCertificate, _ = m.get(ConnectionServerCertificate).(*ServerCertificate)
+	if m.setFields&fieldStreamBody != 0 {
+		md.StreamBody = m.streamBody
+	}
+	if m.setFields&fieldLocalConnectionEstablishedTs != 0 {
+		md.LocalConnectionEstablishedTs = m.localConnectionEstablishedTs
+	}
+	if m.setFields&fieldRemoteConnectionEstablishedTs != 0 {
+		md.RemoteConnectionEstablishedTs = m.remoteConnectionEstablishedTs
+	}
+	if m.setFields&fieldRequestReceivedTs != 0 {
+		md.RequestProcessedTs = m.requestReceivedTs
+	}
+	if m.setFields&fieldSSLHandshakeCompletedTs != 0 {
+		md.SSLHandshakeCompletedTs = m.sslHandshakeCompletedTs
+	}
+	if m.setFields&fieldRequestHostport != 0 {
+		md.RequestHostport = m.requestHostport
+	}
+	if m.setFields&fieldLocalConnectionAddrInfo != 0 {
+		md.LocalAddrInfo = m.localConnectionAddrInfo
+	}
+	if m.setFields&fieldRemoteConnectionAddrInfo != 0 {
+		md.RemoteAddrInfo = m.remoteConnectionAddrInfo
+	}
+	if m.setFields&fieldConnectionTLSState != 0 {
+		md.TLSState = m.tlsState
+	}
+	if m.setFields&fieldConnectionServerCertificate != 0 {
+		md.ServerCertificate = m.serverCertificate
+	}
 	return md
 }
 
@@ -49,10 +269,95 @@ func FromContext(ctx context.Context) (*metadata, bool) {
 }
 
 func (m *metadata) Clone() *metadata {
-	dst := NewMD()
-	m.md.Range(func(key, value any) bool {
-		dst.md.Store(key, value)
-		return true
-	})
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	dst := &metadata{
+		setFields:                     m.setFields,
+		streamBody:                    m.streamBody,
+		localConnectionEstablishedTs:  m.localConnectionEstablishedTs,
+		remoteConnectionEstablishedTs: m.remoteConnectionEstablishedTs,
+		requestReceivedTs:             m.requestReceivedTs,
+		sslHandshakeCompletedTs:       m.sslHandshakeCompletedTs,
+		requestHostport:               m.requestHostport,
+		localConnectionAddrInfo:       m.localConnectionAddrInfo,
+		remoteConnectionAddrInfo:      m.remoteConnectionAddrInfo,
+		tlsState:                      m.tlsState,
+		serverCertificate:             m.serverCertificate,
+	}
+	if len(m.extra) > 0 {
+		dst.extra = make(map[string]any, len(m.extra))
+		maps.Copy(dst.extra, m.extra)
+	}
 	return dst
+}
+
+func (m *metadata) SetStreamBody(v bool) {
+	m.mu.Lock()
+	m.streamBody = v
+	m.setKnownField(StreamBody, fieldStreamBody)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetLocalConnectionEstablishedTs(v time.Time) {
+	m.mu.Lock()
+	m.localConnectionEstablishedTs = v
+	m.setKnownField(LocalConnectionEstablishedTs, fieldLocalConnectionEstablishedTs)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetRemoteConnectionEstablishedTs(v time.Time) {
+	m.mu.Lock()
+	m.remoteConnectionEstablishedTs = v
+	m.setKnownField(RemoteConnectionEstablishedTs, fieldRemoteConnectionEstablishedTs)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetRequestReceivedTs(v time.Time) {
+	m.mu.Lock()
+	m.requestReceivedTs = v
+	m.setKnownField(RequestReceivedTs, fieldRequestReceivedTs)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetSSLHandshakeCompletedTs(v time.Time) {
+	m.mu.Lock()
+	m.sslHandshakeCompletedTs = v
+	m.setKnownField(SSLHandshakeCompletedTs, fieldSSLHandshakeCompletedTs)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetRequestHostport(v string) {
+	m.mu.Lock()
+	m.requestHostport = v
+	m.setKnownField(RequestHostport, fieldRequestHostport)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetLocalConnectionAddrInfo(v ConnectionAddrInfo) {
+	m.mu.Lock()
+	m.localConnectionAddrInfo = v
+	m.setKnownField(LocalConnectionAddrInfo, fieldLocalConnectionAddrInfo)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetRemoteConnectionAddrInfo(v ConnectionAddrInfo) {
+	m.mu.Lock()
+	m.remoteConnectionAddrInfo = v
+	m.setKnownField(RemoteConnectionAddrInfo, fieldRemoteConnectionAddrInfo)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetConnectionTLSState(v *TLSState) {
+	m.mu.Lock()
+	m.tlsState = v
+	m.setKnownField(ConnectionTLSState, fieldConnectionTLSState)
+	m.mu.Unlock()
+}
+
+func (m *metadata) SetConnectionServerCertificate(v *ServerCertificate) {
+	m.mu.Lock()
+	m.serverCertificate = v
+	m.setKnownField(ConnectionServerCertificate, fieldConnectionServerCertificate)
+	m.mu.Unlock()
 }

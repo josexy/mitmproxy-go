@@ -6,11 +6,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
-	"fmt"
 	"math/big"
 	"net"
 	"net/netip"
-	"strings"
 	"time"
 )
 
@@ -84,11 +82,7 @@ func (sc *ServerCertificate) Sha1FingerprintHex() string {
 		return ""
 	}
 	fingerprint := sha1.Sum(sc.RawContent)
-	hexFingerprint := make([]string, 0, len(fingerprint))
-	for _, b := range fingerprint {
-		hexFingerprint = append(hexFingerprint, fmt.Sprintf("%02X", b))
-	}
-	return strings.Join(hexFingerprint, ":")
+	return colonHex(fingerprint[:])
 }
 
 func (sc *ServerCertificate) Sha256FingerprintHex() string {
@@ -96,11 +90,24 @@ func (sc *ServerCertificate) Sha256FingerprintHex() string {
 		return ""
 	}
 	fingerprint := sha256.Sum256(sc.RawContent)
-	hexFingerprint := make([]string, 0, len(fingerprint))
-	for _, b := range fingerprint {
-		hexFingerprint = append(hexFingerprint, fmt.Sprintf("%02X", b))
+	return colonHex(fingerprint[:])
+}
+
+func colonHex(src []byte) string {
+	if len(src) == 0 {
+		return ""
 	}
-	return strings.Join(hexFingerprint, ":")
+	const upperHex = "0123456789ABCDEF"
+	dst := make([]byte, len(src)*3-1)
+	for i, b := range src {
+		j := i * 3
+		if i > 0 {
+			dst[j-1] = ':'
+		}
+		dst[j] = upperHex[b>>4]
+		dst[j+1] = upperHex[b&0x0f]
+	}
+	return string(dst)
 }
 
 // MD contains metadata collected during proxy connection and request processing

@@ -99,9 +99,8 @@ type fakeHttpResponseWriter struct {
 
 func newFakeHttpResponseWriter(conn net.Conn) *fakeHttpResponseWriter {
 	return &fakeHttpResponseWriter{
-		header: make(http.Header),
-		conn:   conn,
-		bufRW:  bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
+		conn:  conn,
+		bufRW: bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
 	}
 }
 
@@ -111,7 +110,13 @@ func (f *fakeHttpResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 // implemented http.ResponseWriter but nothing to do
-func (f *fakeHttpResponseWriter) Header() http.Header       { return f.header }
+func (f *fakeHttpResponseWriter) Header() http.Header {
+	if f.header == nil {
+		f.header = make(http.Header)
+	}
+	return f.header
+}
+
 func (f *fakeHttpResponseWriter) Write([]byte) (int, error) { return 0, nil }
 func (f *fakeHttpResponseWriter) WriteHeader(int)           {}
 
@@ -383,15 +388,15 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	}
 
 	md := metadata.NewMD()
-	md.Set(metadata.LocalConnectionEstablishedTs, localConnEstTs)
-	md.Set(metadata.RemoteConnectionEstablishedTs, remoteConnEstTs)
-	md.Set(metadata.RequestReceivedTs, localConnEstTs)
-	md.Set(metadata.RequestHostport, reqCtx.Hostport)
-	md.Set(metadata.LocalConnectionAddrInfo, metadata.ConnectionAddrInfo{
+	md.SetLocalConnectionEstablishedTs(localConnEstTs)
+	md.SetRemoteConnectionEstablishedTs(remoteConnEstTs)
+	md.SetRequestReceivedTs(localConnEstTs)
+	md.SetRequestHostport(reqCtx.Hostport)
+	md.SetLocalConnectionAddrInfo(metadata.ConnectionAddrInfo{
 		SourceAddr:      getRemoteAddrPortFromConn(conn),
 		DestinationAddr: getLocalAddrPortFromConn(conn),
 	})
-	md.Set(metadata.RemoteConnectionAddrInfo, metadata.ConnectionAddrInfo{
+	md.SetRemoteConnectionAddrInfo(metadata.ConnectionAddrInfo{
 		SourceAddr:      getLocalAddrPortFromConn(dstConn),
 		DestinationAddr: getRemoteAddrPortFromConn(dstConn),
 	})
@@ -505,8 +510,8 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	if foundCert == nil {
 		return nil, nil, ErrServerCertUnavailable
 	}
-	md.Set(metadata.SSLHandshakeCompletedTs, tlsConnEstTs)
-	md.Set(metadata.ConnectionTLSState, &metadata.TLSState{
+	md.SetSSLHandshakeCompletedTs(tlsConnEstTs)
+	md.SetConnectionTLSState(&metadata.TLSState{
 		ServerName:          chi.ServerName,
 		CipherSuites:        chi.CipherSuites,
 		TLSVersions:         chi.SupportedVersions,
@@ -515,7 +520,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		SelectedTLSVersion:  cs.Version,
 		SelectedALPN:        cs.NegotiatedProtocol,
 	})
-	md.Set(metadata.ConnectionServerCertificate, &metadata.ServerCertificate{
+	md.SetConnectionServerCertificate(&metadata.ServerCertificate{
 		Version:            foundCert.Version,
 		SerialNumber:       foundCert.SerialNumber,
 		SignatureAlgorithm: foundCert.SignatureAlgorithm,
@@ -691,7 +696,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		}
 		nextCtx = cloneMetadataContext(nextCtx)
 		if md, ok := metadata.FromContext(nextCtx); ok {
-			md.Set(metadata.RequestReceivedTs, time.Now())
+			md.SetRequestReceivedTs(time.Now())
 		}
 
 		if isWsUpgrade {
@@ -867,8 +872,8 @@ type wsFrameImpl struct {
 	msgType int
 	dataBuf *buf.Buffer
 
-	once    sync.Once
-	invoker WebsocketDelegatedInvoker
+	released atomic.Bool
+	dst      *websocket.Conn
 }
 
 func (f *wsFrameImpl) Direction() WSDirection { return f.dir }
@@ -878,13 +883,15 @@ func (f *wsFrameImpl) MessageType() int { return f.msgType }
 func (f *wsFrameImpl) DataBuffer() *buf.Buffer { return f.dataBuf }
 
 func (f *wsFrameImpl) Invoke() error {
-	err := f.invoker.Invoke(f.msgType, f.dataBuf)
+	err := f.dst.WriteMessage(f.msgType, f.dataBuf.Bytes())
 	f.Release()
 	return err
 }
 
 func (f *wsFrameImpl) Release() {
-	f.once.Do(func() { releaseBuffer(f.dataBuf) })
+	if f.released.CompareAndSwap(false, true) {
+		releaseBuffer(f.dataBuf)
+	}
 }
 
 type wsFramesWatcherImpl struct {
@@ -975,7 +982,7 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 					dir:     dir,
 					msgType: msgType,
 					dataBuf: buffer,
-					invoker: wrapperInvoker(dst.WriteMessage),
+					dst:     dst,
 				}
 				if !fw.send(ctx, frame) {
 					frame.Release()
@@ -1059,13 +1066,13 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 	reqCtx, _ := FromRequestContext(ctx)
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	baseMD, _ := metadata.FromContext(ctx)
-	baseMD.Set(metadata.StreamBody, true)
+	baseMD.SetStreamBody(true)
 
 	// the http.ResponseWriter actually is net/http/h2_bundle.go http2responseWriter
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		streamCtx := cloneMetadataContext(ctx)
 		md, _ := metadata.FromContext(streamCtx)
-		md.Set(metadata.RequestReceivedTs, time.Now())
+		md.SetRequestReceivedTs(time.Now())
 
 		if req.URL.Scheme == "" {
 			if req.TLS != nil {
@@ -1132,9 +1139,9 @@ func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Rea
 	buffer := acquireHTTP2BodyBuffer()
 	defer releaseHTTP2BodyBuffer(buffer)
 	for {
-		n, err := body.Read(*buffer)
+		n, err := body.Read(buffer)
 		if n > 0 {
-			if _, writeErr := rw.Write((*buffer)[:n]); writeErr != nil {
+			if _, writeErr := rw.Write(buffer[:n]); writeErr != nil {
 				return writeErr
 			}
 			// Flush the response to keep the client happy

@@ -40,3 +40,22 @@ func TestDomainTreeMatch(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkDomainTreeMatch(b *testing.B) {
+	matcher := newTrieNode()
+	for _, pattern := range []string{
+		"*.example.com",
+		"google.com",
+		"*.internal.net",
+		"www.*.baidu.com",
+	} {
+		matcher.insert(pattern)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if !matcher.match("www.api.baidu.com") {
+			b.Fatal("expected host to match")
+		}
+	}
+}

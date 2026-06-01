@@ -53,11 +53,12 @@ func (hpd *httpProxyDialer) Dial(network string, addr string) (net.Conn, error) 
 		return nil, err
 	}
 
-	connectHeader := make(http.Header)
+	var connectHeader http.Header
 	if user := hpd.proxyURL.User; user != nil {
 		proxyUser := user.Username()
 		if proxyPassword, passwordSet := user.Password(); passwordSet {
 			credential := base64.StdEncoding.EncodeToString([]byte(proxyUser + ":" + proxyPassword))
+			connectHeader = make(http.Header)
 			connectHeader.Set("Proxy-Authorization", "Basic "+credential)
 		}
 	}

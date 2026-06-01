@@ -30,9 +30,8 @@ func IoCopy(dst io.Writer, src io.Reader) error {
 	} else if _, ok := dst.(io.ReaderFrom); ok {
 		b = nil
 	} else {
-		buf := tcpPool.Get()
-		defer tcpPool.Put(buf)
-		b = *buf
+		b = tcpPool.Get()
+		defer tcpPool.Put(b)
 	}
 	_, err := io.CopyBuffer(dst, src, b)
 	return err

@@ -28,13 +28,16 @@ func initH2CWithPriorKnowledge(w http.ResponseWriter) (net.Conn, error) {
 
 	const expectedBody = "SM\r\n\r\n"
 
-	buf := make([]byte, len(expectedBody))
-	n, err := io.ReadFull(rw, buf)
-	if err != nil {
-		return nil, fmt.Errorf("h2c: error reading client preface: %s", err)
+	var buf [len(expectedBody)]byte
+	for n := 0; n < len(buf); {
+		read, err := rw.Read(buf[n:])
+		if err != nil {
+			return nil, fmt.Errorf("h2c: error reading client preface: %s", err)
+		}
+		n += read
 	}
 
-	if string(buf[:n]) == expectedBody {
+	if string(buf[:]) == expectedBody {
 		return newBufConnExt(conn, rw), nil
 	}
 

@@ -62,14 +62,14 @@ func TestBufferPoolRejectsOversizedBuffers(t *testing.T) {
 func TestByteSliceAndBytesBufferPools(t *testing.T) {
 	v1 := NewV1(8)
 	data := v1.Get()
-	(*data)[0] = 'x'
+	data[0] = 'x'
 	v1.Put(data)
-	if (*data)[0] != 'x' {
+	if data[0] != 'x' {
 		t.Fatalf("fixed byte slice should not be reset")
 	}
 
 	large := make([]byte, MaxBufferSize)
-	v1.Put(&large)
+	v1.Put(large)
 	if cap(large) != MaxBufferSize {
 		t.Fatalf("oversized byte slice was mutated")
 	}

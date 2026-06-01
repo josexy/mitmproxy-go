@@ -28,8 +28,8 @@ var (
 
 func acquireBuffer() *buf.Buffer            { return wsBufferPool.Get() }
 func releaseBuffer(buffer *buf.Buffer)      { wsBufferPool.Put(buffer) }
-func acquireHTTP2BodyBuffer() *[]byte       { return http2BodyBufferPool.Get() }
-func releaseHTTP2BodyBuffer(buffer *[]byte) { http2BodyBufferPool.Put(buffer) }
+func acquireHTTP2BodyBuffer() []byte        { return http2BodyBufferPool.Get() }
+func releaseHTTP2BodyBuffer(buffer []byte)  { http2BodyBufferPool.Put(buffer) }
 func acquireSocksBuffer() *buf.Buffer       { return socksBufferPool.Get() }
 func releaseSocksBuffer(buffer *buf.Buffer) { socksBufferPool.Put(buffer) }
 

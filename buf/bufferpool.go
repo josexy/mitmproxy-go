@@ -52,12 +52,12 @@ func New(initSize int) *BufferPool[*Buffer] {
 	)
 }
 
-// NewV1 buffer type is *[]byte and the buffer size is fixed
-func NewV1(initSize int) *BufferPool[*[]byte] {
+// NewV1 buffer type is []byte and the buffer size is fixed
+func NewV1(initSize int) *BufferPool[[]byte] {
 	return NewPool(
-		func() *[]byte { data := make([]byte, initSize); return &data },
-		func(buf *[]byte) bool {
-			return cap(*buf) < MaxBufferSize
+		func() []byte { return make([]byte, initSize) },
+		func(buf []byte) bool {
+			return cap(buf) < MaxBufferSize
 		},
 	)
 }
