@@ -15,7 +15,6 @@ import (
 	"github.com/josexy/mitmproxy-go"
 	"github.com/josexy/mitmproxy-go/internal/cert"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 var (
@@ -35,34 +34,46 @@ func initCertPath() {
 	serverKeyPath = filepath.Join(tmpDir, serverKeyPath)
 }
 
-func startSimpleHttpServer(t *testing.T) func() {
+type testServerAddrs struct {
+	http1 string
+	h2    string
+	h2c   string
+	https string
+}
+
+func startSimpleHttpServer(t *testing.T) (testServerAddrs, func()) {
 	certificate, err := tls.LoadX509KeyPair(serverCertPath, serverKeyPath)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
 
+	httpListener := listenLocalhost(t)
+	httpsListener := listenLocalhost(t)
+	h2cListener := listenLocalhost(t)
+	https1Listener := listenLocalhost(t)
+
 	httpServer := &http.Server{
-		Addr:    ":9090",
 		Handler: mux,
 	}
 	httpsServer := &http.Server{
-		Addr:    ":9091",
 		Handler: mux,
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{certificate},
 		},
 	}
+	h2cProtocols := &http.Protocols{}
+	h2cProtocols.SetHTTP1(true)
+	h2cProtocols.SetUnencryptedHTTP2(true)
 	h2cServer := &http.Server{
-		Addr:    ":9092",
-		Handler: h2c.NewHandler(mux, &http2.Server{}),
+		Handler:   mux,
+		Protocols: h2cProtocols,
 	}
 
 	https1Server := &http.Server{
-		Addr:    ":9093",
 		Handler: mux,
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{certificate},
@@ -70,36 +81,51 @@ func startSimpleHttpServer(t *testing.T) func() {
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 	go func() {
-		t.Log("start HTTP1.1 server on :9090")
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			panic(err)
+		t.Logf("start HTTP1.1 server on %s", httpListener.Addr())
+		if err := httpServer.Serve(httpListener); err != nil && err != http.ErrServerClosed {
+			t.Errorf("HTTP1.1 server failed: %v", err)
 		}
 	}()
 	go func() {
-		t.Log("start HTTP2 over TLS server on :9091")
-		if err := httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			panic(err)
+		t.Logf("start HTTP2 over TLS server on %s", httpsListener.Addr())
+		if err := httpsServer.ServeTLS(httpsListener, "", ""); err != nil && err != http.ErrServerClosed {
+			t.Errorf("HTTP2 over TLS server failed: %v", err)
 		}
 	}()
 	go func() {
-		t.Log("start H2C server on :9092")
-		if err := h2cServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			panic(err)
+		t.Logf("start H2C server on %s", h2cListener.Addr())
+		if err := h2cServer.Serve(h2cListener); err != nil && err != http.ErrServerClosed {
+			t.Errorf("H2C server failed: %v", err)
 		}
 	}()
 	go func() {
-		t.Log("start HTTP1 over TLS server on :9093")
-		if err := https1Server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			panic(err)
+		t.Logf("start HTTP1 over TLS server on %s", https1Listener.Addr())
+		if err := https1Server.ServeTLS(https1Listener, "", ""); err != nil && err != http.ErrServerClosed {
+			t.Errorf("HTTP1 over TLS server failed: %v", err)
 		}
 	}()
 
-	return func() {
+	addrs := testServerAddrs{
+		http1: httpListener.Addr().String(),
+		h2:    httpsListener.Addr().String(),
+		h2c:   h2cListener.Addr().String(),
+		https: https1Listener.Addr().String(),
+	}
+	return addrs, func() {
 		httpServer.Close()
 		httpsServer.Close()
 		h2cServer.Close()
 		https1Server.Close()
 	}
+}
+
+func listenLocalhost(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln
 }
 
 func testHTTPRequest(typ, proxyAddr, targetAddr string) (statusCode int, proto string, err error) {
@@ -186,7 +212,7 @@ func genServerCertAndKey() {
 	os.WriteFile(serverKeyPath, keyPem, 0644)
 }
 
-func startmitmpgo(t *testing.T, interceptor mitmproxy.HTTPInterceptor) mitmproxy.MitmProxyHandler {
+func buildMitmHandler(t *testing.T, interceptor mitmproxy.HTTPInterceptor) mitmproxy.MitmProxyHandler {
 	handler, err := mitmproxy.NewMitmProxyHandler(
 		mitmproxy.WithCACertPath(mitmCertPath),
 		mitmproxy.WithCAKeyPath(mitmKeyPath),
@@ -208,16 +234,23 @@ func TestMitmProxyHandler(t *testing.T) {
 	genServerCertAndKey()
 	defer os.RemoveAll(certdir)
 
-	handler := startmitmpgo(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+	handler := buildMitmHandler(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
 		resp, err := hi.Invoke(req)
 		t.Logf("url: %s, req_proto: %s, rsp_proto: %s", req.URL, req.Proto, resp.Proto)
 		return resp, err
 	})
 
-	proxyAddr := "http://127.0.0.1:10087"
+	proxyListener := listenLocalhost(t)
+	proxyAddr := "http://" + proxyListener.Addr().String()
+	proxyServer := &http.Server{Handler: handler}
+	defer proxyServer.Close()
 
-	go func() { http.ListenAndServe(":10087", handler) }()
-	closeFunc := startSimpleHttpServer(t)
+	go func() {
+		if err := proxyServer.Serve(proxyListener); err != nil && err != http.ErrServerClosed {
+			t.Errorf("proxy server failed: %v", err)
+		}
+	}()
+	addrs, closeFunc := startSimpleHttpServer(t)
 	time.Sleep(time.Second * 1)
 
 	tests := []struct {
@@ -226,10 +259,10 @@ func TestMitmProxyHandler(t *testing.T) {
 		addr       string
 		statusCode int
 	}{
-		{"http/1.1", "HTTP/1.1", "http://127.0.0.1:9090", 200},
-		{"h2", "HTTP/2.0", "https://127.0.0.1:9091", 200},
-		{"h2c", "HTTP/2.0", "http://127.0.0.1:9092", 200},
-		{"https", "HTTP/1.1", "https://127.0.0.1:9093", 200},
+		{"http/1.1", "HTTP/1.1", "http://" + addrs.http1, 200},
+		{"h2", "HTTP/2.0", "https://" + addrs.h2, 200},
+		{"h2c", "HTTP/2.0", "http://" + addrs.h2c, 200},
+		{"https", "HTTP/1.1", "https://" + addrs.https, 200},
 	}
 
 	for _, test := range tests {

@@ -13,6 +13,7 @@ An easy-to-use and flexible MITM proxy library for Go that can intercept and ins
 - Upstream proxy support
 - Optional custom root CAs and client certificates for mTLS
 - Request metadata for TLS, timing, and connection details
+- Runtime config updates for new connections
 
 ## Installation
 
@@ -233,6 +234,64 @@ mitmproxy.WithExcludeHosts("*.cdn.com", "static.example.com")
 
 `WithExcludeHosts` takes precedence over `WithIncludeHosts`.
 
+## Dynamic Runtime Config
+
+Use `NewDynamicMitmProxyHandler` when runtime updates are needed:
+
+```go
+handler, err := mitmproxy.NewDynamicMitmProxyHandler(
+	mitmproxy.WithCACertPath("certs/ca.crt"),
+	mitmproxy.WithCAKeyPath("certs/ca.key"),
+	mitmproxy.WithHTTPInterceptor(initialInterceptor),
+)
+if err != nil {
+	log.Fatal(err)
+}
+
+handler.SetHTTPInterceptor(updatedInterceptor)
+handler.SetHostFilters(nil, []string{"*.cdn.example.com"})
+handler.SetHTTP2Disabled(true)
+```
+
+Runtime updates are published as immutable config snapshots. A connection captures one snapshot when it enters `Serve`, `ServeHTTP`, or `ServeSOCKS5`; updates only affect new connections. Existing HTTP keep-alive, HTTP/2, and WebSocket connections continue using the snapshot they started with.
+
+Available runtime setters:
+
+```go
+handler.SetProxy("http://127.0.0.1:8080")
+handler.SetProxyDisabled(true)
+handler.SetDialer(&net.Dialer{Timeout: 30 * time.Second})
+handler.SetHostFilters(includeHosts, excludeHosts)
+handler.SetRootCAs("certs/internal-ca.crt")
+handler.SetClientCerts(map[string]mitmproxy.ClientCert{
+	"example.com": {
+		CertPath: "certs/client.crt",
+		KeyPath:  "certs/client.key",
+	},
+})
+
+handler.SetIdleConnTimeout(60 * time.Second)
+handler.SetSkipVerifySSLFromServer(true)
+handler.SetHTTP2Disabled(true)
+handler.SetStreamBaseContext(ctx)
+
+handler.SetErrorHandler(errorHandler)
+handler.SetHTTPInterceptor(httpInterceptor)
+handler.SetChainHTTPInterceptors(interceptor1, interceptor2)
+handler.SetWebsocketInterceptor(websocketInterceptor)
+err := handler.SetMaxWebsocketFramesPerForward(4096)
+```
+
+`SetRootCAs`, `SetClientCerts`, `SetProxy`, `SetProxyDisabled`, `SetDialer`, and `SetMaxWebsocketFramesPerForward` can return errors. If validation fails, the previous runtime config remains active.
+
+CA certificate/key and certificate cache pool settings are initialization-only:
+
+```go
+mitmproxy.WithCACertPath("certs/ca.crt")
+mitmproxy.WithCAKeyPath("certs/ca.key")
+mitmproxy.WithCertCachePool(2048, 30, 15)
+```
+
 ## Metadata
 
 Interceptors can read connection and TLS metadata from the request context:
@@ -283,6 +342,7 @@ Current examples in this repository:
 - `examples/dumper`: HTTP and WebSocket dumping example with metadata logging
 - `examples/modify-content`: modifies request headers and response body
 - `examples/chain-interceptors`: demonstrates ordered HTTP interceptor chaining
+- `examples/dynamic-config`: demonstrates runtime config updates that affect new connections
 
 Run them from the repository root.
 
@@ -313,6 +373,14 @@ go run ./examples/modify-content/main.go -cacert certs/ca.crt -cakey certs/ca.ke
 ```bash
 go run ./examples/chain-interceptors/main.go -cacert certs/ca.crt -cakey certs/ca.key -port 10086
 ```
+
+### Dynamic Config
+
+```bash
+go run ./examples/dynamic-config/main.go -cacert certs/ca.crt -cakey certs/ca.key -port 10086 -origin-port 18080
+```
+
+The demo starts a local origin server, sends proxied requests, then updates the HTTP interceptor and host filters at runtime. Existing keep-alive connections keep their original config snapshot, while new connections use the latest config.
 
 ## Notes
 
