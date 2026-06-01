@@ -41,6 +41,12 @@ func LoadCACertificate(certPath, keyPath string) (cert *Cert, err error) {
 	}
 	certBlock, _ := pem.Decode(certPem)
 	keyBlock, _ := pem.Decode(keyPem)
+	if certBlock == nil {
+		return nil, errors.New("failed to decode certificate PEM")
+	}
+	if keyBlock == nil {
+		return nil, errors.New("failed to decode private key PEM")
+	}
 	caCert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
 		return nil, err

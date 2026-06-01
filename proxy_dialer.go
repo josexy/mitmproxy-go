@@ -86,7 +86,10 @@ func (hpd *httpProxyDialer) Dial(network string, addr string) (net.Conn, error) 
 	if resp.StatusCode != 200 {
 		conn.Close()
 		f := strings.SplitN(resp.Status, " ", 2)
-		return nil, errors.New(f[1])
+		if len(f) == 2 {
+			return nil, errors.New(f[1])
+		}
+		return nil, errors.New(resp.Status)
 	}
 	return conn, nil
 }
