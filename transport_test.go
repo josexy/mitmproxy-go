@@ -45,12 +45,12 @@ func TestProtocolsForRequest(t *testing.T) {
 func TestSingleConnTransportGetClientConnValidationAndClose(t *testing.T) {
 	tr := newTransport("example.com:80", nil, 0, false)
 	req, _ := http.NewRequest(http.MethodGet, "/path", nil)
-	if _, err := tr.getClientConn(context.Background(), req); err == nil || err.Error() != "request URL scheme is empty" {
+	if _, _, err := tr.getClientConn(context.Background(), req); err == nil || err.Error() != "request URL scheme is empty" {
 		t.Fatalf("empty scheme err = %v; want empty scheme error", err)
 	}
 
 	req, _ = http.NewRequest(http.MethodGet, "ftp://example.com/path", nil)
-	if _, err := tr.getClientConn(context.Background(), req); err == nil || err.Error() != `unsupported request URL scheme "ftp"` {
+	if _, _, err := tr.getClientConn(context.Background(), req); err == nil || err.Error() != `unsupported request URL scheme "ftp"` {
 		t.Fatalf("unsupported scheme err = %v", err)
 	}
 
@@ -58,7 +58,7 @@ func TestSingleConnTransportGetClientConnValidationAndClose(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	req, _ = http.NewRequest(http.MethodGet, "http://example.com/path", nil)
-	if _, err := tr.getClientConn(context.Background(), req); !errors.Is(err, net.ErrClosed) {
+	if _, _, err := tr.getClientConn(context.Background(), req); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed transport err = %v; want net.ErrClosed", err)
 	}
 	if err := tr.Close(); err != nil {

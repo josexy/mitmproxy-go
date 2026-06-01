@@ -317,6 +317,10 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	fmt.Printf("local connected at: %v\n", md.LocalConnectionEstablishedTs)
 	fmt.Printf("remote connected at: %v\n", md.RemoteConnectionEstablishedTs)
 	fmt.Printf("request processed at: %v\n", md.RequestProcessedTs)
+	fmt.Printf("total timing: %v\n", md.Timing.Total)
+	for _, phase := range md.Timing.Phases {
+		fmt.Printf("%s: offset=%v duration=%v\n", phase.Label, phase.Offset, phase.Duration)
+	}
 
 	if md.TLSState != nil {
 		fmt.Printf("selected ALPN: %s\n", md.TLSState.SelectedALPN)

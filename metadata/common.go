@@ -21,8 +21,28 @@ const (
 	RemoteConnectionEstablishedTs = "remote_connection_established_ts"
 	// RequestReceivedTs is the timestamp when the request was received and processed
 	RequestReceivedTs = "request_received_ts"
+	// DNSLookupStartTs is the timestamp when DNS lookup started
+	DNSLookupStartTs = "dns_lookup_start_ts"
+	// DNSLookupDoneTs is the timestamp when DNS lookup completed
+	DNSLookupDoneTs = "dns_lookup_done_ts"
+	// SocketConnectStartTs is the timestamp when socket connection started
+	SocketConnectStartTs = "socket_connect_start_ts"
+	// SocketConnectDoneTs is the timestamp when socket connection completed
+	SocketConnectDoneTs = "socket_connect_done_ts"
+	// SSLHandshakeStartTs is the timestamp when the SSL/TLS handshake started
+	SSLHandshakeStartTs = "ssl_handshake_start_ts"
 	// SSLHandshakeCompletedTs is the timestamp when the SSL/TLS handshake completed
 	SSLHandshakeCompletedTs = "ssl_handshake_completed_ts"
+	// RequestUploadStartTs is the timestamp when request upload started
+	RequestUploadStartTs = "request_upload_start_ts"
+	// RequestUploadDoneTs is the timestamp when request upload completed
+	RequestUploadDoneTs = "request_upload_done_ts"
+	// ResponseStartTs is the timestamp when the first response byte was received
+	ResponseStartTs = "response_start_ts"
+	// ResponseDoneTs is the timestamp when response body download completed
+	ResponseDoneTs = "response_done_ts"
+	// ConnectionReused indicates whether the request reused an existing upstream connection
+	ConnectionReused = "connection_reused"
 	// RequestHostport is the target host:port from the request
 	RequestHostport = "request_hostport"
 	// LocalConnectionAddrInfo is the client's source address and port
@@ -116,10 +136,12 @@ type MD struct {
 	LocalConnectionEstablishedTs  time.Time          // When the client's connection was established
 	RemoteConnectionEstablishedTs time.Time          // When the connection to the remote server was established
 	RequestProcessedTs            time.Time          // When the request was received and started processing
+	SSLHandshakeStartTs           time.Time          // When TLS handshake started (zero if non-TLS)
 	SSLHandshakeCompletedTs       time.Time          // When TLS handshake completed (zero if non-TLS)
 	RequestHostport               string             // Target host:port (e.g., "example.com:443")
 	LocalAddrInfo                 ConnectionAddrInfo // Client's source address and port
 	RemoteAddrInfo                ConnectionAddrInfo // Destination server's address and port
 	TLSState                      *TLSState          // TLS negotiation details (nil if non-TLS)
 	ServerCertificate             *ServerCertificate // Server's certificate (nil if non-TLS)
+	Timing                        Timing             // Request timing phases suitable for waterfall charts
 }

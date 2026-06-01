@@ -1,9 +1,11 @@
 package mitmproxy_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509/pkix"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/josexy/mitmproxy-go"
 	"github.com/josexy/mitmproxy-go/internal/cert"
+	"github.com/josexy/mitmproxy-go/metadata"
 	"golang.org/x/net/http2"
 )
 
@@ -27,11 +30,11 @@ var (
 
 func initCertPath() {
 	tmpDir := os.TempDir()
-	certdir = filepath.Join(tmpDir, certdir)
-	mitmCertPath = filepath.Join(tmpDir, mitmCertPath)
-	mitmKeyPath = filepath.Join(tmpDir, mitmKeyPath)
-	serverCertPath = filepath.Join(tmpDir, serverCertPath)
-	serverKeyPath = filepath.Join(tmpDir, serverKeyPath)
+	certdir = filepath.Join(tmpDir, "cert")
+	mitmCertPath = filepath.Join(tmpDir, "cert", "ca.crt")
+	mitmKeyPath = filepath.Join(tmpDir, "cert", "ca.key")
+	serverCertPath = filepath.Join(tmpDir, "cert", "server.crt")
+	serverKeyPath = filepath.Join(tmpDir, "cert", "server.key")
 }
 
 type testServerAddrs struct {
@@ -279,4 +282,200 @@ func TestMitmProxyHandler(t *testing.T) {
 	}
 
 	closeFunc()
+}
+
+func TestHTTP1TimingPhases(t *testing.T) {
+	initCertPath()
+	genCACertAndKey()
+	genServerCertAndKey()
+	defer os.RemoveAll(certdir)
+
+	origin := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			time.Sleep(10 * time.Millisecond)
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}
+	originLn := listenLocalhost(t)
+	go func() {
+		if err := origin.Serve(originLn); err != nil && err != http.ErrServerClosed {
+			t.Errorf("origin server failed: %v", err)
+		}
+	}()
+	defer origin.Close()
+
+	timingCh := make(chan metadata.Timing, 1)
+	handler := buildMitmHandler(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+		resp, err := hi.Invoke(req)
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(data))
+		md, _ := metadata.FromContext(ctx)
+		timingCh <- md.MD().Timing
+		return resp, nil
+	})
+	proxyLn := listenLocalhost(t)
+	proxyServer := &http.Server{Handler: handler}
+	go func() {
+		if err := proxyServer.Serve(proxyLn); err != nil && err != http.ErrServerClosed {
+			t.Errorf("proxy server failed: %v", err)
+		}
+	}()
+	defer proxyServer.Close()
+
+	client := &http.Client{Transport: &http.Transport{
+		Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxyLn.Addr().String()}),
+	}}
+	resp, err := client.Post("http://"+originLn.Addr().String()+"/", "text/plain", bytes.NewReader([]byte("payload")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	timing := <-timingCh
+	assertTimingHasPhase(t, timing, metadata.SocketConnect)
+	assertTimingHasPhase(t, timing, metadata.RequestUpload)
+	assertTimingHasPhase(t, timing, metadata.WaitingResponse)
+	assertTimingHasPhase(t, timing, metadata.ResponseDownload)
+	if timing.Total <= 0 || timing.End.IsZero() {
+		t.Fatalf("timing total/end not recorded: %#v", timing)
+	}
+}
+
+func TestHTTPSTimingIncludesSSLHandshake(t *testing.T) {
+	initCertPath()
+	genCACertAndKey()
+	genServerCertAndKey()
+	defer os.RemoveAll(certdir)
+
+	addrs, closeOrigins := startSimpleHttpServer(t)
+	defer closeOrigins()
+
+	timingCh := make(chan metadata.Timing, 1)
+	handler := buildMitmHandler(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+		resp, err := hi.Invoke(req)
+		if err != nil {
+			return nil, err
+		}
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader([]byte("ok")))
+		md, _ := metadata.FromContext(ctx)
+		timingCh <- md.MD().Timing
+		return resp, nil
+	})
+	proxyLn := listenLocalhost(t)
+	proxyServer := &http.Server{Handler: handler}
+	go func() {
+		if err := proxyServer.Serve(proxyLn); err != nil && err != http.ErrServerClosed {
+			t.Errorf("proxy server failed: %v", err)
+		}
+	}()
+	defer proxyServer.Close()
+
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:           http.ProxyURL(&url.URL{Scheme: "http", Host: proxyLn.Addr().String()}),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}}
+	resp, err := client.Get("https://" + addrs.https + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	timing := <-timingCh
+	assertTimingHasPhase(t, timing, metadata.SSLHandshake)
+}
+
+func TestKeepAliveTimingSkipsConnectionPhasesForReusedConnection(t *testing.T) {
+	initCertPath()
+	genCACertAndKey()
+	genServerCertAndKey()
+	defer os.RemoveAll(certdir)
+
+	origin := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})}
+	originLn := listenLocalhost(t)
+	go func() {
+		if err := origin.Serve(originLn); err != nil && err != http.ErrServerClosed {
+			t.Errorf("origin server failed: %v", err)
+		}
+	}()
+	defer origin.Close()
+
+	timingCh := make(chan metadata.Timing, 2)
+	handler := buildMitmHandler(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+		resp, err := hi.Invoke(req)
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(data))
+		md, _ := metadata.FromContext(ctx)
+		timingCh <- md.MD().Timing
+		return resp, nil
+	})
+	proxyLn := listenLocalhost(t)
+	proxyServer := &http.Server{Handler: handler}
+	go func() {
+		if err := proxyServer.Serve(proxyLn); err != nil && err != http.ErrServerClosed {
+			t.Errorf("proxy server failed: %v", err)
+		}
+	}()
+	defer proxyServer.Close()
+
+	client := &http.Client{Transport: &http.Transport{
+		Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxyLn.Addr().String()}),
+	}}
+	for i := 0; i < 2; i++ {
+		resp, err := client.Get("http://" + originLn.Addr().String() + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	<-timingCh
+	reusedTiming := <-timingCh
+	if !reusedTiming.ConnectionReused {
+		t.Fatalf("second request ConnectionReused = false; want true")
+	}
+	assertTimingMissingPhase(t, reusedTiming, metadata.SocketConnect)
+}
+
+func assertTimingHasPhase(t *testing.T, timing metadata.Timing, name metadata.TimingPhaseName) {
+	t.Helper()
+	for _, phase := range timing.Phases {
+		if phase.Name == name {
+			if phase.Duration < 0 {
+				t.Fatalf("phase %s has negative duration: %#v", name, phase)
+			}
+			return
+		}
+	}
+	t.Fatalf("timing missing phase %s: %#v", name, timing)
+}
+
+func assertTimingMissingPhase(t *testing.T, timing metadata.Timing, name metadata.TimingPhaseName) {
+	t.Helper()
+	for _, phase := range timing.Phases {
+		if phase.Name == name {
+			t.Fatalf("timing unexpectedly includes phase %s: %#v", name, timing)
+		}
+	}
 }
