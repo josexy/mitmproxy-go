@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/josexy/mitmproxy-go/metadata"
 )
 
 type singleConnTransport struct {
@@ -38,12 +36,9 @@ func newTransport(
 }
 
 func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	clientConn, reused, err := t.getClientConn(req.Context(), req)
+	clientConn, err := t.getClientConn(req.Context(), req)
 	if err != nil {
 		return nil, err
-	}
-	if md, ok := metadata.FromContext(req.Context()); ok {
-		md.SetConnectionReused(reused)
 	}
 	resp, err := clientConn.RoundTrip(req)
 	if err != nil {
@@ -69,23 +64,23 @@ func (t *singleConnTransport) Close() error {
 	return nil
 }
 
-func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Request) (*http.ClientConn, bool, error) {
+func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Request) (*http.ClientConn, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.closed {
-		return nil, false, net.ErrClosed
+		return nil, net.ErrClosed
 	}
 	if t.clientConn != nil {
-		return t.clientConn, true, nil
+		return t.clientConn, nil
 	}
 
 	scheme := req.URL.Scheme
 	if scheme == "" {
-		return nil, false, errors.New("request URL scheme is empty")
+		return nil, errors.New("request URL scheme is empty")
 	}
 	if scheme != "http" && scheme != "https" {
-		return nil, false, fmt.Errorf("unsupported request URL scheme %q", scheme)
+		return nil, fmt.Errorf("unsupported request URL scheme %q", scheme)
 	}
 
 	baseTransport := &http.Transport{
@@ -97,10 +92,10 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 	}
 	clientConn, err := baseTransport.NewClientConn(ctx, scheme, t.hostport)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	t.clientConn = clientConn
-	return clientConn, false, nil
+	return clientConn, nil
 }
 
 func protocolsForRequest(scheme string, protoMajor int, disableHTTP2 bool) *http.Protocols {

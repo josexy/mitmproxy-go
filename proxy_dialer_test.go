@@ -183,7 +183,7 @@ func TestProxyDialerDirectDialAndRemoteAddr(t *testing.T) {
 	<-done
 }
 
-func TestProxyDialerRecordsTimingForHostnames(t *testing.T) {
+func TestProxyDialerRecordsConnectionTimestampsForHostnames(t *testing.T) {
 	dialer := NewProxyDialer(nil, &net.Dialer{Timeout: time.Second})
 	md := metadata.NewMD()
 	if _, err := dialer.DialTCPContextWithMetadata(context.Background(), "localhost:1", md); err == nil {
@@ -192,13 +192,13 @@ func TestProxyDialerRecordsTimingForHostnames(t *testing.T) {
 	if _, ok := md.Get(metadata.DNSLookupStartTs); !ok {
 		t.Fatalf("DNS lookup start was not recorded")
 	}
-	if _, ok := md.Get(metadata.DNSLookupDoneTs); !ok {
+	if _, ok := md.Get(metadata.DNSLookupCompletedTs); !ok {
 		t.Fatalf("DNS lookup done was not recorded")
 	}
 	if _, ok := md.Get(metadata.SocketConnectStartTs); !ok {
 		t.Fatalf("socket connect start was not recorded")
 	}
-	if _, ok := md.Get(metadata.SocketConnectDoneTs); !ok {
+	if _, ok := md.Get(metadata.SocketConnectCompletedTs); !ok {
 		t.Fatalf("socket connect done was not recorded")
 	}
 }
@@ -212,13 +212,13 @@ func TestProxyDialerSkipsDNSForIPLiteral(t *testing.T) {
 	if _, ok := md.Get(metadata.DNSLookupStartTs); ok {
 		t.Fatalf("DNS lookup start was recorded for IP literal")
 	}
-	if _, ok := md.Get(metadata.DNSLookupDoneTs); ok {
+	if _, ok := md.Get(metadata.DNSLookupCompletedTs); ok {
 		t.Fatalf("DNS lookup done was recorded for IP literal")
 	}
 	if _, ok := md.Get(metadata.SocketConnectStartTs); !ok {
 		t.Fatalf("socket connect start was not recorded")
 	}
-	if _, ok := md.Get(metadata.SocketConnectDoneTs); !ok {
+	if _, ok := md.Get(metadata.SocketConnectCompletedTs); !ok {
 		t.Fatalf("socket connect done was not recorded")
 	}
 }

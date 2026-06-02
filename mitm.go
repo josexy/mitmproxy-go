@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/netip"
 	"slices"
 	"strings"
@@ -350,6 +349,9 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	}()
 	localConnEstTs := time.Now()
 	md := metadata.NewMD()
+	md.SetLocalConnectionEstablishedTs(localConnEstTs)
+	md.SetRequestReceivedTs(localConnEstTs)
+	md.SetRequestHostport(reqCtx.Hostport)
 	dstConn, err := cfg.proxyDialer.DialTCPContextWithMetadata(ctx, reqCtx.Hostport, md)
 	if err != nil {
 		conn.Close()
@@ -389,10 +391,7 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		return r.passthroughTunnel(ctx, conn, dstConn)
 	}
 
-	md.SetLocalConnectionEstablishedTs(localConnEstTs)
 	md.SetRemoteConnectionEstablishedTs(remoteConnEstTs)
-	md.SetRequestReceivedTs(localConnEstTs)
-	md.SetRequestHostport(reqCtx.Hostport)
 	md.SetLocalConnectionAddrInfo(metadata.ConnectionAddrInfo{
 		SourceAddr:      getRemoteAddrPortFromConn(conn),
 		DestinationAddr: getLocalAddrPortFromConn(conn),
@@ -497,7 +496,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	if err := tlsClientConn.HandshakeContext(ctx); err != nil {
 		return nil, nil, err
 	}
-	md.SetSSLHandshakeCompletedTs(time.Now())
+	tlsConnEstTs := time.Now()
 	cs := tlsClientConn.ConnectionState()
 	if cs.NegotiatedProtocol == "" {
 		// fallback to http/1.1 if the server doesn't support ALPN or doesn't return the negotiated protocol
@@ -512,6 +511,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	if foundCert == nil {
 		return nil, nil, ErrServerCertUnavailable
 	}
+	md.SetSSLHandshakeCompletedTs(tlsConnEstTs)
 	md.SetConnectionTLSState(&metadata.TLSState{
 		ServerName:          chi.ServerName,
 		CipherSuites:        chi.CipherSuites,
@@ -698,10 +698,6 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		nextCtx = cloneMetadataContext(nextCtx)
 		if md, ok := metadata.FromContext(nextCtx); ok {
 			md.SetRequestReceivedTs(time.Now())
-			md.SetResponseDoneTs(time.Time{})
-			md.SetResponseStartTs(time.Time{})
-			md.SetRequestUploadStartTs(time.Time{})
-			md.SetRequestUploadDoneTs(time.Time{})
 		}
 
 		if isWsUpgrade {
@@ -1054,96 +1050,17 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 
 	reqCtx.Request = req
 	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
-	ctx = context.WithValue(ctx, connContextKey, connCtx)
-	req = req.WithContext(withTimingTrace(ctx, md))
-	invoker := HTTPDelegatedInvokerFunc(func(r *http.Request) (*http.Response, error) {
-		resp, err := connCtx.transport.RoundTrip(r)
-		return wrapTimedResponseBody(resp, md), err
-	})
+	req = req.WithContext(context.WithValue(ctx, connContextKey, connCtx))
 	// Only one http interceptor will be invoked
 	if connCtx.config.httpInt != nil {
-		response, err = connCtx.config.httpInt(ctx, req, invoker)
+		response, err = connCtx.config.httpInt(ctx, req, HTTPDelegatedInvokerFunc(connCtx.transport.RoundTrip))
 	} else {
-		response, err = invoker.Invoke(req)
+		response, err = connCtx.transport.RoundTrip(req)
 	}
 	if err != nil {
 		err = fmt.Errorf("transport RoundTrip %s failed: %s", reqCtx.Hostport, err)
 	}
 	return
-}
-
-func wrapTimedResponseBody(response *http.Response, md timingMetadata) *http.Response {
-	if response != nil && response.Body != nil {
-		response.Body = &timedResponseBody{
-			ReadCloser: response.Body,
-			md:         md,
-		}
-	}
-	return response
-}
-
-type timingMetadata interface {
-	Get(string) (any, bool)
-	SetConnectionReused(bool)
-	SetRequestUploadStartTs(time.Time)
-	SetRequestUploadDoneTs(time.Time)
-	SetResponseStartTs(time.Time)
-	SetResponseDoneTs(time.Time)
-}
-
-func withTimingTrace(ctx context.Context, md timingMetadata) context.Context {
-	if md == nil {
-		return ctx
-	}
-	trace := &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) {
-			md.SetConnectionReused(info.Reused)
-		},
-		WroteHeaders: func() {
-			md.SetRequestUploadStartTs(time.Now())
-		},
-		WroteRequest: func(httptrace.WroteRequestInfo) {
-			now := time.Now()
-			if _, ok := md.Get(metadata.RequestUploadStartTs); !ok {
-				md.SetRequestUploadStartTs(now)
-			}
-			md.SetRequestUploadDoneTs(now)
-		},
-		GotFirstResponseByte: func() {
-			md.SetResponseStartTs(time.Now())
-		},
-	}
-	return httptrace.WithClientTrace(ctx, trace)
-}
-
-type timedResponseBody struct {
-	io.ReadCloser
-	md       timingMetadata
-	doneOnce sync.Once
-}
-
-func (b *timedResponseBody) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	if err == io.EOF {
-		b.markDone()
-	}
-	return n, err
-}
-
-func (b *timedResponseBody) Close() error {
-	err := b.ReadCloser.Close()
-	b.markDone()
-	return err
-}
-
-func (b *timedResponseBody) markDone() {
-	b.doneOnce.Do(func() {
-		now := time.Now()
-		if _, ok := b.md.Get(metadata.ResponseStartTs); !ok {
-			b.md.SetResponseStartTs(now)
-		}
-		b.md.SetResponseDoneTs(now)
-	})
 }
 
 func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {

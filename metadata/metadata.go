@@ -13,23 +13,18 @@ type metadataKey struct{}
 type metadata struct {
 	mu sync.RWMutex
 
-	setFields uint32
+	setFields uint16
 
 	streamBody                    bool
 	localConnectionEstablishedTs  time.Time
 	remoteConnectionEstablishedTs time.Time
 	requestReceivedTs             time.Time
 	dnsLookupStartTs              time.Time
-	dnsLookupDoneTs               time.Time
+	dnsLookupCompletedTs          time.Time
 	socketConnectStartTs          time.Time
-	socketConnectDoneTs           time.Time
+	socketConnectCompletedTs      time.Time
 	sslHandshakeStartTs           time.Time
 	sslHandshakeCompletedTs       time.Time
-	requestUploadStartTs          time.Time
-	requestUploadDoneTs           time.Time
-	responseStartTs               time.Time
-	responseDoneTs                time.Time
-	connectionReused              bool
 	requestHostport               string
 	localConnectionAddrInfo       ConnectionAddrInfo
 	remoteConnectionAddrInfo      ConnectionAddrInfo
@@ -40,21 +35,16 @@ type metadata struct {
 }
 
 const (
-	fieldStreamBody uint32 = 1 << iota
+	fieldStreamBody uint16 = 1 << iota
 	fieldLocalConnectionEstablishedTs
 	fieldRemoteConnectionEstablishedTs
 	fieldRequestReceivedTs
 	fieldDNSLookupStartTs
-	fieldDNSLookupDoneTs
+	fieldDNSLookupCompletedTs
 	fieldSocketConnectStartTs
-	fieldSocketConnectDoneTs
+	fieldSocketConnectCompletedTs
 	fieldSSLHandshakeStartTs
 	fieldSSLHandshakeCompletedTs
-	fieldRequestUploadStartTs
-	fieldRequestUploadDoneTs
-	fieldResponseStartTs
-	fieldResponseDoneTs
-	fieldConnectionReused
 	fieldRequestHostport
 	fieldLocalConnectionAddrInfo
 	fieldRemoteConnectionAddrInfo
@@ -99,10 +89,10 @@ func (m *metadata) Set(key string, val any) {
 			m.setKnownField(key, fieldDNSLookupStartTs)
 			return
 		}
-	case DNSLookupDoneTs:
+	case DNSLookupCompletedTs:
 		if v, ok := val.(time.Time); ok {
-			m.dnsLookupDoneTs = v
-			m.setKnownField(key, fieldDNSLookupDoneTs)
+			m.dnsLookupCompletedTs = v
+			m.setKnownField(key, fieldDNSLookupCompletedTs)
 			return
 		}
 	case SocketConnectStartTs:
@@ -111,10 +101,10 @@ func (m *metadata) Set(key string, val any) {
 			m.setKnownField(key, fieldSocketConnectStartTs)
 			return
 		}
-	case SocketConnectDoneTs:
+	case SocketConnectCompletedTs:
 		if v, ok := val.(time.Time); ok {
-			m.socketConnectDoneTs = v
-			m.setKnownField(key, fieldSocketConnectDoneTs)
+			m.socketConnectCompletedTs = v
+			m.setKnownField(key, fieldSocketConnectCompletedTs)
 			return
 		}
 	case SSLHandshakeStartTs:
@@ -127,36 +117,6 @@ func (m *metadata) Set(key string, val any) {
 		if v, ok := val.(time.Time); ok {
 			m.sslHandshakeCompletedTs = v
 			m.setKnownField(key, fieldSSLHandshakeCompletedTs)
-			return
-		}
-	case RequestUploadStartTs:
-		if v, ok := val.(time.Time); ok {
-			m.requestUploadStartTs = v
-			m.setKnownField(key, fieldRequestUploadStartTs)
-			return
-		}
-	case RequestUploadDoneTs:
-		if v, ok := val.(time.Time); ok {
-			m.requestUploadDoneTs = v
-			m.setKnownField(key, fieldRequestUploadDoneTs)
-			return
-		}
-	case ResponseStartTs:
-		if v, ok := val.(time.Time); ok {
-			m.responseStartTs = v
-			m.setKnownField(key, fieldResponseStartTs)
-			return
-		}
-	case ResponseDoneTs:
-		if v, ok := val.(time.Time); ok {
-			m.responseDoneTs = v
-			m.setKnownField(key, fieldResponseDoneTs)
-			return
-		}
-	case ConnectionReused:
-		if v, ok := val.(bool); ok {
-			m.connectionReused = v
-			m.setKnownField(key, fieldConnectionReused)
 			return
 		}
 	case RequestHostport:
@@ -198,7 +158,7 @@ func (m *metadata) Set(key string, val any) {
 	m.extra[key] = val
 }
 
-func (m *metadata) setKnownField(key string, field uint32) {
+func (m *metadata) setKnownField(key string, field uint16) {
 	m.setFields |= field
 	if m.extra != nil {
 		delete(m.extra, key)
@@ -217,26 +177,16 @@ func (m *metadata) clearKnownField(key string) {
 		m.setFields &^= fieldRequestReceivedTs
 	case DNSLookupStartTs:
 		m.setFields &^= fieldDNSLookupStartTs
-	case DNSLookupDoneTs:
-		m.setFields &^= fieldDNSLookupDoneTs
+	case DNSLookupCompletedTs:
+		m.setFields &^= fieldDNSLookupCompletedTs
 	case SocketConnectStartTs:
 		m.setFields &^= fieldSocketConnectStartTs
-	case SocketConnectDoneTs:
-		m.setFields &^= fieldSocketConnectDoneTs
+	case SocketConnectCompletedTs:
+		m.setFields &^= fieldSocketConnectCompletedTs
 	case SSLHandshakeStartTs:
 		m.setFields &^= fieldSSLHandshakeStartTs
 	case SSLHandshakeCompletedTs:
 		m.setFields &^= fieldSSLHandshakeCompletedTs
-	case RequestUploadStartTs:
-		m.setFields &^= fieldRequestUploadStartTs
-	case RequestUploadDoneTs:
-		m.setFields &^= fieldRequestUploadDoneTs
-	case ResponseStartTs:
-		m.setFields &^= fieldResponseStartTs
-	case ResponseDoneTs:
-		m.setFields &^= fieldResponseDoneTs
-	case ConnectionReused:
-		m.setFields &^= fieldConnectionReused
 	case RequestHostport:
 		m.setFields &^= fieldRequestHostport
 	case LocalConnectionAddrInfo:
@@ -280,21 +230,21 @@ func (m *metadata) Get(key string) (val any, ok bool) {
 			return m.getExtra(key)
 		}
 		return m.dnsLookupStartTs, true
-	case DNSLookupDoneTs:
-		if m.setFields&fieldDNSLookupDoneTs == 0 {
+	case DNSLookupCompletedTs:
+		if m.setFields&fieldDNSLookupCompletedTs == 0 {
 			return m.getExtra(key)
 		}
-		return m.dnsLookupDoneTs, true
+		return m.dnsLookupCompletedTs, true
 	case SocketConnectStartTs:
 		if m.setFields&fieldSocketConnectStartTs == 0 {
 			return m.getExtra(key)
 		}
 		return m.socketConnectStartTs, true
-	case SocketConnectDoneTs:
-		if m.setFields&fieldSocketConnectDoneTs == 0 {
+	case SocketConnectCompletedTs:
+		if m.setFields&fieldSocketConnectCompletedTs == 0 {
 			return m.getExtra(key)
 		}
-		return m.socketConnectDoneTs, true
+		return m.socketConnectCompletedTs, true
 	case SSLHandshakeStartTs:
 		if m.setFields&fieldSSLHandshakeStartTs == 0 {
 			return m.getExtra(key)
@@ -305,31 +255,6 @@ func (m *metadata) Get(key string) (val any, ok bool) {
 			return m.getExtra(key)
 		}
 		return m.sslHandshakeCompletedTs, true
-	case RequestUploadStartTs:
-		if m.setFields&fieldRequestUploadStartTs == 0 {
-			return m.getExtra(key)
-		}
-		return m.requestUploadStartTs, true
-	case RequestUploadDoneTs:
-		if m.setFields&fieldRequestUploadDoneTs == 0 {
-			return m.getExtra(key)
-		}
-		return m.requestUploadDoneTs, true
-	case ResponseStartTs:
-		if m.setFields&fieldResponseStartTs == 0 {
-			return m.getExtra(key)
-		}
-		return m.responseStartTs, true
-	case ResponseDoneTs:
-		if m.setFields&fieldResponseDoneTs == 0 {
-			return m.getExtra(key)
-		}
-		return m.responseDoneTs, true
-	case ConnectionReused:
-		if m.setFields&fieldConnectionReused == 0 {
-			return m.getExtra(key)
-		}
-		return m.connectionReused, true
 	case RequestHostport:
 		if m.setFields&fieldRequestHostport == 0 {
 			return m.getExtra(key)
@@ -385,6 +310,18 @@ func (m *metadata) MD() MD {
 	if m.setFields&fieldRequestReceivedTs != 0 {
 		md.RequestProcessedTs = m.requestReceivedTs
 	}
+	if m.setFields&fieldDNSLookupStartTs != 0 {
+		md.DNSLookupStartTs = m.dnsLookupStartTs
+	}
+	if m.setFields&fieldDNSLookupCompletedTs != 0 {
+		md.DNSLookupCompletedTs = m.dnsLookupCompletedTs
+	}
+	if m.setFields&fieldSocketConnectStartTs != 0 {
+		md.SocketConnectStartTs = m.socketConnectStartTs
+	}
+	if m.setFields&fieldSocketConnectCompletedTs != 0 {
+		md.SocketConnectCompletedTs = m.socketConnectCompletedTs
+	}
 	if m.setFields&fieldSSLHandshakeStartTs != 0 {
 		md.SSLHandshakeStartTs = m.sslHandshakeStartTs
 	}
@@ -406,21 +343,6 @@ func (m *metadata) MD() MD {
 	if m.setFields&fieldConnectionServerCertificate != 0 {
 		md.ServerCertificate = m.serverCertificate
 	}
-	md.Timing = buildTiming(timingMarks{
-		Start:              m.requestReceivedTs,
-		End:                m.responseDoneTs,
-		DNSLookupStart:     m.dnsLookupStartTs,
-		DNSLookupDone:      m.dnsLookupDoneTs,
-		SocketConnectStart: m.socketConnectStartTs,
-		SocketConnectDone:  m.socketConnectDoneTs,
-		SSLHandshakeStart:  m.sslHandshakeStartTs,
-		SSLHandshakeDone:   m.sslHandshakeCompletedTs,
-		RequestUploadStart: m.requestUploadStartTs,
-		RequestUploadDone:  m.requestUploadDoneTs,
-		ResponseStart:      m.responseStartTs,
-		ResponseDone:       m.responseDoneTs,
-		ConnectionReused:   m.connectionReused,
-	})
 	return md
 }
 
@@ -447,16 +369,11 @@ func (m *metadata) Clone() *metadata {
 		remoteConnectionEstablishedTs: m.remoteConnectionEstablishedTs,
 		requestReceivedTs:             m.requestReceivedTs,
 		dnsLookupStartTs:              m.dnsLookupStartTs,
-		dnsLookupDoneTs:               m.dnsLookupDoneTs,
+		dnsLookupCompletedTs:          m.dnsLookupCompletedTs,
 		socketConnectStartTs:          m.socketConnectStartTs,
-		socketConnectDoneTs:           m.socketConnectDoneTs,
+		socketConnectCompletedTs:      m.socketConnectCompletedTs,
 		sslHandshakeStartTs:           m.sslHandshakeStartTs,
 		sslHandshakeCompletedTs:       m.sslHandshakeCompletedTs,
-		requestUploadStartTs:          m.requestUploadStartTs,
-		requestUploadDoneTs:           m.requestUploadDoneTs,
-		responseStartTs:               m.responseStartTs,
-		responseDoneTs:                m.responseDoneTs,
-		connectionReused:              m.connectionReused,
 		requestHostport:               m.requestHostport,
 		localConnectionAddrInfo:       m.localConnectionAddrInfo,
 		remoteConnectionAddrInfo:      m.remoteConnectionAddrInfo,
@@ -505,10 +422,10 @@ func (m *metadata) SetDNSLookupStartTs(v time.Time) {
 	m.mu.Unlock()
 }
 
-func (m *metadata) SetDNSLookupDoneTs(v time.Time) {
+func (m *metadata) SetDNSLookupCompletedTs(v time.Time) {
 	m.mu.Lock()
-	m.dnsLookupDoneTs = v
-	m.setKnownField(DNSLookupDoneTs, fieldDNSLookupDoneTs)
+	m.dnsLookupCompletedTs = v
+	m.setKnownField(DNSLookupCompletedTs, fieldDNSLookupCompletedTs)
 	m.mu.Unlock()
 }
 
@@ -519,10 +436,10 @@ func (m *metadata) SetSocketConnectStartTs(v time.Time) {
 	m.mu.Unlock()
 }
 
-func (m *metadata) SetSocketConnectDoneTs(v time.Time) {
+func (m *metadata) SetSocketConnectCompletedTs(v time.Time) {
 	m.mu.Lock()
-	m.socketConnectDoneTs = v
-	m.setKnownField(SocketConnectDoneTs, fieldSocketConnectDoneTs)
+	m.socketConnectCompletedTs = v
+	m.setKnownField(SocketConnectCompletedTs, fieldSocketConnectCompletedTs)
 	m.mu.Unlock()
 }
 
@@ -537,41 +454,6 @@ func (m *metadata) SetSSLHandshakeCompletedTs(v time.Time) {
 	m.mu.Lock()
 	m.sslHandshakeCompletedTs = v
 	m.setKnownField(SSLHandshakeCompletedTs, fieldSSLHandshakeCompletedTs)
-	m.mu.Unlock()
-}
-
-func (m *metadata) SetRequestUploadStartTs(v time.Time) {
-	m.mu.Lock()
-	m.requestUploadStartTs = v
-	m.setKnownField(RequestUploadStartTs, fieldRequestUploadStartTs)
-	m.mu.Unlock()
-}
-
-func (m *metadata) SetRequestUploadDoneTs(v time.Time) {
-	m.mu.Lock()
-	m.requestUploadDoneTs = v
-	m.setKnownField(RequestUploadDoneTs, fieldRequestUploadDoneTs)
-	m.mu.Unlock()
-}
-
-func (m *metadata) SetResponseStartTs(v time.Time) {
-	m.mu.Lock()
-	m.responseStartTs = v
-	m.setKnownField(ResponseStartTs, fieldResponseStartTs)
-	m.mu.Unlock()
-}
-
-func (m *metadata) SetResponseDoneTs(v time.Time) {
-	m.mu.Lock()
-	m.responseDoneTs = v
-	m.setKnownField(ResponseDoneTs, fieldResponseDoneTs)
-	m.mu.Unlock()
-}
-
-func (m *metadata) SetConnectionReused(v bool) {
-	m.mu.Lock()
-	m.connectionReused = v
-	m.setKnownField(ConnectionReused, fieldConnectionReused)
 	m.mu.Unlock()
 }
 

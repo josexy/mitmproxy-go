@@ -115,11 +115,11 @@ type proxyDialer struct {
 	dialer   *net.Dialer
 }
 
-type dialTimingRecorder interface {
+type dialTimestampRecorder interface {
 	SetDNSLookupStartTs(time.Time)
-	SetDNSLookupDoneTs(time.Time)
+	SetDNSLookupCompletedTs(time.Time)
 	SetSocketConnectStartTs(time.Time)
-	SetSocketConnectDoneTs(time.Time)
+	SetSocketConnectCompletedTs(time.Time)
 }
 
 func NewProxyDialer(proxyURL *url.URL, dialer *net.Dialer) *proxyDialer {
@@ -137,7 +137,7 @@ func (d *proxyDialer) DialTCPContext(ctx context.Context, addr string) (net.Conn
 	return d.DialContext(ctx, "tcp", addr)
 }
 
-func (d *proxyDialer) DialTCPContextWithMetadata(ctx context.Context, addr string, md dialTimingRecorder) (net.Conn, error) {
+func (d *proxyDialer) DialTCPContextWithMetadata(ctx context.Context, addr string, md dialTimestampRecorder) (net.Conn, error) {
 	return d.dialWithMetadata(ctx, "tcp", addr, md)
 }
 
@@ -153,7 +153,7 @@ func (d *proxyDialer) dial(ctx context.Context, network, addr string) (net.Conn,
 	return d.dialWithMetadata(ctx, network, addr, nil)
 }
 
-func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string, md dialTimingRecorder) (net.Conn, error) {
+func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string, md dialTimestampRecorder) (net.Conn, error) {
 	var raddr net.Addr
 	netDial := func(network, addr string) (net.Conn, error) {
 		dialAddr := addr
@@ -163,7 +163,7 @@ func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string
 		}
 		resolvedAddr, err := net.ResolveTCPAddr(network, dialAddr)
 		if recordDNS {
-			md.SetDNSLookupDoneTs(time.Now())
+			md.SetDNSLookupCompletedTs(time.Now())
 		}
 		if err != nil {
 			return nil, err
@@ -177,7 +177,7 @@ func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string
 		}
 		conn, err := d.dialer.DialContext(ctx, network, dialAddr)
 		if md != nil {
-			md.SetSocketConnectDoneTs(time.Now())
+			md.SetSocketConnectCompletedTs(time.Now())
 		}
 		return conn, err
 	}

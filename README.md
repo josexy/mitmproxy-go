@@ -304,6 +304,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"time"
 
 	mitmproxy "github.com/josexy/mitmproxy-go"
 	"github.com/josexy/mitmproxy-go/metadata"
@@ -316,11 +317,16 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	fmt.Printf("target: %s\n", md.RequestHostport)
 	fmt.Printf("local connected at: %v\n", md.LocalConnectionEstablishedTs)
 	fmt.Printf("remote connected at: %v\n", md.RemoteConnectionEstablishedTs)
+	fmt.Printf("dns lookup: %v -> %v (%v)\n",
+		md.DNSLookupStartTs, md.DNSLookupCompletedTs,
+		durationBetween(md.DNSLookupStartTs, md.DNSLookupCompletedTs))
+	fmt.Printf("socket connect: %v -> %v (%v)\n",
+		md.SocketConnectStartTs, md.SocketConnectCompletedTs,
+		durationBetween(md.SocketConnectStartTs, md.SocketConnectCompletedTs))
+	fmt.Printf("ssl handshake: %v -> %v (%v)\n",
+		md.SSLHandshakeStartTs, md.SSLHandshakeCompletedTs,
+		durationBetween(md.SSLHandshakeStartTs, md.SSLHandshakeCompletedTs))
 	fmt.Printf("request processed at: %v\n", md.RequestProcessedTs)
-	fmt.Printf("total timing: %v\n", md.Timing.Total)
-	for _, phase := range md.Timing.Phases {
-		fmt.Printf("%s: offset=%v duration=%v\n", phase.Label, phase.Offset, phase.Duration)
-	}
 
 	if md.TLSState != nil {
 		fmt.Printf("selected ALPN: %s\n", md.TLSState.SelectedALPN)
@@ -335,6 +341,13 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	}
 
 	return invoker.Invoke(req)
+}
+
+func durationBetween(start, end time.Time) time.Duration {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	return end.Sub(start)
 }
 ```
 
