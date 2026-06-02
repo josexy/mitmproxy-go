@@ -259,7 +259,15 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	slog.Debug("response",
 		slog.Time("local_connection_establishment", md.LocalConnectionEstablishedTs),
 		slog.Time("remote_connection_establishment", md.RemoteConnectionEstablishedTs),
+		slog.Time("dns_lookup_start", md.DNSLookupStartTs),
+		slog.Time("dns_lookup_completed", md.DNSLookupCompletedTs),
+		slog.Duration("dns_lookup_duration", durationBetween(md.DNSLookupStartTs, md.DNSLookupCompletedTs)),
+		slog.Time("socket_connect_start", md.SocketConnectStartTs),
+		slog.Time("socket_connect_completed", md.SocketConnectCompletedTs),
+		slog.Duration("socket_connect_duration", durationBetween(md.SocketConnectStartTs, md.SocketConnectCompletedTs)),
+		slog.Time("ssl_handshake_start", md.SSLHandshakeStartTs),
 		slog.Time("ssl_handshake_completed", md.SSLHandshakeCompletedTs),
+		slog.Duration("ssl_handshake_duration", durationBetween(md.SSLHandshakeStartTs, md.SSLHandshakeCompletedTs)),
 		slog.Time("request_processed", md.RequestProcessedTs),
 		slog.String("status", rsp.Status),
 		slog.String("protocol", rsp.Proto),
@@ -269,6 +277,13 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	rsp.Body, err = newBodyDecoder(rsp.Body, rsp.Header.Get("Content-Encoding"), CHUNK_TYPE_RSP)
 
 	return rsp, err
+}
+
+func durationBetween(start, end time.Time) time.Duration {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	return end.Sub(start)
 }
 
 func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {

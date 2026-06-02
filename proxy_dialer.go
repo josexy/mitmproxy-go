@@ -115,6 +115,13 @@ type proxyDialer struct {
 	dialer   *net.Dialer
 }
 
+type dialTimestampRecorder interface {
+	SetDNSLookupStartTs(time.Time)
+	SetDNSLookupCompletedTs(time.Time)
+	SetSocketConnectStartTs(time.Time)
+	SetSocketConnectCompletedTs(time.Time)
+}
+
 func NewProxyDialer(proxyURL *url.URL, dialer *net.Dialer) *proxyDialer {
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: dialTimeout}
@@ -130,6 +137,10 @@ func (d *proxyDialer) DialTCPContext(ctx context.Context, addr string) (net.Conn
 	return d.DialContext(ctx, "tcp", addr)
 }
 
+func (d *proxyDialer) DialTCPContextWithMetadata(ctx context.Context, addr string, md dialTimestampRecorder) (net.Conn, error) {
+	return d.dialWithMetadata(ctx, "tcp", addr, md)
+}
+
 func (d *proxyDialer) Dial(network, addr string) (net.Conn, error) {
 	return d.DialContext(context.Background(), network, addr)
 }
@@ -139,15 +150,44 @@ func (d *proxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 }
 
 func (d *proxyDialer) dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	raddr, err := net.ResolveTCPAddr(network, addr)
-	if err != nil {
-		return nil, err
-	}
+	return d.dialWithMetadata(ctx, network, addr, nil)
+}
+
+func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string, md dialTimestampRecorder) (net.Conn, error) {
+	var raddr net.Addr
 	netDial := func(network, addr string) (net.Conn, error) {
-		return d.dialer.DialContext(ctx, network, addr)
+		dialAddr := addr
+		recordDNS := md != nil && shouldRecordDNSLookup(dialAddr)
+		if recordDNS {
+			md.SetDNSLookupStartTs(time.Now())
+		}
+		resolvedAddr, err := net.ResolveTCPAddr(network, dialAddr)
+		if recordDNS {
+			md.SetDNSLookupCompletedTs(time.Now())
+		}
+		if err != nil {
+			return nil, err
+		}
+		if raddr == nil {
+			raddr = resolvedAddr
+		}
+		dialAddr = resolvedAddr.String()
+		if md != nil {
+			md.SetSocketConnectStartTs(time.Now())
+		}
+		conn, err := d.dialer.DialContext(ctx, network, dialAddr)
+		if md != nil {
+			md.SetSocketConnectCompletedTs(time.Now())
+		}
+		return conn, err
 	}
 	if d.proxyURL == nil {
 		return netDial(network, addr)
+	}
+	var err error
+	raddr, err = net.ResolveTCPAddr(network, addr)
+	if err != nil {
+		return nil, err
 	}
 	dialer, err := proxy.FromURL(d.proxyURL, netDialerFunc(netDial))
 	if err != nil {
@@ -159,6 +199,14 @@ func (d *proxyDialer) dial(ctx context.Context, network, addr string) (net.Conn,
 		return nil, err
 	}
 	return &addrConn{raddr, conn}, nil
+}
+
+func shouldRecordDNSLookup(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return net.ParseIP(strings.Trim(host, "[]")) == nil
 }
 
 func parseProxyFrom(disabled bool, proxy string) (proxyURL *url.URL, err error) {

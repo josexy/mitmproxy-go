@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/josexy/mitmproxy-go/metadata"
 )
 
 func TestHostPortNoPort(t *testing.T) {
@@ -179,6 +181,46 @@ func TestProxyDialerDirectDialAndRemoteAddr(t *testing.T) {
 		t.Fatalf("read = %q, %v; want ok, nil", buf, err)
 	}
 	<-done
+}
+
+func TestProxyDialerRecordsConnectionTimestampsForHostnames(t *testing.T) {
+	dialer := NewProxyDialer(nil, &net.Dialer{Timeout: time.Second})
+	md := metadata.NewMD()
+	if _, err := dialer.DialTCPContextWithMetadata(context.Background(), "localhost:1", md); err == nil {
+		t.Fatalf("DialTCPContextWithMetadata unexpectedly succeeded")
+	}
+	if _, ok := md.Get(metadata.DNSLookupStartTs); !ok {
+		t.Fatalf("DNS lookup start was not recorded")
+	}
+	if _, ok := md.Get(metadata.DNSLookupCompletedTs); !ok {
+		t.Fatalf("DNS lookup done was not recorded")
+	}
+	if _, ok := md.Get(metadata.SocketConnectStartTs); !ok {
+		t.Fatalf("socket connect start was not recorded")
+	}
+	if _, ok := md.Get(metadata.SocketConnectCompletedTs); !ok {
+		t.Fatalf("socket connect done was not recorded")
+	}
+}
+
+func TestProxyDialerSkipsDNSForIPLiteral(t *testing.T) {
+	dialer := NewProxyDialer(nil, &net.Dialer{Timeout: time.Second})
+	md := metadata.NewMD()
+	if _, err := dialer.DialTCPContextWithMetadata(context.Background(), "127.0.0.1:1", md); err == nil {
+		t.Fatalf("DialTCPContextWithMetadata unexpectedly succeeded")
+	}
+	if _, ok := md.Get(metadata.DNSLookupStartTs); ok {
+		t.Fatalf("DNS lookup start was recorded for IP literal")
+	}
+	if _, ok := md.Get(metadata.DNSLookupCompletedTs); ok {
+		t.Fatalf("DNS lookup done was recorded for IP literal")
+	}
+	if _, ok := md.Get(metadata.SocketConnectStartTs); !ok {
+		t.Fatalf("socket connect start was not recorded")
+	}
+	if _, ok := md.Get(metadata.SocketConnectCompletedTs); !ok {
+		t.Fatalf("socket connect done was not recorded")
+	}
 }
 
 func TestProxyDialerDialContextErrors(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509/pkix"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/josexy/mitmproxy-go"
 	"github.com/josexy/mitmproxy-go/internal/cert"
+	"github.com/josexy/mitmproxy-go/metadata"
 	"golang.org/x/net/http2"
 )
 
@@ -27,11 +29,11 @@ var (
 
 func initCertPath() {
 	tmpDir := os.TempDir()
-	certdir = filepath.Join(tmpDir, certdir)
-	mitmCertPath = filepath.Join(tmpDir, mitmCertPath)
-	mitmKeyPath = filepath.Join(tmpDir, mitmKeyPath)
-	serverCertPath = filepath.Join(tmpDir, serverCertPath)
-	serverKeyPath = filepath.Join(tmpDir, serverKeyPath)
+	certdir = filepath.Join(tmpDir, "cert")
+	mitmCertPath = filepath.Join(tmpDir, "cert", "ca.crt")
+	mitmKeyPath = filepath.Join(tmpDir, "cert", "ca.key")
+	serverCertPath = filepath.Join(tmpDir, "cert", "server.crt")
+	serverKeyPath = filepath.Join(tmpDir, "cert", "server.key")
 }
 
 type testServerAddrs struct {
@@ -279,4 +281,55 @@ func TestMitmProxyHandler(t *testing.T) {
 	}
 
 	closeFunc()
+}
+
+func TestHTTPSConnectionTimestamps(t *testing.T) {
+	initCertPath()
+	genCACertAndKey()
+	genServerCertAndKey()
+	defer os.RemoveAll(certdir)
+
+	addrs, closeOrigins := startSimpleHttpServer(t)
+	defer closeOrigins()
+
+	mdCh := make(chan metadata.MD, 1)
+	handler := buildMitmHandler(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+		resp, err := hi.Invoke(req)
+		if err != nil {
+			return nil, err
+		}
+		md, _ := metadata.FromContext(ctx)
+		mdCh <- md.MD()
+		return resp, nil
+	})
+	proxyLn := listenLocalhost(t)
+	proxyServer := &http.Server{Handler: handler}
+	go func() {
+		if err := proxyServer.Serve(proxyLn); err != nil && err != http.ErrServerClosed {
+			t.Errorf("proxy server failed: %v", err)
+		}
+	}()
+	defer proxyServer.Close()
+
+	client := &http.Client{Transport: &http.Transport{
+		Proxy:           http.ProxyURL(&url.URL{Scheme: "http", Host: proxyLn.Addr().String()}),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}}
+	resp, err := client.Get("https://" + addrs.https + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	md := <-mdCh
+	if md.SocketConnectStartTs.IsZero() || md.SocketConnectCompletedTs.IsZero() {
+		t.Fatalf("socket timing missing: %#v", md)
+	}
+	if md.SSLHandshakeStartTs.IsZero() || md.SSLHandshakeCompletedTs.IsZero() {
+		t.Fatalf("SSL timing missing: %#v", md)
+	}
+	if md.SSLHandshakeCompletedTs.Before(md.SSLHandshakeStartTs) {
+		t.Fatalf("SSL handshake completed before it started: %#v", md)
+	}
 }

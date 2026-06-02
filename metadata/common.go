@@ -21,6 +21,16 @@ const (
 	RemoteConnectionEstablishedTs = "remote_connection_established_ts"
 	// RequestReceivedTs is the timestamp when the request was received and processed
 	RequestReceivedTs = "request_received_ts"
+	// DNSLookupStartTs is the timestamp when DNS lookup started
+	DNSLookupStartTs = "dns_lookup_start_ts"
+	// DNSLookupCompletedTs is the timestamp when DNS lookup completed
+	DNSLookupCompletedTs = "dns_lookup_completed_ts"
+	// SocketConnectStartTs is the timestamp when socket connection started
+	SocketConnectStartTs = "socket_connect_start_ts"
+	// SocketConnectCompletedTs is the timestamp when socket connection completed
+	SocketConnectCompletedTs = "socket_connect_completed_ts"
+	// SSLHandshakeStartTs is the timestamp when the SSL/TLS handshake started
+	SSLHandshakeStartTs = "ssl_handshake_start_ts"
 	// SSLHandshakeCompletedTs is the timestamp when the SSL/TLS handshake completed
 	SSLHandshakeCompletedTs = "ssl_handshake_completed_ts"
 	// RequestHostport is the target host:port from the request
@@ -116,6 +126,11 @@ type MD struct {
 	LocalConnectionEstablishedTs  time.Time          // When the client's connection was established
 	RemoteConnectionEstablishedTs time.Time          // When the connection to the remote server was established
 	RequestProcessedTs            time.Time          // When the request was received and started processing
+	DNSLookupStartTs              time.Time          // When DNS lookup started
+	DNSLookupCompletedTs          time.Time          // When DNS lookup completed
+	SocketConnectStartTs          time.Time          // When socket connection started
+	SocketConnectCompletedTs      time.Time          // When socket connection completed
+	SSLHandshakeStartTs           time.Time          // When TLS handshake started (zero if non-TLS)
 	SSLHandshakeCompletedTs       time.Time          // When TLS handshake completed (zero if non-TLS)
 	RequestHostport               string             // Target host:port (e.g., "example.com:443")
 	LocalAddrInfo                 ConnectionAddrInfo // Client's source address and port

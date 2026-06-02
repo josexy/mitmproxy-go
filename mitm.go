@@ -348,7 +348,11 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		}
 	}()
 	localConnEstTs := time.Now()
-	dstConn, err := cfg.proxyDialer.DialTCPContext(ctx, reqCtx.Hostport)
+	md := metadata.NewMD()
+	md.SetLocalConnectionEstablishedTs(localConnEstTs)
+	md.SetRequestReceivedTs(localConnEstTs)
+	md.SetRequestHostport(reqCtx.Hostport)
+	dstConn, err := cfg.proxyDialer.DialTCPContextWithMetadata(ctx, reqCtx.Hostport, md)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("failed to connect to %s: %s", reqCtx.Hostport, err)
@@ -387,11 +391,7 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		return r.passthroughTunnel(ctx, conn, dstConn)
 	}
 
-	md := metadata.NewMD()
-	md.SetLocalConnectionEstablishedTs(localConnEstTs)
 	md.SetRemoteConnectionEstablishedTs(remoteConnEstTs)
-	md.SetRequestReceivedTs(localConnEstTs)
-	md.SetRequestHostport(reqCtx.Hostport)
 	md.SetLocalConnectionAddrInfo(metadata.ConnectionAddrInfo{
 		SourceAddr:      getRemoteAddrPortFromConn(conn),
 		DestinationAddr: getLocalAddrPortFromConn(conn),
@@ -492,6 +492,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 
 	tlsClientConn := tls.Client(conn, tlsConfig)
 	// send client hello and do tls handshake
+	md.SetSSLHandshakeStartTs(time.Now())
 	if err := tlsClientConn.HandshakeContext(ctx); err != nil {
 		return nil, nil, err
 	}
