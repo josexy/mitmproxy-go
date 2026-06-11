@@ -3,6 +3,7 @@ package cert
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -13,8 +14,6 @@ import (
 	"os"
 	"slices"
 	"time"
-
-	"crypto/tls"
 )
 
 const defaultKeySize = 2048
