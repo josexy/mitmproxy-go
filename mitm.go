@@ -11,19 +11,20 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"crypto/tls"
+
 	"github.com/josexy/mitmproxy-go/buf"
 	"github.com/josexy/mitmproxy-go/internal/cert"
 	"github.com/josexy/mitmproxy-go/internal/iocopy"
 	"github.com/josexy/mitmproxy-go/metadata"
 	"github.com/josexy/websocket"
-	tls "github.com/refraction-networking/utls"
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
@@ -150,10 +151,8 @@ func (c *localClientConn) Close() error {
 	c.closeErr = c.Conn.Close()
 	c.lock.Unlock()
 	close(c.closeChan)
-	fmt.Println("--> [local] close local conn")
 
 	if c.connCtx.remote != nil {
-		fmt.Println("--> [local] close remote conn")
 		c.connCtx.remote.Close()
 	}
 	return c.closeErr
@@ -168,7 +167,6 @@ func (c *remoteClientConn) Close() error {
 	c.closed = true
 	c.closeErr = c.Conn.Close()
 	c.lock.Unlock()
-	fmt.Println("--> [remote] close remote conn")
 	return c.closeErr
 }
 
@@ -177,6 +175,39 @@ type biConnContext struct {
 	remote    *remoteClientConn
 	transport *singleConnTransport
 	config    *runtimeConfig
+
+	baseMetadata connectionMetadataRecorder
+	remoteDialMu sync.Mutex
+	remoteDialFn func(context.Context, string, string) (net.Conn, error)
+}
+
+func (c *biConnContext) dialRemote(ctx context.Context, network, addr string) (net.Conn, error) {
+	c.remoteDialMu.Lock()
+	dialFn := c.remoteDialFn
+	c.remoteDialMu.Unlock()
+	if dialFn == nil {
+		return nil, errors.New("remote dialer missing in context")
+	}
+	return dialFn(ctx, network, addr)
+}
+
+func (c *biConnContext) setRemoteDialer(dialFn func(context.Context, string, string) (net.Conn, error)) {
+	c.remoteDialMu.Lock()
+	c.remoteDialFn = dialFn
+	c.remoteDialMu.Unlock()
+}
+
+func (c *biConnContext) dialTCPWithMetadata(ctx context.Context, hostport string) (net.Conn, error) {
+	recorder := connectionMetadataRecorderForContext(ctx, c.baseMetadata)
+	if recorder == nil {
+		return c.config.proxyDialer.DialTCPContext(ctx, hostport)
+	}
+	conn, err := c.config.proxyDialer.DialTCPContextWithMetadata(ctx, hostport, recorder)
+	if err != nil {
+		return nil, err
+	}
+	setRemoteConnectionMetadata(recorder, conn, time.Now())
+	return conn, nil
 }
 
 type ErrorContext struct {
@@ -371,17 +402,29 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	remote := &remoteClientConn{
 		Conn: dstConn,
 	}
-	connCtx := &biConnContext{local: local, remote: remote}
+	connCtx := &biConnContext{local: local, remote: remote, config: cfg, baseMetadata: md}
 	local.connCtx, remote.connCtx = connCtx, connCtx
 	conn, dstConn = local, remote
 	remote.innerConn = remote
-	connCtx.transport = newTransport(reqCtx.Hostport, func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if connCtx.remote == nil || connCtx.remote.innerConn == nil {
-			return nil, errors.New("remote connection missing in context")
+	initialRemoteConn := remote.innerConn
+	initialRemoteConnUsed := false
+	connCtx.setRemoteDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		connCtx.remoteDialMu.Lock()
+		if !initialRemoteConnUsed {
+			initialRemoteConnUsed = true
+			conn := initialRemoteConn
+			connCtx.remoteDialMu.Unlock()
+			if conn == nil {
+				return nil, errors.New("remote connection missing in context")
+			}
+			return conn, nil
 		}
-		return connCtx.remote.innerConn, nil
+		connCtx.remoteDialMu.Unlock()
+		return connCtx.dialTCPWithMetadata(ctx, reqCtx.Hostport)
+	})
+	connCtx.transport = newTransport(reqCtx.Hostport, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return connCtx.dialRemote(ctx, network, addr)
 	}, cfg.state.idleConnTimeout, cfg.state.disableHTTP2)
-	connCtx.config = cfg
 
 	defer local.Close()
 	defer connCtx.transport.Close()
@@ -396,15 +439,11 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		return r.passthroughTunnel(ctx, conn, dstConn)
 	}
 
-	md.SetRemoteConnectionEstablishedTs(remoteConnEstTs)
 	md.SetLocalConnectionAddrInfo(metadata.ConnectionAddrInfo{
 		SourceAddr:      getRemoteAddrPortFromConn(conn),
 		DestinationAddr: getLocalAddrPortFromConn(conn),
 	})
-	md.SetRemoteConnectionAddrInfo(metadata.ConnectionAddrInfo{
-		SourceAddr:      getLocalAddrPortFromConn(dstConn),
-		DestinationAddr: getRemoteAddrPortFromConn(dstConn),
-	})
+	setRemoteConnectionMetadata(md, dstConn, remoteConnEstTs)
 	ctx = context.WithValue(metadata.AppendToContext(ctx, md), connContextKey, connCtx)
 
 	return r.handleTunnelRequest(ctx, reqCtx.Request != nil)
@@ -461,29 +500,115 @@ func cloneMetadataContext(ctx context.Context) context.Context {
 	return metadata.AppendToContext(ctx, src.Clone())
 }
 
-func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Context, chi *tls.ClientHelloInfo, conn net.Conn) (net.Conn, *tls.Config, error) {
+type remoteConnectionMetadataRecorder interface {
+	SetRemoteConnectionEstablishedTs(time.Time)
+	SetRemoteConnectionAddrInfo(metadata.ConnectionAddrInfo)
+}
+
+type connectionMetadataRecorder interface {
+	dialTimestampRecorder
+	remoteConnectionMetadataRecorder
+}
+
+type multiConnectionMetadataRecorder struct {
+	recorders []connectionMetadataRecorder
+}
+
+func connectionMetadataRecorderForContext(ctx context.Context, base connectionMetadataRecorder) connectionMetadataRecorder {
+	recorders := make([]connectionMetadataRecorder, 0, 2)
+	if md, ok := metadata.FromContext(ctx); ok {
+		recorders = append(recorders, md)
+	}
+	if base != nil {
+		recorders = append(recorders, base)
+	}
+	switch len(recorders) {
+	case 0:
+		return nil
+	case 1:
+		return recorders[0]
+	default:
+		return multiConnectionMetadataRecorder{recorders: recorders}
+	}
+}
+
+func (m multiConnectionMetadataRecorder) SetDNSLookupStartTs(v time.Time) {
+	for _, recorder := range m.recorders {
+		recorder.SetDNSLookupStartTs(v)
+	}
+}
+
+func (m multiConnectionMetadataRecorder) SetDNSLookupCompletedTs(v time.Time) {
+	for _, recorder := range m.recorders {
+		recorder.SetDNSLookupCompletedTs(v)
+	}
+}
+
+func (m multiConnectionMetadataRecorder) SetSocketConnectStartTs(v time.Time) {
+	for _, recorder := range m.recorders {
+		recorder.SetSocketConnectStartTs(v)
+	}
+}
+
+func (m multiConnectionMetadataRecorder) SetSocketConnectCompletedTs(v time.Time) {
+	for _, recorder := range m.recorders {
+		recorder.SetSocketConnectCompletedTs(v)
+	}
+}
+
+func (m multiConnectionMetadataRecorder) SetRemoteConnectionEstablishedTs(v time.Time) {
+	for _, recorder := range m.recorders {
+		recorder.SetRemoteConnectionEstablishedTs(v)
+	}
+}
+
+func (m multiConnectionMetadataRecorder) SetRemoteConnectionAddrInfo(v metadata.ConnectionAddrInfo) {
+	for _, recorder := range m.recorders {
+		recorder.SetRemoteConnectionAddrInfo(v)
+	}
+}
+
+func setRemoteConnectionMetadata(md remoteConnectionMetadataRecorder, conn net.Conn, established time.Time) {
+	if md == nil || conn == nil {
+		return
+	}
+	md.SetRemoteConnectionEstablishedTs(established)
+	md.SetRemoteConnectionAddrInfo(metadata.ConnectionAddrInfo{
+		SourceAddr:      getLocalAddrPortFromConn(conn),
+		DestinationAddr: getRemoteAddrPortFromConn(conn),
+	})
+}
+
+type capturedClientHello struct {
+	info *tls.ClientHelloInfo
+	raw  []byte
+}
+
+type upstreamTLSHandshakeResult struct {
+	conn               net.Conn
+	hello              capturedClientHello
+	negotiatedProtocol string
+}
+
+func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Context, hello capturedClientHello, conn net.Conn) (net.Conn, *tls.Config, error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	cfg := connCtx.config
 	reqCtx, _ := FromRequestContext(ctx)
 	md, _ := metadata.FromContext(ctx)
+	chi := hello.info
 
 	serverName := chi.ServerName
-	protos := chi.SupportedProtos
-
-	if cfg.state.disableHTTP2 {
-		protos = slices.DeleteFunc(protos, func(e string) bool { return e == http2.NextProtoTLS })
-	}
+	protos := filteredClientHelloProtos(chi.SupportedProtos, cfg.state.disableHTTP2)
 
 	host, _, _ := net.SplitHostPort(reqCtx.Hostport)
 	if serverName == "" {
 		serverName = host
 	}
-	tlsConfig := &tls.Config{
+	tlsConfig := &utls.Config{
 		// Get clientHello alpnProtocols from client and forward to server
-		NextProtos:   protos,
-		ServerName:   serverName,
-		CipherSuites: chi.CipherSuites,
-		RootCAs:      cfg.rootCACertPool,
+		NextProtos: protos,
+		ServerName: serverName,
+		RootCAs:    cfg.rootCACertPool,
 	}
 	if cfg.state.skipVerifySSL {
 		tlsConfig.InsecureSkipVerify = true
@@ -491,15 +616,22 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	if len(cfg.clientCertPool) > 0 {
 		if clientCert, ok := cfg.clientCertPool[host]; ok {
 			// mTLS client-authentication
-			tlsConfig.Certificates = []tls.Certificate{clientCert}
+			tlsConfig.Certificates = []utls.Certificate{clientCert}
 		}
 	}
 
-	tlsClientConn := tls.Client(conn, tlsConfig)
+	clientHelloSpec, err := clientHelloSpecFromRaw(hello.raw, serverName, protos)
+	if err != nil {
+		return nil, nil, err
+	}
+	tlsClientConn := utls.UClient(conn, tlsConfig, utls.HelloCustom)
+	if err := tlsClientConn.ApplyPreset(clientHelloSpec); err != nil {
+		return nil, nil, fmt.Errorf("apply client hello fingerprint: %w", err)
+	}
 	// send client hello and do tls handshake
 	md.SetSSLHandshakeStartTs(time.Now())
 	if err := tlsClientConn.HandshakeContext(ctx); err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("upstream tls handshake: %w", err)
 	}
 	tlsConnEstTs := time.Now()
 	cs := tlsClientConn.ConnectionState()
@@ -575,6 +707,35 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	}, nil
 }
 
+func (r *mitmProxyHandler) setTLSRemoteDialer(connCtx *biConnContext, hostport string, firstConn net.Conn, hello capturedClientHello) {
+	var mu sync.Mutex
+	firstConnUsed := false
+	connCtx.setRemoteDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		if !firstConnUsed {
+			firstConnUsed = true
+			conn := firstConn
+			mu.Unlock()
+			if conn == nil {
+				return nil, errors.New("remote tls connection missing in context")
+			}
+			return conn, nil
+		}
+		mu.Unlock()
+
+		rawConn, err := connCtx.dialTCPWithMetadata(ctx, hostport)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn, _, err := r.initiateSSLHandshakeWithClientHello(ctx, hello, rawConn)
+		if err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	})
+}
+
 func isTLS(data []byte) bool {
 	// Ref: https: //github.com/mitmproxy/mitmproxy/blob/main/mitmproxy/net/tls.py
 	// TLS ClientHello magic, works for SSLv3, TLSv1.0, TLSv1.1, TLSv1.2, and TLSv1.3
@@ -615,14 +776,22 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	// Check if the common http/websocket request with tls
 	if len(data) >= 3 && isTLS(data) {
 		tlsRequest = true
-		clientHelloInfoCh := make(chan *tls.ClientHelloInfo, 1)
-		tlsConnCh := make(chan net.Conn, 1)
+		clientHelloInfoCh := make(chan capturedClientHello, 1)
+		tlsConnCh := make(chan upstreamTLSHandshakeResult, 1)
 		tlsConfigCh := make(chan *tls.Config, 1)
 		errCh := make(chan error, 1)
-		tlsConn := tls.Server(srcConn, &tls.Config{
+		captureConn := newClientHelloCaptureConn(srcConn)
+		tlsConn := tls.Server(captureConn, &tls.Config{
 			SessionTicketsDisabled: true,
 			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-				clientHelloInfoCh <- chi
+				rawClientHello, err := captureConn.RawClientHello()
+				if err != nil {
+					return nil, fmt.Errorf("capture client hello: %w", err)
+				}
+				clientHelloInfoCh <- capturedClientHello{
+					info: chi,
+					raw:  rawClientHello,
+				}
 				select {
 				case err := <-errCh:
 					return nil, err
@@ -641,7 +810,15 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				errCh <- err
 			} else {
 				tlsConfigCh <- tlsConfig
-				tlsConnCh <- conn
+				negotiatedProtocol := ""
+				if len(tlsConfig.NextProtos) > 0 {
+					negotiatedProtocol = tlsConfig.NextProtos[0]
+				}
+				tlsConnCh <- upstreamTLSHandshakeResult{
+					conn:               conn,
+					hello:              chi,
+					negotiatedProtocol: negotiatedProtocol,
+				}
 			}
 		}(dstConn)
 		// read client hello and do tls handshake
@@ -650,18 +827,21 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 			// we should close the channel in order to quit the goroutine
 			close(clientHelloInfoCh)
 			select {
-			case conn := <-tlsConnCh:
+			case result := <-tlsConnCh:
 				// if tls handshake failed after GetConfigForClient() succeed,
 				// we should close the tls connection if it has been created
-				conn.Close()
+				result.conn.Close()
 			default:
 				// tls handshake failed if GetConfigForClient() failed
 			}
 			return fmt.Errorf("tls server handshake failed: %s", err)
 		}
 		// wait for tls handshake
-		dstConn = <-tlsConnCh
+		result := <-tlsConnCh
+		dstConn = result.conn
 		connCtx.remote.innerConn = dstConn
+		connCtx.transport.setNegotiatedProtocol(result.negotiatedProtocol)
+		r.setTLSRemoteDialer(connCtx, reqCtx.Hostport, dstConn, result.hello)
 		srcConn = tlsConn
 		fakerw = newFakeHttpResponseWriter(srcConn)
 

@@ -7,9 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"crypto/tls"
+
 	"github.com/josexy/mitmproxy-go/internal/cache"
 	"github.com/josexy/mitmproxy-go/internal/cert"
-	tls "github.com/refraction-networking/utls"
 )
 
 var errNoPriKey = errors.New("no available private key")

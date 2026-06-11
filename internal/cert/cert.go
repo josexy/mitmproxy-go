@@ -14,7 +14,7 @@ import (
 	"slices"
 	"time"
 
-	tls "github.com/refraction-networking/utls"
+	"crypto/tls"
 )
 
 const defaultKeySize = 2048
