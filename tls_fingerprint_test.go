@@ -78,6 +78,26 @@ func TestClientHelloCaptureConnCapturesExactlyFirstRecord(t *testing.T) {
 	}
 }
 
+func TestTLSRecordCaptureStopsRecordingAfterDone(t *testing.T) {
+	record := []byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04}
+	extra := []byte{0x17, 0x03, 0x03, 0x00, 0x01, 0xff}
+
+	var capture tlsRecordCapture
+	capture.Record(record)
+	if !capture.Done() {
+		t.Fatal("capture was not marked done after a complete record")
+	}
+	capture.Record(extra)
+
+	raw, err := capture.RawClientHello()
+	if err != nil {
+		t.Fatalf("RawClientHello: %v", err)
+	}
+	if !bytes.Equal(raw, record) {
+		t.Fatalf("raw = %x, want %x", raw, record)
+	}
+}
+
 func TestClientHelloCaptureConnHandlesSplitReads(t *testing.T) {
 	record := []byte{0x16, 0x03, 0x03, 0x00, 0x06, 0x01, 0x00, 0x00, 0x02, 0xab, 0xcd}
 	conn := newClientHelloCaptureConn(&readChunkConn{

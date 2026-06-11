@@ -7,6 +7,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
@@ -18,16 +19,28 @@ var errClientHelloRecordNotCaptured = errors.New("client hello record not captur
 
 type tlsRecordCapture struct {
 	mu   sync.Mutex
+	done atomic.Bool
 	raw  []byte
 	want int
 }
 
+func (c *tlsRecordCapture) Done() bool {
+	return c.done.Load()
+}
+
 func (c *tlsRecordCapture) Record(data []byte) {
+	if c.done.Load() {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.done.Load() {
+		return
+	}
 	for len(data) > 0 {
 		if c.want > 0 && len(c.raw) >= c.want {
+			c.done.Store(true)
 			return
 		}
 
@@ -47,6 +60,10 @@ func (c *tlsRecordCapture) Record(data []byte) {
 		}
 		c.raw = append(c.raw, data[:n]...)
 		data = data[n:]
+		if c.want > 0 && len(c.raw) >= c.want {
+			c.done.Store(true)
+			return
+		}
 	}
 }
 
@@ -68,6 +85,7 @@ func (c *tlsRecordCapture) RawClientHello() ([]byte, error) {
 	}
 	raw := make([]byte, c.want)
 	copy(raw, c.raw[:c.want])
+	c.done.Store(true)
 	return raw, nil
 }
 
@@ -82,7 +100,7 @@ func newClientHelloCaptureConn(conn net.Conn) *clientHelloCaptureConn {
 
 func (c *clientHelloCaptureConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	if n > 0 {
+	if n > 0 && !c.capture.Done() {
 		c.capture.Record(p[:n])
 	}
 	return n, err
