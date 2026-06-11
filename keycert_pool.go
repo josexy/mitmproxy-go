@@ -2,7 +2,6 @@ package mitmproxy
 
 import (
 	"crypto/rsa"
-	"crypto/tls"
 	"errors"
 	"math/rand"
 	"sync"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/josexy/mitmproxy-go/internal/cache"
 	"github.com/josexy/mitmproxy-go/internal/cert"
+	tls "github.com/refraction-networking/utls"
 )
 
 var errNoPriKey = errors.New("no available private key")

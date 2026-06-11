@@ -2,7 +2,6 @@ package mitmproxy
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -10,6 +9,8 @@ import (
 	"os"
 	"slices"
 	"time"
+
+	tls "github.com/refraction-networking/utls"
 )
 
 var ErrInvalidWebsocketFrameBufferSize = errors.New("websocket frame buffer size must be greater than 0")

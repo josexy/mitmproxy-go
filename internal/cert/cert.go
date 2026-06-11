@@ -3,7 +3,6 @@ package cert
 import (
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -14,6 +13,8 @@ import (
 	"os"
 	"slices"
 	"time"
+
+	tls "github.com/refraction-networking/utls"
 )
 
 const defaultKeySize = 2048

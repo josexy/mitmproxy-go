@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -24,6 +23,7 @@ import (
 	"github.com/josexy/mitmproxy-go/internal/iocopy"
 	"github.com/josexy/mitmproxy-go/metadata"
 	"github.com/josexy/websocket"
+	tls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
@@ -150,8 +150,10 @@ func (c *localClientConn) Close() error {
 	c.closeErr = c.Conn.Close()
 	c.lock.Unlock()
 	close(c.closeChan)
+	fmt.Println("--> [local] close local conn")
 
 	if c.connCtx.remote != nil {
+		fmt.Println("--> [local] close remote conn")
 		c.connCtx.remote.Close()
 	}
 	return c.closeErr
@@ -166,10 +168,7 @@ func (c *remoteClientConn) Close() error {
 	c.closed = true
 	c.closeErr = c.Conn.Close()
 	c.lock.Unlock()
-
-	if c.connCtx.local != nil {
-		c.connCtx.local.Close()
-	}
+	fmt.Println("--> [remote] close remote conn")
 	return c.closeErr
 }
 
@@ -208,7 +207,6 @@ type mitmProxyHandler struct {
 	runtimeState   runtimeConfigState
 	priKeyPool     *priKeyPool
 	serverCertPool *certPool
-	h2s            *http2.Server
 }
 
 func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
@@ -238,7 +236,6 @@ func newMitmProxyHandler(opt ...Option) (*mitmProxyHandler, error) {
 	handler := &mitmProxyHandler{
 		options:      opts,
 		runtimeState: runtimeState,
-		h2s:          &http2.Server{},
 		priKeyPool:   newPriKeyPool(opts.certCachePool.Capacity),
 		serverCertPool: newServerCertPool(opts.certCachePool.Capacity,
 			time.Duration(opts.certCachePool.IntervalSecond)*time.Second,
@@ -247,6 +244,14 @@ func newMitmProxyHandler(opt ...Option) (*mitmProxyHandler, error) {
 	}
 	handler.config.Store(runtimeConfig)
 	return handler, nil
+}
+
+func newHTTP2Server(cfg *runtimeConfig) *http2.Server {
+	server := &http2.Server{}
+	if cfg != nil {
+		server.IdleTimeout = cfg.state.idleConnTimeout
+	}
+	return server
 }
 
 func (r *mitmProxyHandler) Cleanup() {
@@ -671,7 +676,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				connCtx.local.waitClose()
 				cancel()
 			}()
-			r.h2s.ServeConn(srcConn, &http2.ServeConnOpts{
+			newHTTP2Server(connCtx.config).ServeConn(srcConn, &http2.ServeConnOpts{
 				Context: newCtx,
 				Handler: r.serveHTTP2Handler(ctx),
 			})
@@ -785,7 +790,7 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 			connCtx.local.waitClose()
 			cancel()
 		}()
-		r.h2s.ServeConn(conn, &http2.ServeConnOpts{
+		newHTTP2Server(connCtx.config).ServeConn(conn, &http2.ServeConnOpts{
 			Context:          newCtx,
 			Handler:          r.serveHTTP2Handler(ctx),
 			SawClientPreface: true,
@@ -804,7 +809,7 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 			connCtx.local.waitClose()
 			cancel()
 		}()
-		r.h2s.ServeConn(conn, &http2.ServeConnOpts{
+		newHTTP2Server(connCtx.config).ServeConn(conn, &http2.ServeConnOpts{
 			Context:        newCtx,
 			Handler:        r.serveHTTP2Handler(ctx),
 			UpgradeRequest: req,
@@ -1143,7 +1148,7 @@ func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Rea
 		n, err := body.Read(buffer)
 		if n > 0 {
 			if _, writeErr := rw.Write(buffer[:n]); writeErr != nil {
-				return writeErr
+				return fmt.Errorf("write to http.ResponseWriter failed: %s", writeErr)
 			}
 			// Flush the response to keep the client happy
 			flusher.Flush()
@@ -1152,7 +1157,7 @@ func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Rea
 			break
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("read from response body failed: %s", err)
 		}
 	}
 	return nil

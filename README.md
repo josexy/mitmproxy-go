@@ -301,7 +301,7 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
+	tls "github.com/refraction-networking/utls"
 	"fmt"
 	"net/http"
 	"time"
