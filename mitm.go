@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -16,8 +17,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"crypto/tls"
 
 	"github.com/josexy/mitmproxy-go/buf"
 	"github.com/josexy/mitmproxy-go/internal/cert"

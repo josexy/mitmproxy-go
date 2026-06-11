@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
@@ -18,8 +19,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	stdtls "crypto/tls"
 
 	"github.com/josexy/mitmproxy-go/internal/cert"
 	utls "github.com/refraction-networking/utls"
@@ -298,7 +297,7 @@ func writeTestCertificates(t *testing.T, dir string) (caCertPath, caKeyPath, ser
 
 func startRawClientHelloOrigin(t *testing.T, certPath, keyPath string) (string, <-chan []byte, func()) {
 	t.Helper()
-	certificate, err := stdtls.LoadX509KeyPair(certPath, keyPath)
+	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,8 +314,8 @@ func startRawClientHelloOrigin(t *testing.T, certPath, keyPath string) (string, 
 			}
 			go func(conn net.Conn) {
 				captureConn := newClientHelloCaptureConn(conn)
-				tlsConn := stdtls.Server(captureConn, &stdtls.Config{
-					Certificates: []stdtls.Certificate{certificate},
+				tlsConn := tls.Server(captureConn, &tls.Config{
+					Certificates: []tls.Certificate{certificate},
 					NextProtos:   []string{"http/1.1"},
 				})
 				defer tlsConn.Close()

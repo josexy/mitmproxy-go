@@ -2,12 +2,11 @@ package mitmproxy
 
 import (
 	"crypto/rsa"
+	"crypto/tls"
 	"errors"
 	"math/rand"
 	"sync"
 	"time"
-
-	"crypto/tls"
 
 	"github.com/josexy/mitmproxy-go/internal/cache"
 	"github.com/josexy/mitmproxy-go/internal/cert"
