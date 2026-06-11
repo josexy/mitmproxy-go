@@ -238,6 +238,9 @@ type mitmProxyHandler struct {
 	runtimeState   runtimeConfigState
 	priKeyPool     *priKeyPool
 	serverCertPool *certPool
+	activeMu       sync.Mutex
+	activeConns    map[*localClientConn]struct{}
+	closed         bool
 }
 
 func NewMitmProxyHandler(opt ...Option) (MitmProxyHandler, error) {
@@ -268,6 +271,7 @@ func newMitmProxyHandler(opt ...Option) (*mitmProxyHandler, error) {
 		options:      opts,
 		runtimeState: runtimeState,
 		priKeyPool:   newPriKeyPool(opts.certCachePool.Capacity),
+		activeConns:  make(map[*localClientConn]struct{}),
 		serverCertPool: newServerCertPool(opts.certCachePool.Capacity,
 			time.Duration(opts.certCachePool.IntervalSecond)*time.Second,
 			time.Duration(opts.certCachePool.ExpireSecond)*time.Second,
@@ -286,7 +290,47 @@ func newHTTP2Server(cfg *runtimeConfig) *http2.Server {
 }
 
 func (r *mitmProxyHandler) Cleanup() {
+	r.closeActiveConns()
 	r.serverCertPool.Stop()
+}
+
+func (r *mitmProxyHandler) isClosed() bool {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	return r.closed
+}
+
+func (r *mitmProxyHandler) trackActiveConn(conn *localClientConn) bool {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	if r.closed {
+		return false
+	}
+	r.activeConns[conn] = struct{}{}
+	return true
+}
+
+func (r *mitmProxyHandler) untrackActiveConn(conn *localClientConn) {
+	r.activeMu.Lock()
+	delete(r.activeConns, conn)
+	r.activeMu.Unlock()
+}
+
+func (r *mitmProxyHandler) closeActiveConns() {
+	r.activeMu.Lock()
+	r.closed = true
+	conns := make([]*localClientConn, 0, len(r.activeConns))
+	for conn := range r.activeConns {
+		conns = append(conns, conn)
+	}
+	r.activeMu.Unlock()
+
+	for _, conn := range conns {
+		if conn.connCtx != nil && conn.connCtx.transport != nil {
+			_ = conn.connCtx.transport.Close()
+		}
+		_ = conn.Close()
+	}
 }
 
 func (r *mitmProxyHandler) CACertPath() string {
@@ -372,6 +416,10 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		conn.Close()
 		return ErrRequestContextMissing
 	}
+	if r.isClosed() {
+		conn.Close()
+		return net.ErrClosed
+	}
 	cfg := r.config.Load()
 
 	defer func() {
@@ -405,6 +453,11 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	connCtx := &biConnContext{local: local, remote: remote, config: cfg, baseMetadata: md}
 	local.connCtx, remote.connCtx = connCtx, connCtx
 	conn, dstConn = local, remote
+	if !r.trackActiveConn(local) {
+		local.Close()
+		return net.ErrClosed
+	}
+	defer r.untrackActiveConn(local)
 	remote.innerConn = remote
 	initialRemoteConn := remote.innerConn
 	initialRemoteConnUsed := false
