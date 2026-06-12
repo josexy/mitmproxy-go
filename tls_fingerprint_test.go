@@ -52,7 +52,7 @@ func (a fingerprintDummyAddr) Network() string { return string(a) }
 func (a fingerprintDummyAddr) String() string  { return string(a) }
 
 func TestClientHelloCaptureConnCapturesExactlyFirstRecord(t *testing.T) {
-	record := []byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04}
+	record := []byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00}
 	extra := []byte{0x17, 0x03, 0x03, 0x00, 0x01, 0xff}
 	input := append(append([]byte{}, record...), extra...)
 	conn := newClientHelloCaptureConn(&readChunkConn{Reader: bytes.NewReader(input)})
@@ -79,7 +79,7 @@ func TestClientHelloCaptureConnCapturesExactlyFirstRecord(t *testing.T) {
 }
 
 func TestTLSRecordCaptureStopsRecordingAfterDone(t *testing.T) {
-	record := []byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04}
+	record := []byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00}
 	extra := []byte{0x17, 0x03, 0x03, 0x00, 0x01, 0xff}
 
 	var capture tlsRecordCapture
@@ -117,6 +117,35 @@ func TestClientHelloCaptureConnHandlesSplitReads(t *testing.T) {
 		if raw, err := conn.RawClientHello(); err == nil {
 			if !bytes.Equal(raw, record) {
 				t.Fatalf("raw = %x, want %x", raw, record)
+			}
+			return
+		}
+	}
+	t.Fatal("record was not captured")
+}
+
+func TestClientHelloCaptureConnReassemblesClientHelloAcrossRecords(t *testing.T) {
+	record1 := []byte{0x16, 0x03, 0x03, 0x00, 0x03, 0x01, 0x00, 0x00}
+	record2 := []byte{0x16, 0x03, 0x03, 0x00, 0x03, 0x02, 0xab, 0xcd}
+	input := append(append([]byte{}, record1...), record2...)
+	conn := newClientHelloCaptureConn(&readChunkConn{
+		Reader:   bytes.NewReader(input),
+		maxChunk: 2,
+	})
+
+	buf := make([]byte, 16)
+	for {
+		_, err := conn.Read(buf)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if raw, err := conn.RawClientHello(); err == nil {
+			want := []byte{0x16, 0x03, 0x03, 0x00, 0x06, 0x01, 0x00, 0x00, 0x02, 0xab, 0xcd}
+			if !bytes.Equal(raw, want) {
+				t.Fatalf("raw = %x, want %x", raw, want)
 			}
 			return
 		}

@@ -14,14 +14,19 @@ import (
 )
 
 const tlsRecordHeaderLen = 5
+const tlsHandshakeHeaderLen = 4
 
 var errClientHelloRecordNotCaptured = errors.New("client hello record not captured")
 
 type tlsRecordCapture struct {
-	mu   sync.Mutex
-	done atomic.Bool
-	raw  []byte
-	want int
+	mu               sync.Mutex
+	done             atomic.Bool
+	buf              []byte
+	handshake        []byte
+	wantHandshake    int
+	recordVersion    [2]byte
+	haveRecordHeader bool
+	firstRecordType  byte
 }
 
 func (c *tlsRecordCapture) Done() bool {
@@ -38,32 +43,27 @@ func (c *tlsRecordCapture) Record(data []byte) {
 	if c.done.Load() {
 		return
 	}
-	for len(data) > 0 {
-		if c.want > 0 && len(c.raw) >= c.want {
+	c.buf = append(c.buf, data...)
+	for {
+		if c.wantHandshake > 0 && len(c.handshake) >= c.wantHandshake {
+			c.handshake = c.handshake[:c.wantHandshake]
 			c.done.Store(true)
 			return
 		}
-
-		if len(c.raw) < tlsRecordHeaderLen {
-			n := min(tlsRecordHeaderLen-len(c.raw), len(data))
-			c.raw = append(c.raw, data[:n]...)
-			data = data[n:]
-			if len(c.raw) < tlsRecordHeaderLen {
-				return
-			}
-			c.want = tlsRecordHeaderLen + int(binary.BigEndian.Uint16(c.raw[3:5]))
-		}
-
-		n := min(c.want-len(c.raw), len(data))
-		if n <= 0 {
+		if len(c.buf) < tlsRecordHeaderLen {
 			return
 		}
-		c.raw = append(c.raw, data[:n]...)
-		data = data[n:]
-		if c.want > 0 && len(c.raw) >= c.want {
-			c.done.Store(true)
+		c.captureRecordHeader(c.buf[:tlsRecordHeaderLen])
+		if c.firstRecordType != 0x16 {
 			return
 		}
+		recordLen := int(binary.BigEndian.Uint16(c.buf[3:5]))
+		if len(c.buf) < tlsRecordHeaderLen+recordLen {
+			return
+		}
+		payload := c.buf[tlsRecordHeaderLen : tlsRecordHeaderLen+recordLen]
+		c.buf = c.buf[tlsRecordHeaderLen+recordLen:]
+		c.recordHandshakePayload(payload)
 	}
 }
 
@@ -71,22 +71,64 @@ func (c *tlsRecordCapture) RawClientHello() ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.raw) < tlsRecordHeaderLen {
-		return nil, fmt.Errorf("%w: header has %d bytes", errClientHelloRecordNotCaptured, len(c.raw))
+	if !c.haveRecordHeader {
+		return nil, fmt.Errorf("%w: header has %d bytes", errClientHelloRecordNotCaptured, len(c.buf))
 	}
-	if c.raw[0] != 0x16 {
-		return nil, fmt.Errorf("%w: first record type is %#x", errClientHelloRecordNotCaptured, c.raw[0])
+	if c.firstRecordType != 0x16 {
+		return nil, fmt.Errorf("%w: first record type is %#x", errClientHelloRecordNotCaptured, c.firstRecordType)
 	}
-	if c.want == 0 {
+	if len(c.handshake) < tlsHandshakeHeaderLen {
+		return nil, fmt.Errorf("%w: handshake header has %d bytes", errClientHelloRecordNotCaptured, len(c.handshake))
+	}
+	if c.handshake[0] != 0x01 {
+		return nil, fmt.Errorf("%w: handshake type is %#x", errClientHelloRecordNotCaptured, c.handshake[0])
+	}
+	if c.wantHandshake == 0 {
 		return nil, errClientHelloRecordNotCaptured
 	}
-	if len(c.raw) < c.want {
-		return nil, fmt.Errorf("%w: got %d bytes, want %d", errClientHelloRecordNotCaptured, len(c.raw), c.want)
+	if len(c.handshake) < c.wantHandshake {
+		return nil, fmt.Errorf("%w: got %d handshake bytes, want %d", errClientHelloRecordNotCaptured, len(c.handshake), c.wantHandshake)
 	}
-	raw := make([]byte, c.want)
-	copy(raw, c.raw[:c.want])
+	raw := make([]byte, tlsRecordHeaderLen+c.wantHandshake)
+	raw[0] = 0x16
+	copy(raw[1:3], c.recordVersion[:])
+	recordLen := min(c.wantHandshake, 0xffff)
+	binary.BigEndian.PutUint16(raw[3:5], uint16(recordLen))
+	copy(raw[tlsRecordHeaderLen:], c.handshake[:c.wantHandshake])
 	c.done.Store(true)
 	return raw, nil
+}
+
+func (c *tlsRecordCapture) captureRecordHeader(header []byte) {
+	if c.haveRecordHeader {
+		return
+	}
+	c.haveRecordHeader = true
+	c.firstRecordType = header[0]
+	copy(c.recordVersion[:], header[1:3])
+}
+
+func (c *tlsRecordCapture) recordHandshakePayload(payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	if c.wantHandshake > 0 {
+		remaining := c.wantHandshake - len(c.handshake)
+		if remaining <= 0 {
+			return
+		}
+		payload = payload[:min(remaining, len(payload))]
+	}
+	c.handshake = append(c.handshake, payload...)
+	if c.wantHandshake == 0 && len(c.handshake) >= tlsHandshakeHeaderLen {
+		c.wantHandshake = tlsHandshakeHeaderLen + int(c.handshake[1])<<16 + int(c.handshake[2])<<8 + int(c.handshake[3])
+		if len(c.handshake) > c.wantHandshake {
+			c.handshake = c.handshake[:c.wantHandshake]
+		}
+	}
+	if c.wantHandshake > 0 && len(c.handshake) >= c.wantHandshake {
+		c.done.Store(true)
+	}
 }
 
 type clientHelloCaptureConn struct {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/textproto"
 	"strings"
 	"sync"
 	"time"
@@ -69,13 +70,19 @@ func shouldDiscardClientConnAfterRoundTripError(ctx context.Context, clientConn 
 	if err == nil {
 		return false
 	}
+	if clientConn.Err() != nil {
+		return true
+	}
 	if isRequestCanceledRoundTripError(ctx, err) {
 		return false
 	}
-	return clientConn.Err() != nil || isClientConnUnusableRoundTripError(err)
+	return isClientConnUnusableRoundTripError(err)
 }
 
 func replayableRequest(req *http.Request) (*http.Request, bool) {
+	if !isReplayableRequest(req) {
+		return nil, false
+	}
 	if req.Body == nil || req.Body == http.NoBody {
 		return req, true
 	}
@@ -89,6 +96,33 @@ func replayableRequest(req *http.Request) (*http.Request, bool) {
 	}
 	next.Body = body
 	return next, true
+}
+
+func isReplayableRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	switch req.Method {
+	case "", http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	}
+	return headerHasKey(req.Header, "Idempotency-Key") || headerHasKey(req.Header, "X-Idempotency-Key")
+}
+
+func headerHasKey(header http.Header, key string) bool {
+	if header == nil {
+		return false
+	}
+	canonical := textproto.CanonicalMIMEHeaderKey(key)
+	if _, ok := header[canonical]; ok {
+		return true
+	}
+	for k := range header {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
 }
 
 func isRequestCanceledRoundTripError(ctx context.Context, err error) bool {
@@ -166,7 +200,40 @@ func (t *singleConnTransport) discardClientConn(clientConn *http.ClientConn, clo
 
 	if closeConn {
 		_ = clientConn.Close()
+	} else {
+		t.watchRetiredClientConn(clientConn)
 	}
+}
+
+func (t *singleConnTransport) watchRetiredClientConn(clientConn *http.ClientConn) {
+	clientConn.SetStateHook(func(cc *http.ClientConn) {
+		if cc.Err() != nil || cc.InFlight() == 0 {
+			t.closeRetiredClientConn(cc)
+		}
+	})
+	if clientConn.Err() != nil || clientConn.InFlight() == 0 {
+		t.closeRetiredClientConn(clientConn)
+	}
+}
+
+func (t *singleConnTransport) closeRetiredClientConn(clientConn *http.ClientConn) {
+	t.mu.Lock()
+	idx := -1
+	for i, retired := range t.retired {
+		if retired == clientConn {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.mu.Unlock()
+		return
+	}
+	t.retired = append(t.retired[:idx], t.retired[idx+1:]...)
+	t.mu.Unlock()
+
+	clientConn.SetStateHook(nil)
+	_ = clientConn.Close()
 }
 
 func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Request) (*http.ClientConn, error) {

@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -316,6 +318,252 @@ func TestSingleConnTransportRetriesReplayableRequestAfterBadClientConn(t *testin
 	<-done
 }
 
+func TestSingleConnTransportDoesNotRetryNonIdempotentRequestAfterBadClientConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+	}()
+
+	dialCount := 0
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount++
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		true,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", nil)
+	if _, err := tr.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip unexpectedly succeeded")
+	}
+	if dialCount != 1 {
+		t.Fatalf("dialCount = %d, want no retry for non-idempotent request", dialCount)
+	}
+	<-done
+}
+
+func TestSingleConnTransportRetriesIdempotencyKeyRequestAfterBadClientConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		firstConn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = http.ReadRequest(bufio.NewReader(firstConn))
+		_ = firstConn.Close()
+
+		secondConn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer secondConn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(secondConn))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		body, _ := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if string(body) != "payload" {
+			errCh <- fmt.Errorf("retry body = %q, want payload", body)
+			return
+		}
+		_, _ = secondConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+	}()
+
+	dialCount := 0
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount++
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		true,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", strings.NewReader("payload"))
+	req.Header["Idempotency-Key"] = []string{}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
+		t.Fatalf("response = %d %q, want 200 ok", resp.StatusCode, body)
+	}
+	if dialCount != 2 {
+		t.Fatalf("dialCount = %d, want retry on a new connection", dialCount)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	<-done
+}
+
+func TestShouldDiscardCanceledErrorWhenClientConnIsClosed(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		true,
+	)
+	defer tr.Close()
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	clientConn, err := tr.getClientConn(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = clientConn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !shouldDiscardClientConnAfterRoundTripError(ctx, clientConn, context.Canceled) {
+		t.Fatal("closed client conn was kept after request cancellation")
+	}
+	<-done
+}
+
+func TestSingleConnTransportClosesRetiredClientConnWhenDrained(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	requestStarted := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+		close(requestStarted)
+		<-releaseResponse
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+	}()
+
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		true,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for request")
+	}
+	tr.mu.Lock()
+	clientConn := tr.clientConn
+	tr.mu.Unlock()
+	if clientConn == nil {
+		t.Fatal("client connection was not cached")
+	}
+	tr.discardClientConn(clientConn, false)
+	tr.mu.Lock()
+	retiredCount := len(tr.retired)
+	tr.mu.Unlock()
+	if retiredCount != 1 {
+		t.Fatalf("retired count = %d, want 1 while request is in flight", retiredCount)
+	}
+
+	close(releaseResponse)
+	var resp *http.Response
+	select {
+	case err := <-errCh:
+		t.Fatalf("RoundTrip: %v", err)
+	case resp = <-respCh:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for response")
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	waitForCondition(t, time.Second, func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return len(tr.retired) == 0
+	})
+	if clientConn.Err() == nil {
+		t.Fatal("retired client conn remained open after draining")
+	}
+	<-done
+}
+
 func TestSingleConnTransportUsesNegotiatedHTTP2ForWrappedTLSConn(t *testing.T) {
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor != 2 {
@@ -371,5 +619,19 @@ func TestSingleConnTransportUsesNegotiatedHTTP2ForWrappedTLSConn(t *testing.T) {
 	}
 	if dialCount != 1 {
 		t.Fatalf("dialCount = %d, want 1", dialCount)
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !fn() {
+		t.Fatal("condition was not met before timeout")
 	}
 }
