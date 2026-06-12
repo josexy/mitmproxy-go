@@ -193,6 +193,8 @@ func TestRuntimeConfigConcurrentSettersAndRequests(t *testing.T) {
 			handler.SetHTTP2Disabled(true)
 			handler.SetHTTP2Disabled(false)
 			handler.SetIdleConnTimeout(time.Second)
+			handler.SetLogger(noopLogger)
+			handler.SetLogger(nil)
 			_ = handler.SetMaxWebsocketFramesPerForward(1)
 		}
 	})

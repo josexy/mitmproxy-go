@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -42,25 +43,59 @@ func newTransport(
 }
 
 func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	logger := loggerFromContext(req.Context())
 	for attempt := 0; ; attempt++ {
+		start := time.Now()
+		logAttrs(req.Context(), logger, slog.LevelDebug, "transport round trip started",
+			slog.String("hostport", t.hostport),
+			slog.String("method", requestMethod(req)),
+			slog.String("url", requestURL(req)),
+			slog.Int("attempt", attempt),
+		)
 		clientConn, err := t.getClientConn(req.Context(), req)
 		if err != nil {
+			logAttrs(req.Context(), logger, slog.LevelWarn, "transport client connection failed",
+				slog.String("hostport", t.hostport),
+				slog.String("method", requestMethod(req)),
+				slog.String("url", requestURL(req)),
+				slog.Int("attempt", attempt),
+				errorAttr(err),
+			)
 			return nil, err
 		}
 		resp, err := clientConn.RoundTrip(req)
 		if err == nil {
+			logAttrs(req.Context(), logger, slog.LevelDebug, "transport round trip completed",
+				slog.String("hostport", t.hostport),
+				slog.String("method", requestMethod(req)),
+				slog.String("url", requestURL(req)),
+				slog.Int("attempt", attempt),
+				slog.Int("status_code", resp.StatusCode),
+				slog.Duration("duration", time.Since(start)),
+			)
 			return resp, nil
 		}
 		discard := shouldDiscardClientConnAfterRoundTripError(req.Context(), clientConn, err)
+		nextReq, retry := replayableRequest(req)
+		retry = attempt == 0 && discard && retry
+		if discard || retry {
+			logAttrs(req.Context(), logger, slog.LevelWarn, "transport round trip failed",
+				slog.String("hostport", t.hostport),
+				slog.String("method", requestMethod(req)),
+				slog.String("url", requestURL(req)),
+				slog.Int("attempt", attempt),
+				slog.Bool("discard", discard),
+				slog.Bool("retry", retry),
+				slog.Duration("duration", time.Since(start)),
+				errorAttr(err),
+			)
+		}
 		if discard {
 			t.discardClientConn(clientConn, shouldCloseDiscardedClientConn(clientConn, err))
 		}
-		if attempt == 0 && discard {
-			nextReq, ok := replayableRequest(req)
-			if ok {
-				req = nextReq
-				continue
-			}
+		if retry {
+			req = nextReq
+			continue
 		}
 		return nil, err
 	}
@@ -242,6 +277,11 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 		return nil, net.ErrClosed
 	}
 	if t.clientConn != nil {
+		logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "transport client connection reused",
+			slog.String("hostport", t.hostport),
+			slog.String("method", requestMethod(req)),
+			slog.String("url", requestURL(req)),
+		)
 		return t.clientConn, nil
 	}
 
@@ -266,6 +306,11 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 		return nil, err
 	}
 	t.clientConn = clientConn
+	logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "transport client connection created",
+		slog.String("hostport", t.hostport),
+		slog.String("scheme", connScheme),
+		slog.Bool("disable_http2", t.disableHTTP2),
+	)
 	return clientConn, nil
 }
 

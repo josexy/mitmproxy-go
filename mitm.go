@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -198,13 +199,44 @@ func (c *biConnContext) setRemoteDialer(dialFn func(context.Context, string, str
 
 func (c *biConnContext) dialTCPWithMetadata(ctx context.Context, hostport string) (net.Conn, error) {
 	recorder := connectionMetadataRecorderForContext(ctx, c.baseMetadata)
+	start := time.Now()
+	logConfigAttrs(ctx, c.config, slog.LevelDebug, "upstream tcp dial started",
+		slog.String("network", "tcp"),
+		slog.String("addr", hostport),
+	)
 	if recorder == nil {
-		return c.config.proxyDialer.DialTCPContext(ctx, hostport)
+		conn, err := c.config.proxyDialer.DialTCPContext(ctx, hostport)
+		if err != nil {
+			logConfigAttrs(ctx, c.config, slog.LevelDebug, "upstream tcp dial failed",
+				slog.String("network", "tcp"),
+				slog.String("addr", hostport),
+				slog.Duration("duration", time.Since(start)),
+				errorAttr(err),
+			)
+			return nil, err
+		}
+		logConfigAttrs(ctx, c.config, slog.LevelDebug, "upstream tcp dial completed",
+			slog.String("network", "tcp"),
+			slog.String("addr", hostport),
+			slog.Duration("duration", time.Since(start)),
+		)
+		return conn, nil
 	}
 	conn, err := c.config.proxyDialer.DialTCPContextWithMetadata(ctx, hostport, recorder)
 	if err != nil {
+		logConfigAttrs(ctx, c.config, slog.LevelDebug, "upstream tcp dial failed",
+			slog.String("network", "tcp"),
+			slog.String("addr", hostport),
+			slog.Duration("duration", time.Since(start)),
+			errorAttr(err),
+		)
 		return nil, err
 	}
+	logConfigAttrs(ctx, c.config, slog.LevelDebug, "upstream tcp dial completed",
+		slog.String("network", "tcp"),
+		slog.String("addr", hostport),
+		slog.Duration("duration", time.Since(start)),
+	)
 	setRemoteConnectionMetadata(recorder, conn, time.Now())
 	return conn, nil
 }
@@ -277,6 +309,27 @@ func newMitmProxyHandler(opt ...Option) (*mitmProxyHandler, error) {
 		),
 	}
 	handler.config.Store(runtimeConfig)
+	certCacheCapacity := opts.certCachePool.Capacity
+	if certCacheCapacity <= 0 {
+		certCacheCapacity = 2048
+	}
+	certCacheIntervalSeconds := opts.certCachePool.IntervalSecond
+	if certCacheIntervalSeconds <= 0 {
+		certCacheIntervalSeconds = 30
+	}
+	certCacheExpireSeconds := opts.certCachePool.ExpireSecond
+	if certCacheExpireSeconds <= 0 {
+		certCacheExpireSeconds = 15
+	}
+	logConfigAttrs(context.Background(), runtimeConfig, slog.LevelInfo, "mitm handler initialized",
+		slog.Bool("proxy_configured", runtimeConfig.proxyDialer != nil && runtimeConfig.proxyDialer.proxyURL != nil),
+		slog.Bool("disable_http2", runtimeConfig.state.disableHTTP2),
+		slog.Bool("include_hosts_configured", len(runtimeConfig.state.includeHosts) > 0),
+		slog.Bool("exclude_hosts_configured", len(runtimeConfig.state.excludeHosts) > 0),
+		slog.Int("cert_cache_capacity", certCacheCapacity),
+		slog.Int("cert_cache_interval_seconds", certCacheIntervalSeconds),
+		slog.Int("cert_cache_expire_seconds", certCacheExpireSeconds),
+	)
 	return handler, nil
 }
 
@@ -289,8 +342,11 @@ func newHTTP2Server(cfg *runtimeConfig) *http2.Server {
 }
 
 func (r *mitmProxyHandler) Cleanup() {
-	r.closeActiveConns()
+	closed := r.closeActiveConns()
 	r.serverCertPool.Stop()
+	logConfigAttrs(context.Background(), r.config.Load(), slog.LevelInfo, "cleanup active connections",
+		slog.Int("active_connections", closed),
+	)
 }
 
 func (r *mitmProxyHandler) isClosed() bool {
@@ -315,7 +371,7 @@ func (r *mitmProxyHandler) untrackActiveConn(conn *localClientConn) {
 	r.activeMu.Unlock()
 }
 
-func (r *mitmProxyHandler) closeActiveConns() {
+func (r *mitmProxyHandler) closeActiveConns() int {
 	r.activeMu.Lock()
 	r.closed = true
 	conns := make([]*localClientConn, 0, len(r.activeConns))
@@ -330,6 +386,7 @@ func (r *mitmProxyHandler) closeActiveConns() {
 		}
 		_ = conn.Close()
 	}
+	return len(conns)
 }
 
 func (r *mitmProxyHandler) CACertPath() string {
@@ -420,6 +477,11 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		return net.ErrClosed
 	}
 	cfg := r.config.Load()
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "serve connection",
+		slog.String("source_addr", remoteAddrOrDefault(conn.RemoteAddr())),
+		slog.String("hostport", reqCtx.Hostport),
+		slog.Bool("http_connect", reqCtx.HttpConnectMethod),
+	)
 
 	defer func() {
 		if err != nil {
@@ -435,11 +497,27 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	md.SetLocalConnectionEstablishedTs(localConnEstTs)
 	md.SetRequestReceivedTs(localConnEstTs)
 	md.SetRequestHostport(reqCtx.Hostport)
+	dialStart := time.Now()
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "upstream tcp dial started",
+		slog.String("network", "tcp"),
+		slog.String("addr", reqCtx.Hostport),
+	)
 	dstConn, err := cfg.proxyDialer.DialTCPContextWithMetadata(ctx, reqCtx.Hostport, md)
 	if err != nil {
 		conn.Close()
+		logConfigAttrs(ctx, cfg, slog.LevelDebug, "upstream tcp dial failed",
+			slog.String("network", "tcp"),
+			slog.String("addr", reqCtx.Hostport),
+			slog.Duration("duration", time.Since(dialStart)),
+			errorAttr(err),
+		)
 		return fmt.Errorf("failed to connect to %s: %s", reqCtx.Hostport, err)
 	}
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "upstream tcp dial completed",
+		slog.String("network", "tcp"),
+		slog.String("addr", reqCtx.Hostport),
+		slog.Duration("duration", time.Since(dialStart)),
+	)
 	remoteConnEstTs := time.Now()
 
 	local := &localClientConn{
@@ -487,7 +565,13 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		}
 	}
 
-	if shouldPassthroughRequest(cfg, reqCtx.Hostport) {
+	passthrough, reason := shouldPassthroughRequest(cfg, reqCtx.Hostport)
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "passthrough decision",
+		slog.String("hostport", reqCtx.Hostport),
+		slog.Bool("passthrough", passthrough),
+		slog.String("reason", reason),
+	)
+	if passthrough {
 		return r.passthroughTunnel(ctx, conn, dstConn)
 	}
 
@@ -501,23 +585,23 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	return r.handleTunnelRequest(ctx, reqCtx.Request != nil)
 }
 
-func shouldPassthroughRequest(cfg *runtimeConfig, hostport string) bool {
+func shouldPassthroughRequest(cfg *runtimeConfig, hostport string) (bool, string) {
 	host, _, _ := net.SplitHostPort(hostport)
 
 	if len(cfg.state.excludeHosts) > 0 {
 		if found := cfg.domainMatcher.exclude.match(host); found {
-			// passthrough
-			return true
+			return true, "exclude_host"
 		}
 	}
 
 	if len(cfg.state.includeHosts) > 0 {
 		found := cfg.domainMatcher.include.match(host)
-		return !found
+		if !found {
+			return true, "not_in_include_hosts"
+		}
 	}
 
-	// not passthrough
-	return false
+	return false, "intercept"
 }
 
 func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn, dstConn net.Conn) error {
@@ -539,6 +623,13 @@ func (r *mitmProxyHandler) handleError(ec ErrorContext) {
 }
 
 func handleErrorWithConfig(cfg *runtimeConfig, ec ErrorContext) {
+	if ec.Error != nil {
+		logConfigAttrs(context.Background(), cfg, slog.LevelError, "proxy error",
+			slog.String("remote_addr", ec.RemoteAddr),
+			slog.String("hostport", ec.Hostport),
+			errorAttr(ec.Error),
+		)
+	}
 	if cfg != nil && cfg.state.errHandler != nil && ec.Error != nil {
 		cfg.state.errHandler(ec)
 	}
@@ -656,6 +747,11 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	if serverName == "" {
 		serverName = host
 	}
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "tls client hello captured",
+		slog.String("hostport", reqCtx.Hostport),
+		slog.String("server_name", serverName),
+		slog.Any("alpn", protos),
+	)
 	tlsConfig := &utls.Config{
 		// Get clientHello alpnProtocols from client and forward to server
 		NextProtos: protos,
@@ -669,6 +765,9 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		if clientCert, ok := cfg.clientCertPool[host]; ok {
 			// mTLS client-authentication
 			tlsConfig.Certificates = []utls.Certificate{clientCert}
+			logConfigAttrs(ctx, cfg, slog.LevelDebug, "client certificate selected",
+				slog.String("host", host),
+			)
 		}
 	}
 
@@ -700,6 +799,13 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	if foundCert == nil {
 		return nil, nil, ErrServerCertUnavailable
 	}
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "upstream tls handshake completed",
+		slog.String("hostport", reqCtx.Hostport),
+		slog.String("server_name", serverName),
+		slog.String("selected_alpn", cs.NegotiatedProtocol),
+		slog.Uint64("selected_tls_version", uint64(cs.Version)),
+		slog.Uint64("selected_cipher_suite", uint64(cs.CipherSuite)),
+	)
 	md.SetSSLHandshakeCompletedTs(tlsConnEstTs)
 	md.SetConnectionTLSState(&metadata.TLSState{
 		ServerName:          chi.ServerName,
@@ -725,6 +831,9 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 
 	// Get server certificate from local cache pool
 	if serverCert, err := r.serverCertPool.Get(host); err == nil {
+		logConfigAttrs(ctx, cfg, slog.LevelDebug, "server certificate cache hit",
+			slog.String("host", host),
+		)
 		return tlsClientConn, &tls.Config{
 			SessionTicketsDisabled: true,
 			// Server selected negotiated protocol
@@ -751,6 +860,9 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 
 	certificate := serverCert.Certificate()
 	r.serverCertPool.Set(host, certificate)
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "server certificate generated",
+		slog.String("host", host),
+	)
 	return tlsClientConn, &tls.Config{
 		SessionTicketsDisabled: true,
 		// Server selected negotiated protocol
@@ -898,6 +1010,10 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		r.setTLSRemoteDialer(connCtx, reqCtx.Hostport, dstConn, result.hello)
 		srcConn = tlsConn
 		fakerw = newFakeHttpResponseWriter(srcConn)
+		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "tls tunnel negotiated",
+			slog.String("hostport", reqCtx.Hostport),
+			slog.String("selected_alpn", result.negotiatedProtocol),
+		)
 
 		state := tlsConn.ConnectionState()
 		// If the result of the negotiation is http2,
@@ -905,6 +1021,10 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		// and finally we only need to get the [http.Request] and process the [http.ResponseWriter].
 		// Early process http2
 		if state.NegotiatedProtocol == http2.NextProtoTLS {
+			logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http2 connection serving",
+				slog.String("hostport", reqCtx.Hostport),
+				slog.String("mode", "tls"),
+			)
 			newCtx, cancel := context.WithCancel(connCtx.config.state.streamBaseCtx)
 			go func() {
 				connCtx.local.waitClose()
@@ -1019,6 +1139,10 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 		if err != nil {
 			return false, err
 		}
+		reqCtx, _ := FromRequestContext(ctx)
+		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "h2c prior knowledge",
+			slog.String("hostport", reqCtx.Hostport),
+		)
 		newCtx, cancel := context.WithCancel(connCtx.config.state.streamBaseCtx)
 		go func() {
 			connCtx.local.waitClose()
@@ -1038,6 +1162,12 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 		if err != nil {
 			return false, err
 		}
+		reqCtx, _ := FromRequestContext(ctx)
+		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "h2c upgrade",
+			slog.String("hostport", reqCtx.Hostport),
+			slog.String("method", requestMethod(req)),
+			slog.String("url", requestURL(req)),
+		)
 		newCtx, cancel := context.WithCancel(connCtx.config.state.streamBaseCtx)
 		go func() {
 			connCtx.local.waitClose()
@@ -1098,6 +1228,13 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 			request.URL.Scheme = "ws"
 		}
 	}
+	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http request parsed",
+		slog.String("hostport", reqCtx.Hostport),
+		slog.String("method", requestMethod(request)),
+		slog.String("url", requestURL(request)),
+		slog.String("proto", requestProto(request)),
+		slog.Bool("websocket_upgrade", upgrade),
+	)
 
 	removeProxyHeaders(request.Header)
 	// patch the new request to the request context
@@ -1180,6 +1317,12 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 		wsDstConn.Close()
 		return err
 	}
+	logConfigAttrs(ctx, cfg, slog.LevelDebug, "websocket upgraded",
+		slog.String("hostport", reqCtx.Hostport),
+		slog.String("method", requestMethod(reqCtx.Request)),
+		slog.String("url", requestURL(reqCtx.Request)),
+		slog.Int("status_code", resp.StatusCode),
+	)
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(err)
@@ -1213,9 +1356,28 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 			}
 			msgType, buffer, err := readBufferFromWSConn(src)
 			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+					logConfigAttrs(ctx, cfg, slog.LevelDebug, "websocket relay read closed",
+						slog.String("hostport", reqCtx.Hostport),
+						slog.String("direction", dir.String()),
+						errorAttr(err),
+					)
+				} else {
+					logConfigAttrs(ctx, cfg, slog.LevelWarn, "websocket relay read failed",
+						slog.String("hostport", reqCtx.Hostport),
+						slog.String("direction", dir.String()),
+						errorAttr(err),
+					)
+				}
 				reportErr(err)
 				break
 			}
+			logConfigAttrs(ctx, cfg, slog.LevelDebug, "websocket frame",
+				slog.String("hostport", reqCtx.Hostport),
+				slog.String("direction", dir.String()),
+				slog.Int("message_type", msgType),
+				slog.Int("bytes", buffer.Len()),
+			)
 			if fw != nil {
 				// MUST release buffer manually
 				frame := &wsFrameImpl{
@@ -1263,6 +1425,17 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	if fw != nil {
 		fw.close()
 	}
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
+		logConfigAttrs(ctx, cfg, slog.LevelWarn, "websocket relay ended",
+			slog.String("hostport", reqCtx.Hostport),
+			errorAttr(err),
+		)
+	} else {
+		logConfigAttrs(ctx, cfg, slog.LevelDebug, "websocket relay ended",
+			slog.String("hostport", reqCtx.Hostport),
+			errorAttr(err),
+		)
+	}
 	return
 }
 
@@ -1290,6 +1463,13 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 	reqCtx.Request = req
 	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
 	req = req.WithContext(context.WithValue(ctx, connContextKey, connCtx))
+	start := time.Now()
+	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http request",
+		slog.String("hostport", reqCtx.Hostport),
+		slog.String("method", requestMethod(req)),
+		slog.String("url", requestURL(req)),
+		slog.String("proto", requestProto(req)),
+	)
 	// Only one http interceptor will be invoked
 	if connCtx.config.httpInt != nil {
 		response, err = connCtx.config.httpInt(ctx, req, HTTPDelegatedInvokerFunc(connCtx.transport.RoundTrip))
@@ -1298,7 +1478,23 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 	}
 	if err != nil {
 		err = fmt.Errorf("transport RoundTrip %s failed: %s", reqCtx.Hostport, err)
+		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http request failed",
+			slog.String("hostport", reqCtx.Hostport),
+			slog.String("method", requestMethod(req)),
+			slog.String("url", requestURL(req)),
+			slog.Duration("duration", time.Since(start)),
+			errorAttr(err),
+		)
+		return
 	}
+	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http response",
+		slog.String("hostport", reqCtx.Hostport),
+		slog.String("method", requestMethod(req)),
+		slog.String("url", requestURL(req)),
+		slog.String("proto", response.Proto),
+		slog.Int("status_code", response.StatusCode),
+		slog.Duration("duration", time.Since(start)),
+	)
 	return
 }
 

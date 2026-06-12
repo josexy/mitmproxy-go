@@ -14,6 +14,7 @@ An easy-to-use and flexible MITM proxy library for Go that can intercept and ins
 - Optional custom root CAs and client certificates for mTLS
 - uTLS-based ClientHello and ALPN mirroring for upstream TLS handshakes
 - Request metadata for TLS, timing, and connection details
+- Optional structured internal logging through `log/slog`
 - Runtime config updates for new connections
 
 ## Installation
@@ -192,8 +193,11 @@ func main() {
 mitmproxy.WithCACertPath("certs/ca.crt")
 mitmproxy.WithCAKeyPath("certs/ca.key")
 mitmproxy.WithStreamBaseContext(ctx)
+mitmproxy.WithLogger(slog.Default())
 mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {})
 ```
+
+Internal proxy logging is disabled by default. Pass `WithLogger(logger)` to enable structured `slog` output; pass `WithLogger(nil)` to disable it. Log messages are prefixed with `[mitmproxy-go]`. Core logs include connection, routing, TLS, HTTP, HTTP/2, WebSocket, transport retry, and runtime config metadata, but do not log headers, bodies, WebSocket payloads, or raw certificates.
 
 ### Upstream and Transport
 
@@ -255,6 +259,7 @@ if err != nil {
 
 handler.SetHTTPInterceptor(updatedInterceptor)
 handler.SetHostFilters(nil, []string{"*.cdn.example.com"})
+handler.SetLogger(slog.Default())
 handler.SetHTTP2Disabled(true)
 ```
 
@@ -279,6 +284,7 @@ handler.SetIdleConnTimeout(60 * time.Second)
 handler.SetSkipVerifySSLFromServer(true)
 handler.SetHTTP2Disabled(true)
 handler.SetStreamBaseContext(ctx)
+handler.SetLogger(logger)
 
 handler.SetErrorHandler(errorHandler)
 handler.SetHTTPInterceptor(httpInterceptor)

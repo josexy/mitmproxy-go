@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"slices"
@@ -27,6 +28,7 @@ type RuntimeConfigManager interface {
 	SetSkipVerifySSLFromServer(skip bool)
 	SetHTTP2Disabled(disabled bool)
 	SetStreamBaseContext(ctx context.Context)
+	SetLogger(logger *slog.Logger)
 
 	SetErrorHandler(handler ErrorHandler)
 	SetHTTPInterceptor(interceptor HTTPInterceptor)
@@ -51,6 +53,7 @@ type runtimeConfigState struct {
 	excludeHosts  []string
 	rootCAs       []string
 	dialer        *net.Dialer
+	logger        *slog.Logger
 
 	idleConnTimeout       time.Duration
 	wsMaxFramesPerForward int
@@ -87,6 +90,7 @@ func newRuntimeConfigStateFromOptions(opts *options) runtimeConfigState {
 		excludeHosts:          slices.Clone(opts.excludeHosts),
 		rootCAs:               slices.Clone(opts.rootCAs),
 		dialer:                opts.dialer,
+		logger:                opts.logger,
 		idleConnTimeout:       opts.idleConnTimeout,
 		wsMaxFramesPerForward: opts.wsMaxFramesPerForward,
 		clientCerts:           cloneClientCerts(opts.clientCerts),
@@ -114,6 +118,7 @@ func buildRuntimeConfig(state runtimeConfigState) (*runtimeConfig, error) {
 	if state.dialer == nil {
 		state.dialer = &net.Dialer{Timeout: dialTimeout}
 	}
+	state.logger = normalizeLogger(state.logger)
 	if state.wsMaxFramesPerForward <= 0 {
 		return nil, ErrInvalidWebsocketFrameBufferSize
 	}

@@ -137,6 +137,7 @@ func main() {
 	handler, err := mitmproxy.NewMitmProxyHandler(
 		mitmproxy.WithCACertPath(caCertPath),
 		mitmproxy.WithCAKeyPath(caKeyPath),
+		mitmproxy.WithLogger(logger),
 		mitmproxy.WithHTTPInterceptor(httpInterceptor),
 		mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
 		mitmproxy.WithErrorHandler(errHandler),
