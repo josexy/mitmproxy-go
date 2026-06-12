@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -315,6 +316,83 @@ func TestSingleConnTransportRetriesReplayableRequestAfterBadClientConn(t *testin
 		t.Fatalf("dialCount = %d, want retry on a new connection", dialCount)
 	}
 	<-done
+}
+
+func TestSingleConnTransportRetriesHTTP2RequestAfterBadClientConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 2)
+	protos := &http.Protocols{}
+	protos.SetHTTP1(true)
+	protos.SetUnencryptedHTTP2(true)
+	server := &http.Server{
+		Protocols: protos,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ProtoMajor != 2 {
+				errCh <- fmt.Errorf("origin request proto = %s, want HTTP/2", r.Proto)
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}
+	defer server.Close()
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		firstConn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if err := closeHTTP2ConnAfterRequestHeaders(firstConn); err != nil {
+			errCh <- err
+			return
+		}
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed && !errors.Is(err, net.ErrClosed) {
+			errCh <- err
+		}
+	}()
+
+	dialCount := 0
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount++
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || string(body) != "ok" {
+		t.Fatalf("response = proto %s status %d body %q, want HTTP/2 200 ok", resp.Proto, resp.StatusCode, body)
+	}
+	if dialCount != 2 {
+		t.Fatalf("dialCount = %d, want HTTP/2 retry on a new connection", dialCount)
+	}
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+	_ = server.Close()
+	<-firstDone
 }
 
 func TestSingleConnTransportDoesNotRetryNonIdempotentRequestAfterBadClientConn(t *testing.T) {
@@ -669,5 +747,43 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
 	}
 	if !fn() {
 		t.Fatal("condition was not met before timeout")
+	}
+}
+
+func closeHTTP2ConnAfterRequestHeaders(conn net.Conn) error {
+	defer conn.Close()
+
+	preface := make([]byte, len(http2.ClientPreface))
+	if _, err := io.ReadFull(conn, preface); err != nil {
+		return err
+	}
+	if string(preface) != http2.ClientPreface {
+		return fmt.Errorf("client preface = %q, want HTTP/2 client preface", preface)
+	}
+
+	framer := http2.NewFramer(conn, conn)
+	for {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			return err
+		}
+		if _, ok := frame.(*http2.SettingsFrame); ok {
+			break
+		}
+	}
+	if err := framer.WriteSettings(); err != nil {
+		return err
+	}
+	if err := framer.WriteSettingsAck(); err != nil {
+		return err
+	}
+	for {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			return err
+		}
+		if _, ok := frame.(*http2.HeadersFrame); ok {
+			return nil
+		}
 	}
 }
