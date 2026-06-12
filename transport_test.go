@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -363,14 +362,61 @@ func TestSingleConnTransportDoesNotRetryNonIdempotentRequestAfterBadClientConn(t
 	<-done
 }
 
-func TestSingleConnTransportRetriesIdempotencyKeyRequestAfterBadClientConn(t *testing.T) {
+func TestSingleConnTransportDoesNotRetryIdempotencyKeyRequestWithBodyAfterBadClientConn(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
 
-	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+	}()
+
+	dialCount := 0
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount++
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		true,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", nil)
+	req.Body = io.NopCloser(strings.NewReader("payload"))
+	req.Header["Idempotency-Key"] = []string{}
+	req.ContentLength = int64(len("payload"))
+	if _, err := tr.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip unexpectedly succeeded")
+	}
+	if dialCount != 1 {
+		t.Fatalf("dialCount = %d, want no retry for request with body", dialCount)
+	}
+	<-done
+}
+
+func TestSingleConnTransportRetriesIdempotencyKeyRequestWithoutBodyAfterBadClientConn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -388,15 +434,10 @@ func TestSingleConnTransportRetriesIdempotencyKeyRequestAfterBadClientConn(t *te
 		defer secondConn.Close()
 		req, err := http.ReadRequest(bufio.NewReader(secondConn))
 		if err != nil {
-			errCh <- err
 			return
 		}
-		body, _ := io.ReadAll(req.Body)
+		_, _ = io.Copy(io.Discard, req.Body)
 		_ = req.Body.Close()
-		if string(body) != "payload" {
-			errCh <- fmt.Errorf("retry body = %q, want payload", body)
-			return
-		}
 		_, _ = secondConn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
 	}()
 
@@ -412,7 +453,7 @@ func TestSingleConnTransportRetriesIdempotencyKeyRequestAfterBadClientConn(t *te
 	)
 	defer tr.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", strings.NewReader("payload"))
+	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", nil)
 	req.Header["Idempotency-Key"] = []string{}
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
@@ -425,11 +466,6 @@ func TestSingleConnTransportRetriesIdempotencyKeyRequestAfterBadClientConn(t *te
 	}
 	if dialCount != 2 {
 		t.Fatalf("dialCount = %d, want retry on a new connection", dialCount)
-	}
-	select {
-	case err := <-errCh:
-		t.Fatal(err)
-	default:
 	}
 	<-done
 }

@@ -83,19 +83,17 @@ func replayableRequest(req *http.Request) (*http.Request, bool) {
 	if !isReplayableRequest(req) {
 		return nil, false
 	}
-	if req.Body == nil || req.Body == http.NoBody {
+	if requestHasNoBody(req) {
 		return req, true
 	}
-	if req.GetBody == nil {
-		return nil, false
+	return nil, false
+}
+
+func requestHasNoBody(req *http.Request) bool {
+	if req == nil {
+		return false
 	}
-	next := req.Clone(req.Context())
-	body, err := req.GetBody()
-	if err != nil {
-		return nil, false
-	}
-	next.Body = body
-	return next, true
+	return req.Body == nil || req.Body == http.NoBody
 }
 
 func isReplayableRequest(req *http.Request) bool {

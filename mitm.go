@@ -761,12 +761,14 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 
 func (r *mitmProxyHandler) setTLSRemoteDialer(connCtx *biConnContext, hostport string, firstConn net.Conn, hello capturedClientHello) {
 	var mu sync.Mutex
-	firstConnUsed := false
+	initialConn := firstConn
+	initialConnConsumed := false
 	connCtx.setRemoteDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
 		mu.Lock()
-		if !firstConnUsed {
-			firstConnUsed = true
-			conn := firstConn
+		if !initialConnConsumed {
+			initialConnConsumed = true
+			conn := initialConn
+			initialConn = nil
 			mu.Unlock()
 			if conn == nil {
 				return nil, errors.New("remote tls connection missing in context")
