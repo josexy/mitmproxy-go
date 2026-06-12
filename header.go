@@ -29,8 +29,7 @@ const (
 )
 
 var (
-	HttpResponseConnectionEstablished    = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
-	H2CUpgradeResponseSwitchingProtocols = []byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
+	HttpResponseConnectionEstablished = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
 )
 
 var (

@@ -24,7 +24,6 @@ type singleConnTransport struct {
 	mu         sync.Mutex
 	clientConn *http.ClientConn
 	retired    []*http.ClientConn
-	singleUse  map[net.Conn]struct{}
 	upstream   string
 	closed     bool
 }
@@ -44,9 +43,6 @@ func newTransport(
 }
 
 func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if shouldUseUpstreamH2CUpgrade(req, t.disableHTTP2) {
-		return t.roundTripH2CUpgrade(req)
-	}
 	logger := loggerFromContext(req.Context())
 	for attempt := 0; ; attempt++ {
 		start := time.Now()
@@ -206,8 +202,6 @@ func (t *singleConnTransport) Close() error {
 	t.clientConn = nil
 	retired := t.retired
 	t.retired = nil
-	singleUse := t.singleUse
-	t.singleUse = nil
 	t.mu.Unlock()
 
 	if clientConn != nil {
@@ -216,44 +210,7 @@ func (t *singleConnTransport) Close() error {
 	for _, conn := range retired {
 		_ = conn.Close()
 	}
-	for conn := range singleUse {
-		_ = conn.Close()
-	}
 	return nil
-}
-
-func (t *singleConnTransport) dialSingleUseConn(ctx context.Context) (net.Conn, error) {
-	if t.dialFn == nil {
-		return nil, errors.New("remote dialer missing")
-	}
-	conn, err := t.dialFn(ctx, "tcp", t.hostport)
-	if err != nil {
-		return nil, err
-	}
-	if err := t.trackSingleUseConn(conn); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
-func (t *singleConnTransport) trackSingleUseConn(conn net.Conn) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.closed {
-		return net.ErrClosed
-	}
-	if t.singleUse == nil {
-		t.singleUse = make(map[net.Conn]struct{})
-	}
-	t.singleUse[conn] = struct{}{}
-	return nil
-}
-
-func (t *singleConnTransport) untrackSingleUseConn(conn net.Conn) {
-	t.mu.Lock()
-	delete(t.singleUse, conn)
-	t.mu.Unlock()
 }
 
 func (t *singleConnTransport) setNegotiatedProtocol(proto string) {

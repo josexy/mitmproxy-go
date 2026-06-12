@@ -1155,33 +1155,93 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 		})
 		return true, nil
 	}
-	// Handle Upgrade to h2c (RFC 7540 Section 3.2)
+	// Handle Upgrade to h2c (RFC 7540 Section 3.2).
+	//
+	// Unlike h2c prior knowledge, the first h2c-upgrade request is an
+	// HTTP/1.1 hop-by-hop handshake that the upstream may need to observe.
+	// Go does not expose a high-level client API for "stream 1 was already
+	// sent as an HTTP/1.1 upgrade request, now read its HTTP/2 response".
+	// Keep this path transparent: forward the upgrade request and then tunnel
+	// the upgraded connection without MITM-parsing the HTTP/2 streams.
 	if isH2CUpgrade(req.Header) {
-		removeProxyHeaders(req.Header)
-		conn, settings, err := upgradeH2C(rw, req)
-		if err != nil {
-			return false, err
-		}
 		reqCtx, _ := FromRequestContext(ctx)
-		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "h2c upgrade",
+		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "h2c upgrade passthrough",
 			slog.String("hostport", reqCtx.Hostport),
 			slog.String("method", requestMethod(req)),
 			slog.String("url", requestURL(req)),
 		)
-		newCtx, cancel := context.WithCancel(connCtx.config.state.streamBaseCtx)
-		go func() {
-			connCtx.local.waitClose()
-			cancel()
-		}()
-		newHTTP2Server(connCtx.config).ServeConn(conn, &http2.ServeConnOpts{
-			Context:        newCtx,
-			Handler:        r.serveHTTP2Handler(ctx),
-			UpgradeRequest: req,
-			Settings:       settings,
-		})
-		return true, nil
+		return true, r.passthroughH2CUpgrade(ctx, rw, req)
 	}
 	return false, nil
+}
+
+// passthroughH2CUpgrade forwards the HTTP/1.1 h2c upgrade handshake to the
+// upstream and then tunnels the upgraded HTTP/2 bytes in both directions.
+func (r *mitmProxyHandler) passthroughH2CUpgrade(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	srcConn, rwc, err := http.NewResponseController(rw).Hijack()
+	if err != nil {
+		return err
+	}
+	if rwc != nil {
+		srcConn = newBufConnExt(srcConn, rwc)
+	}
+
+	if err := writeH2CUpgradeRequestHeaders(connCtx.remote, req); err != nil {
+		return err
+	}
+	return iocopy.IoCopyBidirectional(connCtx.remote, srcConn)
+}
+
+func writeH2CUpgradeRequestHeaders(dst io.Writer, req *http.Request) error {
+	bw := bufio.NewWriter(dst)
+	method := req.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	requestURI := "/"
+	if req.URL != nil {
+		if uri := req.URL.RequestURI(); uri != "" {
+			requestURI = uri
+		}
+	}
+	if _, err := fmt.Fprintf(bw, "%s %s HTTP/1.1\r\n", method, requestURI); err != nil {
+		return err
+	}
+
+	host := req.Host
+	if host == "" && req.URL != nil {
+		host = req.URL.Host
+	}
+	if host != "" {
+		if _, err := fmt.Fprintf(bw, "Host: %s\r\n", host); err != nil {
+			return err
+		}
+	}
+
+	header := req.Header.Clone()
+	removeProxyHeaders(header)
+	header.Del("Host")
+	header.Del(HttpHeaderContentLength)
+	header.Del(HttpHeaderTransferEncoding)
+
+	if req.ContentLength > 0 {
+		if _, err := fmt.Fprintf(bw, "Content-Length: %d\r\n", req.ContentLength); err != nil {
+			return err
+		}
+	} else if len(req.TransferEncoding) > 0 {
+		if _, err := fmt.Fprintf(bw, "Transfer-Encoding: %s\r\n", strings.Join(req.TransferEncoding, ", ")); err != nil {
+			return err
+		}
+	}
+
+	if err := header.Write(bw); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(bw, "\r\n"); err != nil {
+		return err
+	}
+	return bw.Flush()
 }
 
 func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *fakeHttpResponseWriter, request *http.Request, tlsRequest bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
@@ -1207,7 +1267,6 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 	}
 
 	if !connCtx.config.state.disableHTTP2 {
-		// If it's a SOCKS proxy, then the request might be h2c.
 		earlyDone, retErr = r.handlePrefaceOrH2CRequest(ctx, fakerw, request)
 		if retErr != nil || earlyDone {
 			return
