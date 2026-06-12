@@ -2,7 +2,6 @@ package mitmproxy
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -10,6 +9,8 @@ import (
 	"os"
 	"slices"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 var ErrInvalidWebsocketFrameBufferSize = errors.New("websocket frame buffer size must be greater than 0")
@@ -67,7 +68,7 @@ type runtimeConfig struct {
 
 	proxyDialer    *proxyDialer
 	rootCACertPool *x509.CertPool
-	clientCertPool map[string]tls.Certificate
+	clientCertPool map[string]utls.Certificate
 	httpInt        HTTPInterceptor
 	domainMatcher  struct {
 		include *trieNode
@@ -185,10 +186,10 @@ func loadRootCAPool(rootCAPaths []string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-func loadClientCertPool(clientCerts map[string]ClientCert) (map[string]tls.Certificate, error) {
-	pool := make(map[string]tls.Certificate, len(clientCerts))
+func loadClientCertPool(clientCerts map[string]ClientCert) (map[string]utls.Certificate, error) {
+	pool := make(map[string]utls.Certificate, len(clientCerts))
 	for hostname, cc := range clientCerts {
-		tlsCert, err := tls.LoadX509KeyPair(cc.CertPath, cc.KeyPath)
+		tlsCert, err := utls.LoadX509KeyPair(cc.CertPath, cc.KeyPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load client cert: %s:%s %w", cc.CertPath, cc.KeyPath, err)
 		}
