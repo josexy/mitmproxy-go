@@ -4,14 +4,15 @@ An easy-to-use and flexible MITM proxy library for Go that can intercept and ins
 
 ## Features
 
-- HTTP/1.1, HTTP/2, and h2c support
+- HTTP/1.1, HTTP/2 over TLS, and h2c support
 - HTTPS interception with custom CA certificates
 - WebSocket and secure WebSocket interception
 - HTTP proxy mode and SOCKS5 proxy mode
 - HTTP interceptor chaining
 - Host include/exclude filtering with wildcard matching
-- Upstream proxy support
+- Upstream HTTP CONNECT and SOCKS5 proxy support
 - Optional custom root CAs and client certificates for mTLS
+- uTLS-based ClientHello and ALPN mirroring for upstream TLS handshakes
 - Request metadata for TLS, timing, and connection details
 - Runtime config updates for new connections
 
@@ -23,7 +24,7 @@ go get github.com/josexy/mitmproxy-go
 
 ## Prerequisites
 
-HTTPS interception requires a CA certificate and private key:
+The handler loads a CA certificate and private key at startup. Generate a local CA before running the examples:
 
 ```bash
 chmod +x ./tools/gen_cert.sh
@@ -216,6 +217,8 @@ mitmproxy.WithClientCert("example.com", mitmproxy.ClientCert{
 mitmproxy.WithCertCachePool(2048, 30, 15)
 ```
 
+HTTPS and WSS interception automatically captures the client's TLS ClientHello, fingerprints it with uTLS (`github.com/refraction-networking/utls`), patches SNI/ALPN for the target server, and uses that spec for the upstream TLS handshake. `WithDisableHTTP2` also removes `h2` from mirrored ALPN protocols.
+
 ### Interceptors
 
 ```go
@@ -224,6 +227,8 @@ mitmproxy.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
 mitmproxy.WithWebsocketInterceptor(websocketInterceptor)
 mitmproxy.WithMaxWebsocketFramesPerForward(4096)
 ```
+
+For WebSocket frames received from `WebsocketFramesWatcher`, call either `frame.Invoke()` to forward the frame or `frame.Release()` to drop it and release the backing buffer.
 
 ### Host Filtering
 
@@ -315,6 +320,8 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	md := mdCtx.MD()
 
 	fmt.Printf("target: %s\n", md.RequestHostport)
+	fmt.Printf("local addr: %s -> %s\n", md.LocalAddrInfo.SourceAddr, md.LocalAddrInfo.DestinationAddr)
+	fmt.Printf("remote addr: %s -> %s\n", md.RemoteAddrInfo.SourceAddr, md.RemoteAddrInfo.DestinationAddr)
 	fmt.Printf("local connected at: %v\n", md.LocalConnectionEstablishedTs)
 	fmt.Printf("remote connected at: %v\n", md.RemoteConnectionEstablishedTs)
 	fmt.Printf("dns lookup: %v -> %v (%v)\n",
@@ -369,6 +376,12 @@ Run them from the repository root.
 go run ./examples/helloworld/main.go -cacert certs/ca.crt -cakey certs/ca.key -port 10086
 ```
 
+Then send a request through the proxy:
+
+```bash
+curl -x http://127.0.0.1:10086 --cacert certs/ca.crt https://example.com
+```
+
 ### Dumper
 
 ```bash
@@ -419,4 +432,4 @@ gofmt -w <files>
 
 ## License
 
-This project is available under the terms specified in the repository.
+This project is available under the MIT License.
