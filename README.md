@@ -1,6 +1,6 @@
 # mitmproxy-go
 
-An easy-to-use and flexible MITM proxy library for Go that can intercept and inspect HTTP, HTTPS, HTTP/2, h2c, WebSocket, and WSS traffic.
+An easy-to-use and flexible MITM proxy library for Go. It can intercept and inspect HTTP, HTTPS, HTTP/2, h2c, WebSocket, and WSS traffic, and it can run as either an HTTP proxy or a SOCKS5 proxy.
 
 ## Features
 
@@ -32,7 +32,17 @@ chmod +x ./tools/gen_cert.sh
 OUTDIR=certs ./tools/gen_cert.sh
 ```
 
-Clients that use the proxy must trust the generated CA certificate.
+The script writes `ca.crt`, `ca.key`, `server.crt`, `server.key`, `client.crt`, and `client.key` to `OUTDIR`. Clients that use the proxy must trust the generated `ca.crt`.
+
+The generator can be customized with environment variables:
+
+```bash
+OUTDIR=certs \
+CA_DOMAIN=example.ca.com \
+DOMAINS=localhost,127.0.0.1 \
+IPS=127.0.0.1 \
+./tools/gen_cert.sh
+```
 
 ## Quick Start
 
@@ -203,12 +213,17 @@ Internal proxy logging is disabled by default. Pass `WithLogger(logger)` to enab
 
 ```go
 mitmproxy.WithProxy("http://127.0.0.1:8080")
+mitmproxy.WithProxy("socks5://127.0.0.1:1080")
 mitmproxy.WithDisableProxy()
 mitmproxy.WithDialer(&net.Dialer{Timeout: 30 * time.Second})
 mitmproxy.WithIdleConnTimeout(60 * time.Second)
 mitmproxy.WithDisableHTTP2()
 mitmproxy.WithSkipVerifySSLFromServer()
 ```
+
+If `WithProxy` is not set, `HTTP_PROXY` and `HTTPS_PROXY` environment variables are considered. `WithDisableProxy` disables both explicit and environment proxy settings.
+
+`WithDisableHTTP2` forces HTTP/1.1 upstream traffic and disables h2c handling. When HTTP/2 is enabled, h2c prior-knowledge connections can be inspected; HTTP/1.1 `Upgrade: h2c` handshakes are forwarded transparently as passthrough tunnels.
 
 ### TLS and Certificate Options
 
@@ -223,6 +238,8 @@ mitmproxy.WithCertCachePool(2048, 30, 15)
 
 HTTPS and WSS interception automatically captures the client's TLS ClientHello, fingerprints it with uTLS (`github.com/refraction-networking/utls`), patches SNI/ALPN for the target server, and uses that spec for the upstream TLS handshake. `WithDisableHTTP2` also removes `h2` from mirrored ALPN protocols.
 
+`WithCertCachePool(capacity, intervalSecond, expireSecond)` configures the generated certificate cache. `capacity` must be a multiple of 256 when it is set; the interval and expiration values are seconds.
+
 ### Interceptors
 
 ```go
@@ -232,7 +249,9 @@ mitmproxy.WithWebsocketInterceptor(websocketInterceptor)
 mitmproxy.WithMaxWebsocketFramesPerForward(4096)
 ```
 
-For WebSocket frames received from `WebsocketFramesWatcher`, call either `frame.Invoke()` to forward the frame or `frame.Release()` to drop it and release the backing buffer.
+When both `WithHTTPInterceptor` and `WithChainHTTPInterceptor` are configured, the single interceptor runs first and then the chain runs in the order provided.
+
+For WebSocket frames received from `WebsocketFramesWatcher`, call either `frame.Invoke()` to forward the frame or `frame.Release()` to drop it and release the backing buffer. `frame.Invoke()` releases the backing buffer after forwarding.
 
 ### Host Filtering
 
@@ -294,6 +313,8 @@ err := handler.SetMaxWebsocketFramesPerForward(4096)
 ```
 
 `SetRootCAs`, `SetClientCerts`, `SetProxy`, `SetProxyDisabled`, `SetDialer`, and `SetMaxWebsocketFramesPerForward` can return errors. If validation fails, the previous runtime config remains active.
+
+`SetHTTPInterceptor` replaces any previously configured HTTP interceptor chain. `SetChainHTTPInterceptors` replaces any previously configured single HTTP interceptor.
 
 CA certificate/key and certificate cache pool settings are initialization-only:
 
