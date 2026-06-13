@@ -35,6 +35,7 @@ func main() {
 	handler, err := mitmproxy.NewDynamicMitmProxyHandler(
 		mitmproxy.WithCACertPath(caCertPath),
 		mitmproxy.WithCAKeyPath(caKeyPath),
+		mitmproxy.WithLogger(logger),
 		mitmproxy.WithHTTPInterceptor(tagInterceptor("initial")),
 		mitmproxy.WithIdleConnTimeout(30*time.Second),
 		mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {

@@ -3,6 +3,7 @@ package mitmproxy
 import (
 	"context"
 	"crypto/x509"
+	"log/slog"
 	"net"
 	"time"
 
@@ -36,6 +37,7 @@ type options struct {
 	excludeHosts  []string    // Blacklist of hosts to exclude from interception (supports wildcards)
 	rootCAs       []string    // Paths to additional root CA certificate files
 	dialer        *net.Dialer // Custom dialer for outbound connections
+	logger        *slog.Logger
 
 	idleConnTimeout time.Duration // Idle timeout for connections
 
@@ -83,6 +85,21 @@ func newOptions(opt ...Option) *options {
 func WithStreamBaseContext(baseCtx context.Context) Option {
 	return OptionFunc(func(o *options) {
 		o.streamBaseCtx = baseCtx
+	})
+}
+
+// WithLogger sets the logger used by the proxy internals.
+// If logger is nil or this option is not specified, proxy logging is disabled.
+//
+// Example:
+//
+//	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+//	handler, err := NewMitmProxyHandler(
+//	    WithLogger(logger),
+//	)
+func WithLogger(logger *slog.Logger) Option {
+	return OptionFunc(func(o *options) {
+		o.logger = logger
 	})
 }
 

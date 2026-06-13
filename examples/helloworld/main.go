@@ -40,6 +40,7 @@ func main() {
 	handler, err := mitmproxy.NewMitmProxyHandler(
 		mitmproxy.WithCACertPath(caCertPath),
 		mitmproxy.WithCAKeyPath(caKeyPath),
+		mitmproxy.WithLogger(logger),
 		mitmproxy.WithHTTPInterceptor(httpInterceptor),
 	)
 	if err != nil {

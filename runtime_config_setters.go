@@ -2,6 +2,7 @@ package mitmproxy
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"slices"
 	"time"
@@ -54,21 +55,21 @@ func (r *mitmProxyHandler) SetClientCerts(clientCerts map[string]ClientCert) err
 func (r *mitmProxyHandler) SetIdleConnTimeout(timeout time.Duration) {
 	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.idleConnTimeout = timeout
-		return state, runtimeConfigParts{}, nil
+		return state, runtimeConfigParts{idleConnTimeout: true}, nil
 	})
 }
 
 func (r *mitmProxyHandler) SetSkipVerifySSLFromServer(skip bool) {
 	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.skipVerifySSL = skip
-		return state, runtimeConfigParts{}, nil
+		return state, runtimeConfigParts{skipVerifySSL: true}, nil
 	})
 }
 
 func (r *mitmProxyHandler) SetHTTP2Disabled(disabled bool) {
 	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.disableHTTP2 = disabled
-		return state, runtimeConfigParts{}, nil
+		return state, runtimeConfigParts{http2: true}, nil
 	})
 }
 
@@ -78,14 +79,21 @@ func (r *mitmProxyHandler) SetStreamBaseContext(ctx context.Context) {
 			ctx = context.Background()
 		}
 		state.streamBaseCtx = ctx
-		return state, runtimeConfigParts{}, nil
+		return state, runtimeConfigParts{streamBaseContext: true}, nil
+	})
+}
+
+func (r *mitmProxyHandler) SetLogger(logger *slog.Logger) {
+	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+		state.logger = logger
+		return state, runtimeConfigParts{logger: true}, nil
 	})
 }
 
 func (r *mitmProxyHandler) SetErrorHandler(handler ErrorHandler) {
 	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.errHandler = handler
-		return state, runtimeConfigParts{}, nil
+		return state, runtimeConfigParts{errorHandler: true}, nil
 	})
 }
 
@@ -108,26 +116,83 @@ func (r *mitmProxyHandler) SetChainHTTPInterceptors(interceptors ...HTTPIntercep
 func (r *mitmProxyHandler) SetWebsocketInterceptor(interceptor WebsocketInterceptor) {
 	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.wsInt = interceptor
-		return state, runtimeConfigParts{}, nil
+		return state, runtimeConfigParts{websocketInterceptor: true}, nil
 	})
 }
 
 func (r *mitmProxyHandler) SetMaxWebsocketFramesPerForward(maxFrames int) error {
 	if maxFrames <= 0 {
+		logConfigAttrs(context.Background(), r.config.Load(), slog.LevelWarn, "runtime config update failed",
+			slog.Any("parts", []string{"websocket"}),
+			slog.Int("max_websocket_frames_per_forward", maxFrames),
+			errorAttr(ErrInvalidWebsocketFrameBufferSize),
+		)
 		return ErrInvalidWebsocketFrameBufferSize
 	}
 	return r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.wsMaxFramesPerForward = maxFrames
-		return state, runtimeConfigParts{}, nil
+		return state, runtimeConfigParts{websocket: true}, nil
 	})
 }
 
 type runtimeConfigParts struct {
-	proxy           bool
-	rootCAs         bool
-	clientCerts     bool
-	domainMatcher   bool
-	httpInterceptor bool
+	proxy                bool
+	rootCAs              bool
+	clientCerts          bool
+	domainMatcher        bool
+	httpInterceptor      bool
+	logger               bool
+	idleConnTimeout      bool
+	skipVerifySSL        bool
+	http2                bool
+	streamBaseContext    bool
+	errorHandler         bool
+	websocketInterceptor bool
+	websocket            bool
+}
+
+func (p runtimeConfigParts) names() []string {
+	names := make([]string, 0, 8)
+	if p.proxy {
+		names = append(names, "proxy")
+	}
+	if p.rootCAs {
+		names = append(names, "root_cas")
+	}
+	if p.clientCerts {
+		names = append(names, "client_certs")
+	}
+	if p.domainMatcher {
+		names = append(names, "host_filters")
+	}
+	if p.httpInterceptor {
+		names = append(names, "http_interceptor")
+	}
+	if p.logger {
+		names = append(names, "logger")
+	}
+	if p.idleConnTimeout {
+		names = append(names, "idle_conn_timeout")
+	}
+	if p.skipVerifySSL {
+		names = append(names, "skip_verify_ssl")
+	}
+	if p.http2 {
+		names = append(names, "http2")
+	}
+	if p.streamBaseContext {
+		names = append(names, "stream_base_context")
+	}
+	if p.errorHandler {
+		names = append(names, "error_handler")
+	}
+	if p.websocketInterceptor {
+		names = append(names, "websocket_interceptor")
+	}
+	if p.websocket {
+		names = append(names, "websocket")
+	}
+	return names
 }
 
 func (r *mitmProxyHandler) updateRuntimeConfig(update func(runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error)) error {
@@ -137,14 +202,25 @@ func (r *mitmProxyHandler) updateRuntimeConfig(update func(runtimeConfigState) (
 	oldCfg := r.config.Load()
 	nextState, parts, err := update(r.runtimeState.clone())
 	if err != nil {
+		logConfigAttrs(context.Background(), oldCfg, slog.LevelWarn, "runtime config update failed",
+			slog.Any("parts", parts.names()),
+			errorAttr(err),
+		)
 		return err
 	}
 	nextCfg, err := rebuildRuntimeConfig(oldCfg, nextState, parts)
 	if err != nil {
+		logConfigAttrs(context.Background(), oldCfg, slog.LevelWarn, "runtime config update failed",
+			slog.Any("parts", parts.names()),
+			errorAttr(err),
+		)
 		return err
 	}
 	r.runtimeState = nextCfg.state
 	r.config.Store(nextCfg)
+	logConfigAttrs(context.Background(), nextCfg, slog.LevelInfo, "runtime config updated",
+		slog.Any("parts", parts.names()),
+	)
 	return nil
 }
 
@@ -156,6 +232,7 @@ func rebuildRuntimeConfig(oldCfg *runtimeConfig, state runtimeConfigState, parts
 	if state.dialer == nil {
 		state.dialer = &net.Dialer{Timeout: dialTimeout}
 	}
+	state.logger = normalizeLogger(state.logger)
 
 	cfg := &runtimeConfig{
 		state:          state,
