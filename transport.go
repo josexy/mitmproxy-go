@@ -88,10 +88,11 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 				slog.Bool("retry", retry),
 				slog.Duration("duration", time.Since(start)),
 				errorAttr(err),
+				clientConnErrorAttr(clientConn),
 			)
 		}
 		if discard {
-			t.discardClientConn(clientConn, shouldCloseDiscardedClientConn(clientConn, err))
+			t.discardClientConn(req.Context(), clientConn, shouldCloseDiscardedClientConn(clientConn, err))
 		}
 		if retry {
 			req = nextReq
@@ -219,37 +220,74 @@ func (t *singleConnTransport) setNegotiatedProtocol(proto string) {
 	t.mu.Unlock()
 }
 
-func (t *singleConnTransport) discardClientConn(clientConn *http.ClientConn, closeConn bool) {
+func (t *singleConnTransport) discardClientConn(ctx context.Context, clientConn *http.ClientConn, closeConn bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = context.WithoutCancel(ctx)
+	}
+	logger := loggerFromContext(ctx)
+
 	t.mu.Lock()
 	if t.clientConn != clientConn {
 		t.mu.Unlock()
+		logAttrs(ctx, logger, slog.LevelDebug, "transport client connection discard skipped",
+			slog.String("hostport", t.hostport),
+			slog.Bool("close_conn", closeConn),
+			slog.String("reason", "not_current"),
+			slog.Int("in_flight", clientConn.InFlight()),
+			clientConnErrorAttr(clientConn),
+		)
 		return
 	}
 	t.clientConn = nil
 	if !closeConn {
 		t.retired = append(t.retired, clientConn)
 	}
+	retiredCount := len(t.retired)
 	t.mu.Unlock()
 
+	logAttrs(ctx, logger, slog.LevelDebug, "transport client connection discarded",
+		slog.String("hostport", t.hostport),
+		slog.Bool("close_conn", closeConn),
+		slog.Int("retired_count", retiredCount),
+		slog.Int("in_flight", clientConn.InFlight()),
+		clientConnErrorAttr(clientConn),
+	)
 	if closeConn {
 		_ = clientConn.Close()
 	} else {
-		t.watchRetiredClientConn(clientConn)
+		t.watchRetiredClientConn(ctx, logger, clientConn)
 	}
 }
 
-func (t *singleConnTransport) watchRetiredClientConn(clientConn *http.ClientConn) {
+func (t *singleConnTransport) watchRetiredClientConn(ctx context.Context, logger *slog.Logger, clientConn *http.ClientConn) {
+	logAttrs(ctx, logger, slog.LevelDebug, "transport retired client connection watching",
+		slog.String("hostport", t.hostport),
+		slog.Int("in_flight", clientConn.InFlight()),
+		clientConnErrorAttr(clientConn),
+	)
 	clientConn.SetStateHook(func(cc *http.ClientConn) {
-		if cc.Err() != nil || cc.InFlight() == 0 {
-			t.closeRetiredClientConn(cc)
+		if reason := retiredClientConnCloseReason(cc); reason != "" {
+			t.closeRetiredClientConn(ctx, logger, cc, reason)
 		}
 	})
-	if clientConn.Err() != nil || clientConn.InFlight() == 0 {
-		t.closeRetiredClientConn(clientConn)
+	if reason := retiredClientConnCloseReason(clientConn); reason != "" {
+		t.closeRetiredClientConn(ctx, logger, clientConn, reason)
 	}
 }
 
-func (t *singleConnTransport) closeRetiredClientConn(clientConn *http.ClientConn) {
+func retiredClientConnCloseReason(clientConn *http.ClientConn) string {
+	if clientConn.Err() != nil {
+		return "error"
+	}
+	if clientConn.InFlight() == 0 {
+		return "drained"
+	}
+	return ""
+}
+
+func (t *singleConnTransport) closeRetiredClientConn(ctx context.Context, logger *slog.Logger, clientConn *http.ClientConn, reason string) {
 	t.mu.Lock()
 	idx := -1
 	for i, retired := range t.retired {
@@ -260,13 +298,31 @@ func (t *singleConnTransport) closeRetiredClientConn(clientConn *http.ClientConn
 	}
 	if idx < 0 {
 		t.mu.Unlock()
+		logAttrs(ctx, logger, slog.LevelDebug, "transport retired client connection close skipped",
+			slog.String("hostport", t.hostport),
+			slog.String("reason", "not_retired"),
+			slog.Int("in_flight", clientConn.InFlight()),
+			clientConnErrorAttr(clientConn),
+		)
 		return
 	}
 	t.retired = append(t.retired[:idx], t.retired[idx+1:]...)
+	retiredCount := len(t.retired)
 	t.mu.Unlock()
 
 	clientConn.SetStateHook(nil)
 	_ = clientConn.Close()
+	logAttrs(ctx, logger, slog.LevelDebug, "transport retired client connection closed",
+		slog.String("hostport", t.hostport),
+		slog.String("reason", reason),
+		slog.Int("retired_count", retiredCount),
+		slog.Int("in_flight", clientConn.InFlight()),
+		clientConnErrorAttr(clientConn),
+	)
+}
+
+func clientConnErrorAttr(clientConn *http.ClientConn) slog.Attr {
+	return namedErrorAttr("client_conn_error", clientConn.Err())
 }
 
 func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Request) (*http.ClientConn, error) {

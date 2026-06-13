@@ -58,10 +58,14 @@ func logConfigAttrs(ctx context.Context, cfg *runtimeConfig, level slog.Level, m
 }
 
 func errorAttr(err error) slog.Attr {
+	return namedErrorAttr("error", err)
+}
+
+func namedErrorAttr(name string, err error) slog.Attr {
 	if err == nil {
-		return slog.String("error", "")
+		return slog.String(name, "")
 	}
-	return slog.String("error", err.Error())
+	return slog.String(name, err.Error())
 }
 
 func requestMethod(req *http.Request) string {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -624,7 +625,11 @@ func TestSingleConnTransportClosesRetiredClientConnWhenDrained(t *testing.T) {
 	)
 	defer tr.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	logger, sink := newCaptureLogger(slog.LevelDebug)
+	ctx := context.WithValue(context.Background(), connContextKey, &biConnContext{
+		config: &runtimeConfig{state: runtimeConfigState{logger: logger}},
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
 	respCh := make(chan *http.Response, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -647,13 +652,18 @@ func TestSingleConnTransportClosesRetiredClientConnWhenDrained(t *testing.T) {
 	if clientConn == nil {
 		t.Fatal("client connection was not cached")
 	}
-	tr.discardClientConn(clientConn, false)
+	tr.discardClientConn(req.Context(), clientConn, false)
 	tr.mu.Lock()
 	retiredCount := len(tr.retired)
 	tr.mu.Unlock()
 	if retiredCount != 1 {
 		t.Fatalf("retired count = %d, want 1 while request is in flight", retiredCount)
 	}
+	discardLog := requireLogMessage(t, sink, "transport client connection discarded")
+	if got := attrBool(discardLog, "close_conn"); got {
+		t.Fatal("discard log close_conn = true; want false")
+	}
+	requireLogMessage(t, sink, "transport retired client connection watching")
 
 	close(releaseResponse)
 	var resp *http.Response
@@ -674,6 +684,10 @@ func TestSingleConnTransportClosesRetiredClientConnWhenDrained(t *testing.T) {
 	})
 	if clientConn.Err() == nil {
 		t.Fatal("retired client conn remained open after draining")
+	}
+	closeLog := requireLogMessage(t, sink, "transport retired client connection closed")
+	if got := attrString(closeLog, "reason"); got != "drained" {
+		t.Fatalf("retired close reason = %q; want drained", got)
 	}
 	<-done
 }
