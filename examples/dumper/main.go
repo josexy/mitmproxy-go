@@ -250,7 +250,7 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 		)
 	}
 
-	req.Body, _ = newBodyDecoder(req.Body, "", CHUNK_TYPE_REQ)
+	req.Body, _ = newBodyDecoder(req.Body, req.Header.Get("Content-Encoding"), CHUNK_TYPE_REQ)
 
 	rsp, err := invoker.Invoke(req)
 	if err != nil {
