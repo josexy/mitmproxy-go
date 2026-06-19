@@ -61,6 +61,7 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 				slog.Int("attempt", attempt),
 				errorAttr(err),
 			)
+			closeRequestBody(req)
 			return nil, err
 		}
 		resp, err := clientConn.RoundTrip(req)
@@ -100,6 +101,13 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 		return nil, err
 	}
+}
+
+func closeRequestBody(req *http.Request) {
+	if req == nil || req.Body == nil {
+		return
+	}
+	_ = req.Body.Close()
 }
 
 func shouldDiscardClientConnAfterRoundTripError(ctx context.Context, clientConn *http.ClientConn, err error) bool {
