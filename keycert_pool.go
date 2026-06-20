@@ -33,22 +33,34 @@ func newPriKeyPool(maxSize int) *priKeyPool {
 
 func (p *priKeyPool) Get() (*rsa.PrivateKey, error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var n, m = len(p.keys), cap(p.keys)
+	n, m := len(p.keys), cap(p.keys)
 	if m == 0 {
+		p.mu.Unlock()
 		return nil, errNoPriKey
 	}
-	if n < m {
-		key, err := cert.GeneratePrivateKey()
-		if err != nil {
-			return nil, err
-		}
-		p.keys = append(p.keys, key)
+	if n >= m {
+		// pool is full: reuse an existing key. math/rand is not safe for
+		// concurrent use, so the pick must stay under the lock.
+		key := p.keys[p.rand.Intn(n)]
+		p.mu.Unlock()
 		return key, nil
 	}
-	index := p.rand.Intn(n)
-	key := p.keys[index]
+	p.mu.Unlock()
+
+	// Generate the key without holding the lock: RSA key generation is
+	// expensive and would otherwise serialize every concurrent cert mint.
+	key, err := cert.GeneratePrivateKey()
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	// Another goroutine may have filled the pool meanwhile; only append while
+	// there is still room so the pool stays bounded by its capacity.
+	if len(p.keys) < cap(p.keys) {
+		p.keys = append(p.keys, key)
+	}
+	p.mu.Unlock()
 	return key, nil
 }
 
