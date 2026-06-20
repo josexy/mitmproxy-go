@@ -32,41 +32,11 @@ var (
 	HttpResponseConnectionEstablished = []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
 )
 
-var (
-	// Hop-by-hop headers. These are removed when sent to the backend.
-	// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
-	hopByHopHeaders = []string{
-		HttpHeaderConnection,
-		HttpHeaderKeepAlive,
-		HttpHeaderProxyAuthenticate,
-		HttpHeaderProxyAuthorization,
-		HttpHeaderTe,
-		HttpHeaderTrailers,
-		HttpHeaderTransferEncoding,
-		HttpHeaderUpgrade,
-		HttpHeaderProxyConnection,
-	}
-)
-
 func removeProxyHeaders(header http.Header) {
 	header.Del(HttpHeaderProxyAuthenticate)
 	header.Del(HttpHeaderProxyAuthorization)
 	header.Del(HttpHeaderProxyConnection)
 	header.Del(HttpHeaderProxyAgent)
-}
-
-func removeHopByHopRequestHeaders(header http.Header) {
-	for _, h := range hopByHopHeaders {
-		header.Del(h)
-	}
-}
-
-func removeWebsocketRequestHeaders(header http.Header) {
-	header.Del(HttpHeaderUpgrade)
-	header.Del(HttpHeaderConnection)
-	header.Del(HttpHeaderSecWebsocketKey)
-	header.Del(HttpHeaderSecWebsocketVersion)
-	header.Del(HttpHeaderSecWebsocketExtensions)
 }
 
 func isWSUpgrade(h http.Header) bool {
