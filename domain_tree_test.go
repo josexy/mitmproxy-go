@@ -32,6 +32,7 @@ func TestDomainTreeMatch(t *testing.T) {
 		{"www.baidu.com", false},
 		{"www.api.baidu.db.com", false},
 		{"www.api.baidu.com", true},
+		{"WWW.EXAMPLE.COM.", true},
 	}
 
 	for _, tc := range testCases {

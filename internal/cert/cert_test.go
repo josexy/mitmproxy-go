@@ -109,6 +109,16 @@ func TestLoadCACertificateErrors(t *testing.T) {
 	if _, err := LoadCACertificate(certPath, keyPath); err == nil {
 		t.Fatalf("non-RSA PKCS8 key should fail")
 	}
+
+	otherCA, err := NewCaBuilder().Subject(pkix.Name{CommonName: "other ca"}).ValidateDays(1).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherKeyPem, _ := otherCA.Pem()
+	certPath, keyPath = writeCertFiles(t, certPem, otherKeyPem)
+	if _, err := LoadCACertificate(certPath, keyPath); err == nil {
+		t.Fatalf("mismatched CA certificate and key should fail")
+	}
 }
 
 func TestCertificateBuilderBuildFromCA(t *testing.T) {

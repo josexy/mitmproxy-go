@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,7 @@ type ReqContext struct {
 	Hostport          string
 	Request           *http.Request
 	HttpConnectMethod bool
+	Socks5Connect     bool
 }
 
 func AppendToRequestContext(ctx context.Context, reqCtx ReqContext) context.Context {
@@ -66,43 +68,62 @@ func FromRequestContext(ctx context.Context) (ReqContext, bool) {
 }
 
 func ParseHostPort(req *http.Request) (string, error) {
+	if req == nil {
+		return "", ErrInvalidProxyRequest
+	}
 	var target string
 	if req.Method != http.MethodConnect {
 		target = req.Host
 	} else {
 		target = req.RequestURI
 	}
+	target = strings.TrimSpace(target)
 	host, port, err := net.SplitHostPort(target)
-	if err != nil || port == "" {
-		host = target
-		if req.Method != http.MethodConnect {
-			port = "80"
+	if err != nil {
+		if req.Method == http.MethodConnect {
+			return "", fmt.Errorf("invalid CONNECT target %q: %w", target, err)
 		}
-		// ipv6
-		if len(host) > 0 && host[0] == '[' {
-			host = target[1 : len(host)-1]
+		if strings.HasPrefix(target, "[") && strings.HasSuffix(target, "]") {
+			host = target[1 : len(target)-1]
+		} else {
+			if strings.Contains(target, ":") {
+				return "", fmt.Errorf("invalid request host %q: %w", target, err)
+			}
+			host = target
 		}
+		port = "80"
 	}
-	if len(host) == 0 {
-		return "", err
+	if host == "" || port == "" {
+		return "", fmt.Errorf("invalid proxy target %q", target)
 	}
-	return net.JoinHostPort(host, port), nil
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", fmt.Errorf("invalid proxy target port %q", port)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(portNumber)), nil
 }
 
 var _ http.Hijacker = (*fakeHttpResponseWriter)(nil)
 var _ http.ResponseWriter = (*fakeHttpResponseWriter)(nil)
 
 type fakeHttpResponseWriter struct {
-	conn   net.Conn
-	bufRW  *bufio.ReadWriter
-	header http.Header
+	conn          net.Conn
+	bufRW         *bufio.ReadWriter
+	requestReader *boundedHTTPRequestReader
+	header        http.Header
 }
 
 func newFakeHttpResponseWriter(conn net.Conn) *fakeHttpResponseWriter {
+	requestReader := newBoundedHTTPRequestReader(conn)
 	return &fakeHttpResponseWriter{
-		conn:  conn,
-		bufRW: bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)),
+		conn:          conn,
+		bufRW:         bufio.NewReadWriter(requestReader.reader, bufio.NewWriter(conn)),
+		requestReader: requestReader,
 	}
+}
+
+func (f *fakeHttpResponseWriter) ReadRequest(maxHeaderBytes int) (*http.Request, error) {
+	return f.requestReader.ReadRequest(maxHeaderBytes)
 }
 
 // Hijack hijack the connection for websocket
@@ -282,6 +303,10 @@ func NewDynamicMitmProxyHandler(opt ...Option) (DynamicMitmProxyHandler, error) 
 	return newMitmProxyHandler(opt...)
 }
 
+func NewResourceLimitedDynamicMitmProxyHandler(opt ...Option) (ResourceLimitedDynamicMitmProxyHandler, error) {
+	return newMitmProxyHandler(opt...)
+}
+
 func newMitmProxyHandler(opt ...Option) (*mitmProxyHandler, error) {
 	opts := newOptions(opt...)
 	var err error
@@ -301,7 +326,7 @@ func newMitmProxyHandler(opt ...Option) (*mitmProxyHandler, error) {
 	handler := &mitmProxyHandler{
 		options:      opts,
 		runtimeState: runtimeState,
-		priKeyPool:   newPriKeyPool(opts.certCachePool.Capacity),
+		priKeyPool:   newPriKeyPool(),
 		activeConns:  make(map[*localClientConn]struct{}),
 		serverCertPool: newServerCertPool(opts.certCachePool.Capacity,
 			time.Duration(opts.certCachePool.IntervalSecond)*time.Second,
@@ -450,18 +475,26 @@ func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error
 			})
 		}
 	}()
-	if err = r.handleSocks5Handshake(ctx, conn); err != nil {
+	cfg := r.config.Load()
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, cfg.state.handshakeTimeout)
+	clearDeadline := setDeadlineFromContext(handshakeCtx, conn)
+	defer cancelHandshake()
+	defer clearDeadline()
+	if err = r.handleSocks5Handshake(handshakeCtx, conn); err != nil {
 		conn.Close()
 		return err
 	}
-	if hostport, err = r.handleSocks5Request(ctx, conn); err != nil {
+	if hostport, err = r.handleSocks5Request(handshakeCtx, conn); err != nil {
 		conn.Close()
 		return err
 	}
+	clearDeadline()
+	cancelHandshake()
 	retErr := r.Serve(AppendToRequestContext(ctx, ReqContext{
 		Hostport:          hostport,
 		Request:           nil,
 		HttpConnectMethod: false,
+		Socks5Connect:     true,
 	}), conn)
 	return retErr
 }
@@ -504,6 +537,9 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	)
 	dstConn, err := cfg.proxyDialer.DialTCPContextWithMetadata(ctx, reqCtx.Hostport, md)
 	if err != nil {
+		if reqCtx.Socks5Connect {
+			_ = writeSocks5Reply(conn, socks5ReplyForError(err), nil)
+		}
 		conn.Close()
 		logConfigAttrs(ctx, cfg, slog.LevelDebug, "upstream tcp dial failed",
 			slog.String("network", "tcp"),
@@ -519,6 +555,13 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		slog.Duration("duration", time.Since(dialStart)),
 	)
 	remoteConnEstTs := time.Now()
+	if reqCtx.Socks5Connect {
+		if err = writeSocks5Reply(conn, socks5ReplySucceeded, dstConn.LocalAddr()); err != nil {
+			conn.Close()
+			dstConn.Close()
+			return err
+		}
+	}
 
 	local := &localClientConn{
 		Conn:      conn,
@@ -572,7 +615,7 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		slog.String("reason", reason),
 	)
 	if passthrough {
-		return r.passthroughTunnel(ctx, conn, dstConn)
+		return r.passthroughTunnel(ctx, conn, dstConn, cfg.state.handshakeTimeout)
 	}
 
 	md.SetLocalConnectionAddrInfo(metadata.ConnectionAddrInfo{
@@ -604,7 +647,7 @@ func shouldPassthroughRequest(cfg *runtimeConfig, hostport string) (bool, string
 	return false, "intercept"
 }
 
-func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn, dstConn net.Conn) error {
+func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn, dstConn net.Conn, initialActivityTimeout time.Duration) error {
 	reqCtx, _ := FromRequestContext(ctx)
 	// only write the request for none-CONNECT request
 	if reqCtx.Request != nil {
@@ -613,8 +656,56 @@ func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn, dstCo
 		if err := reqCtx.Request.Write(dstConn); err != nil {
 			return err
 		}
+	} else {
+		srcConn, dstConn = connsWithInitialActivityDeadline(initialActivityTimeout, srcConn, dstConn)
 	}
 	return iocopy.IoCopyBidirectional(dstConn, srcConn)
+}
+
+type initialActivityDeadline struct {
+	once  sync.Once
+	conns []net.Conn
+}
+
+func connsWithInitialActivityDeadline(timeout time.Duration, first, second net.Conn) (net.Conn, net.Conn) {
+	if timeout <= 0 {
+		return first, second
+	}
+	conns := []net.Conn{first, second}
+	deadline := &initialActivityDeadline{conns: conns}
+	for _, conn := range conns {
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+	}
+	return &activityTrackingConn{Conn: conns[0], deadline: deadline}, &activityTrackingConn{Conn: conns[1], deadline: deadline}
+}
+
+func (d *initialActivityDeadline) clear() {
+	d.once.Do(func() {
+		for _, conn := range d.conns {
+			_ = conn.SetDeadline(time.Time{})
+		}
+	})
+}
+
+type activityTrackingConn struct {
+	net.Conn
+	deadline *initialActivityDeadline
+}
+
+func (c *activityTrackingConn) Read(data []byte) (int, error) {
+	n, err := c.Conn.Read(data)
+	if n > 0 {
+		c.deadline.clear()
+	}
+	return n, err
+}
+
+func (c *activityTrackingConn) Write(data []byte) (int, error) {
+	n, err := c.Conn.Write(data)
+	if n > 0 {
+		c.deadline.clear()
+	}
+	return n, err
 }
 
 func (r *mitmProxyHandler) handleError(ec ErrorContext) {
@@ -762,7 +853,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		tlsConfig.InsecureSkipVerify = true
 	}
 	if len(cfg.clientCertPool) > 0 {
-		if clientCert, ok := cfg.clientCertPool[host]; ok {
+		if clientCert, ok := cfg.clientCertPool[normalizeDomain(serverName)]; ok {
 			// mTLS client-authentication
 			tlsConfig.Certificates = []utls.Certificate{clientCert}
 			logConfigAttrs(ctx, cfg, slog.LevelDebug, "client certificate selected",
@@ -781,7 +872,7 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	}
 	// send client hello and do tls handshake
 	md.SetSSLHandshakeStartTs(time.Now())
-	clearHandshakeDeadline := setDeadlineForTimeout(conn, cfg.state.idleConnTimeout)
+	clearHandshakeDeadline := setDeadlineForTimeout(conn, cfg.state.handshakeTimeout)
 	err = tlsClientConn.HandshakeContext(ctx)
 	clearHandshakeDeadline()
 	if err != nil {
@@ -832,10 +923,11 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		RawContent:         foundCert.Raw,
 	})
 
+	certCacheKey := certificateCacheKey(serverName, host)
 	// Get server certificate from local cache pool
-	if serverCert, err := r.serverCertPool.Get(host); err == nil {
+	if serverCert, err := r.serverCertPool.Get(certCacheKey); err == nil {
 		logConfigAttrs(ctx, cfg, slog.LevelDebug, "server certificate cache hit",
-			slog.String("host", host),
+			slog.String("host", certCacheKey),
 		)
 		return tlsClientConn, &tls.Config{
 			SessionTicketsDisabled: true,
@@ -862,9 +954,9 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	}
 
 	certificate := serverCert.Certificate()
-	r.serverCertPool.Set(host, certificate)
+	r.serverCertPool.Set(certCacheKey, certificate)
 	logConfigAttrs(ctx, cfg, slog.LevelDebug, "server certificate generated",
-		slog.String("host", host),
+		slog.String("host", certCacheKey),
 	)
 	return tlsClientConn, &tls.Config{
 		SessionTicketsDisabled: true,
@@ -872,6 +964,13 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		NextProtos:   []string{cs.NegotiatedProtocol},
 		Certificates: []tls.Certificate{certificate},
 	}, nil
+}
+
+func certificateCacheKey(serverName, host string) string {
+	if serverName = normalizeDomain(serverName); serverName != "" {
+		return serverName
+	}
+	return normalizeDomain(host)
 }
 
 func (r *mitmProxyHandler) setTLSRemoteDialer(connCtx *biConnContext, hostport string, firstConn net.Conn, hello capturedClientHello) {
@@ -943,7 +1042,9 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 
 	if !consumedRequest {
 		bufConn := newBufConn(srcConn)
+		clearDeadline := setReadDeadlineForTimeout(srcConn, connCtx.config.state.handshakeTimeout)
 		data, err = bufConn.Peek(3)
+		clearDeadline()
 		if err != nil {
 			return fmt.Errorf("short buffer to peek: %s", err)
 		}
@@ -980,12 +1081,14 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				}
 			},
 		})
+		handshakeCtx, cancelHandshake := context.WithTimeout(ctx, connCtx.config.state.handshakeTimeout)
+		clearDeadline := setDeadlineFromContext(handshakeCtx, srcConn)
 		go func(c net.Conn) {
 			chi, ok := <-clientHelloInfoCh
 			if !ok {
 				return
 			}
-			conn, tlsConfig, err := r.initiateSSLHandshakeWithClientHello(ctx, chi, c)
+			conn, tlsConfig, err := r.initiateSSLHandshakeWithClientHello(handshakeCtx, chi, c)
 			if err != nil {
 				errCh <- err
 			} else {
@@ -1001,13 +1104,10 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				}
 			}
 		}(dstConn)
-		// read client hello and do tls handshake. Bound it so a slow client,
-		// or a stalled upstream handshake that GetConfigForClient() blocks on,
-		// cannot pin this goroutine and the connection forever.
-		clearHandshakeDeadline := setDeadlineForTimeout(srcConn, connCtx.config.state.idleConnTimeout)
-		err = tlsConn.HandshakeContext(ctx)
-		clearHandshakeDeadline()
-		if err != nil {
+		// Bound both sides of the coordinated downstream/upstream handshake.
+		if err = tlsConn.HandshakeContext(handshakeCtx); err != nil {
+			cancelHandshake()
+			clearDeadline()
 			// if tls handshake failed before GetConfigForClient(),
 			// we should close the channel in order to quit the goroutine
 			close(clientHelloInfoCh)
@@ -1023,6 +1123,8 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		}
 		// wait for tls handshake
 		result := <-tlsConnCh
+		cancelHandshake()
+		clearDeadline()
 		dstConn = result.conn
 		connCtx.remote.innerConn = dstConn
 		connCtx.transport.setNegotiatedProtocol(result.negotiatedProtocol)
@@ -1058,9 +1160,10 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	}
 
 	request := reqCtx.Request
+	firstRead := request == nil
 	for {
 		reqCtx, _ := FromRequestContext(ctx)
-		nextCtx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest)
+		nextCtx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest, firstRead)
 		if err != nil || earlyDone {
 			if request == nil && isExpectedIdleReadClose(err) {
 				return nil
@@ -1068,6 +1171,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 			return err
 		}
 		request = nil
+		firstRead = false
 
 		nextReqCtx, _ := FromRequestContext(nextCtx)
 		if !requestMatchesHostport(nextReqCtx.Request, reqCtx.Hostport) {
@@ -1079,7 +1183,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		}
 
 		if isWsUpgrade {
-			return r.relayConnForWS(nextCtx, srcConn, dstConn)
+			return r.relayConnForWS(nextCtx, newBufConnExt(srcConn, fakerw.bufRW), dstConn)
 		}
 		response, err := r.relayConnForHTTP(nextCtx, srcConn)
 		if err != nil {
@@ -1114,7 +1218,13 @@ func requestMatchesHostport(req *http.Request, hostport string) bool {
 	if !strings.EqualFold(requestHost, host) {
 		return false
 	}
-	return port == "" || requestPort == "" || requestPort == port
+	if requestPort == "" {
+		requestPort = "80"
+		if req.TLS != nil || (req.URL != nil && (strings.EqualFold(req.URL.Scheme, "https") || strings.EqualFold(req.URL.Scheme, "wss"))) {
+			requestPort = "443"
+		}
+	}
+	return port == requestPort
 }
 
 func splitHostOptionalPort(hostport string) (string, string) {
@@ -1263,23 +1373,24 @@ func writeH2CUpgradeRequestHeaders(dst io.Writer, req *http.Request) error {
 	return bw.Flush()
 }
 
-func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *fakeHttpResponseWriter, request *http.Request, tlsRequest bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
+func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *fakeHttpResponseWriter, request *http.Request, tlsRequest, firstRead bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
+	clearDeadline := func() {}
 
 	// Read the http request for https/wss via tls tunnel
 
 	// Need to read the request
 	if request == nil {
-		_, rw, err := fakerw.Hijack()
-		if err != nil {
-			retErr = err
-			return
+		readTimeout := connCtx.config.state.idleConnTimeout
+		if firstRead {
+			readTimeout = connCtx.config.state.handshakeTimeout
 		}
-		clearDeadline := setReadDeadlineForTimeout(fakerw.conn, connCtx.config.state.idleConnTimeout)
-		request, err = http.ReadRequest(rw.Reader)
-		clearDeadline()
+		clearDeadline = setReadDeadlineForTimeout(fakerw.conn, readTimeout)
+		var err error
+		request, err = fakerw.ReadRequest(connCtx.config.state.maxHTTPHeaderBytes)
 		if err != nil {
+			clearDeadline()
 			retErr = err
 			return
 		}
@@ -1288,9 +1399,11 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 	if !connCtx.config.state.disableHTTP2 {
 		earlyDone, retErr = r.handlePrefaceOrH2CRequest(ctx, fakerw, request)
 		if retErr != nil || earlyDone {
+			clearDeadline()
 			return
 		}
 	}
+	clearDeadline()
 
 	if tlsRequest {
 		request.URL.Scheme = "https"
@@ -1314,7 +1427,11 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 		slog.Bool("websocket_upgrade", upgrade),
 	)
 
-	removeProxyHeaders(request.Header)
+	if upgrade {
+		sanitizeWebsocketUpgradeHeaders(request.Header)
+	} else {
+		removeHopByHopRequestHeaders(request.Header)
+	}
 	// patch the new request to the request context
 	reqCtx.Request = request
 	newCtx = AppendToRequestContext(ctx, reqCtx)
@@ -1327,8 +1444,12 @@ type wsFrameImpl struct {
 	msgType int
 	dataBuf *buf.Buffer
 
-	released atomic.Bool
-	dst      *websocket.Conn
+	state atomic.Uint32
+	dst   *websocket.Conn
+	// Invoked exactly once when the frame is forwarded or discarded so its
+	// payload no longer counts against the interceptor's buffered-byte budget.
+	onRelease     func(int64)
+	reservedBytes int64
 }
 
 func (f *wsFrameImpl) Direction() WSDirection { return f.dir }
@@ -1338,37 +1459,101 @@ func (f *wsFrameImpl) MessageType() int { return f.msgType }
 func (f *wsFrameImpl) DataBuffer() *buf.Buffer { return f.dataBuf }
 
 func (f *wsFrameImpl) Invoke() error {
+	if !f.state.CompareAndSwap(0, 1) {
+		return ErrWebsocketFrameReleased
+	}
 	err := f.dst.WriteMessage(f.msgType, f.dataBuf.Bytes())
-	f.Release()
+	f.releaseResources()
+	f.state.Store(2)
 	return err
 }
 
 func (f *wsFrameImpl) Release() {
-	if f.released.CompareAndSwap(false, true) {
-		releaseBuffer(f.dataBuf)
+	if f.state.CompareAndSwap(0, 2) {
+		f.releaseResources()
+	}
+}
+
+func (f *wsFrameImpl) releaseResources() {
+	releaseBuffer(f.dataBuf)
+	if f.onRelease != nil {
+		f.onRelease(f.reservedBytes)
 	}
 }
 
 type wsFramesWatcherImpl struct {
 	framesCh  chan WsFrame
 	closeOnce sync.Once
+	// bufferedBytes includes frames queued in framesCh and frames currently
+	// held by the interceptor. The budget is shared by both traffic directions.
+	bufferedBytes  atomic.Int64
+	maxBuffered    int64
+	budgetReleased chan struct{}
 }
 
 func (w *wsFramesWatcherImpl) Receive() <-chan WsFrame { return w.framesCh }
 
-func (w *wsFramesWatcherImpl) send(ctx context.Context, frame WsFrame) bool {
+func (w *wsFramesWatcherImpl) send(ctx context.Context, frame *wsFrameImpl) bool {
+	size := int64(frame.dataBuf.Len())
+	// Reserve bytes before publishing the frame so every frame visible to the
+	// interceptor is already included in the aggregate memory budget.
+	if !w.reserve(ctx, size) {
+		return false
+	}
+	frame.onRelease = w.release
+	frame.reservedBytes = size
 	select {
 	case <-ctx.Done():
+		frame.Release()
 		return false
 	case w.framesCh <- frame:
 		return true
 	}
 }
 
+func (w *wsFramesWatcherImpl) reserve(ctx context.Context, size int64) bool {
+	if size > w.maxBuffered {
+		return false
+	}
+	for {
+		current := w.bufferedBytes.Load()
+		if current <= w.maxBuffered-size && w.bufferedBytes.CompareAndSwap(current, current+size) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-w.budgetReleased:
+			// Waiting here applies backpressure to the corresponding WebSocket
+			// reader until the interceptor invokes or releases another frame.
+		}
+	}
+}
+
+func (w *wsFramesWatcherImpl) release(size int64) {
+	w.bufferedBytes.Add(-size)
+	select {
+	case w.budgetReleased <- struct{}{}:
+	default:
+	}
+}
+
 func (w *wsFramesWatcherImpl) close() {
 	w.closeOnce.Do(func() {
 		close(w.framesCh)
+		// Return buffers and byte reservations for frames that the interceptor
+		// did not consume before the connection shut down.
+		for frame := range w.framesCh {
+			frame.Release()
+		}
 	})
+}
+
+func startWebsocketInterceptor(ctx context.Context, cancel context.CancelCauseFunc, interceptor WebsocketInterceptor, request *http.Request, response *http.Response, watcher WebsocketFramesWatcher) {
+	go func() {
+		interceptor(ctx, request, response, watcher)
+		cancel(io.EOF)
+	}()
 }
 
 func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn net.Conn) (err error) {
@@ -1377,24 +1562,37 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	reqCtx, _ := FromRequestContext(ctx)
 	reqClone := reqCtx.Request.Clone(reqCtx.Request.Context())
 	if reqClone.Body != nil {
-		data, err := io.ReadAll(reqClone.Body)
+		limit := int64(cfg.state.maxHTTPHeaderBytes)
+		if reqClone.ContentLength > limit {
+			return fmt.Errorf("websocket upgrade body exceeds %d bytes", limit)
+		}
+		data, err := io.ReadAll(io.LimitReader(reqClone.Body, limit+1))
 		if err != nil {
 			return err
+		}
+		if int64(len(data)) > limit {
+			return fmt.Errorf("websocket upgrade body exceeds %d bytes", limit)
 		}
 		reqClone.Body.Close()
 		reqClone.Body = io.NopCloser(bytes.NewReader(data))
 		reqCtx.Request.Body = io.NopCloser(bytes.NewReader(data))
 	}
 
-	wsDstConn, resp, err := websocket.DialWithPreparedRequestAndNetConn(reqClone, dstConn)
+	boundedDstConn := newBoundedHTTPHeaderConn(dstConn, cfg.state.maxHTTPHeaderBytes)
+	wsDstConn, resp, err := websocket.DialWithPreparedRequestAndNetConn(reqClone, boundedDstConn)
 	if err != nil {
 		return err
 	}
+	sanitizeWebsocketUpgradeHeaders(resp.Header)
 	wsSrcConn, err := websocket.UpgradeWithPreparedResponseAndNetConn(resp, srcConn)
 	if err != nil {
 		wsDstConn.Close()
 		return err
 	}
+	// Enforce the per-message limit on complete logical messages from both
+	// peers; fragmented WebSocket messages still count as one combined message.
+	wsSrcConn.SetReadLimit(cfg.state.wsMaxMessageBytes)
+	wsDstConn.SetReadLimit(cfg.state.wsMaxMessageBytes)
 	logConfigAttrs(ctx, cfg, slog.LevelDebug, "websocket upgraded",
 		slog.String("hostport", reqCtx.Hostport),
 		slog.String("method", requestMethod(reqCtx.Request)),
@@ -1412,10 +1610,15 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 
 	var fw *wsFramesWatcherImpl
 	if cfg.state.wsInt != nil {
+		// framesCh bounds the number of pending interceptor items, while
+		// maxBuffered independently bounds their combined payload bytes across
+		// both relay directions.
 		fw = &wsFramesWatcherImpl{
-			framesCh: make(chan WsFrame, cfg.state.wsMaxFramesPerForward*2),
+			framesCh:       make(chan WsFrame, cfg.state.wsMaxFramesPerForward*2),
+			maxBuffered:    cfg.state.wsMaxBufferedBytes,
+			budgetReleased: make(chan struct{}, 1),
 		}
-		go cfg.state.wsInt(ctx, reqCtx.Request, resp, fw)
+		startWebsocketInterceptor(ctx, cancel, cfg.state.wsInt, reqCtx.Request, resp, fw)
 	}
 
 	errCh := make(chan error, 2)
@@ -1432,7 +1635,9 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 				return
 			default:
 			}
-			msgType, buffer, err := readBufferFromWSConn(src)
+			// The interceptor API exposes a complete message buffer, so reject an
+			// oversized message while reading it rather than after it is queued.
+			msgType, buffer, err := readBufferFromWSConn(src, cfg.state.wsMaxMessageBytes)
 			if err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
 					logConfigAttrs(ctx, cfg, slog.LevelDebug, "websocket relay read closed",
@@ -1457,7 +1662,8 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 				slog.Int("bytes", buffer.Len()),
 			)
 			if fw != nil {
-				// MUST release buffer manually
+				// Ownership of buffer transfers to the frame. Invoke or Release returns
+				// both the pooled buffer and its buffered-byte reservation.
 				frame := &wsFrameImpl{
 					dir:     dir,
 					msgType: msgType,
@@ -1524,6 +1730,7 @@ func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn net.Con
 		return nil, err
 	}
 	defer response.Body.Close()
+	removeHopByHopHeaders(response.Header)
 	if err = response.Write(srcConn); err != nil {
 		return nil, err
 	}
@@ -1555,7 +1762,7 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 		response, err = connCtx.transport.RoundTrip(req)
 	}
 	if err != nil {
-		err = fmt.Errorf("transport RoundTrip %s failed: %s", reqCtx.Hostport, err)
+		err = fmt.Errorf("transport RoundTrip %s failed: %w", reqCtx.Hostport, err)
 		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http request failed",
 			slog.String("hostport", reqCtx.Hostport),
 			slog.String("method", requestMethod(req)),
@@ -1564,6 +1771,13 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 			errorAttr(err),
 		)
 		return
+	}
+	if response == nil {
+		err = errors.New("HTTP interceptor returned a nil response without an error")
+		return nil, err
+	}
+	if response.Body == nil {
+		response.Body = http.NoBody
 	}
 	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http response",
 		slog.String("hostport", reqCtx.Hostport),
@@ -1587,6 +1801,16 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 		streamCtx := cloneMetadataContext(ctx)
 		md, _ := metadata.FromContext(streamCtx)
 		md.SetRequestReceivedTs(time.Now())
+		if !requestMatchesHostport(req, reqCtx.Hostport) {
+			err := fmt.Errorf("http2 authority %q does not match connection target %q", req.Host, reqCtx.Hostport)
+			handleErrorWithConfig(connCtx.config, ErrorContext{
+				Hostport:   reqCtx.Hostport,
+				RemoteAddr: req.RemoteAddr,
+				Error:      err,
+			})
+			http.Error(rw, http.StatusText(http.StatusMisdirectedRequest), http.StatusMisdirectedRequest)
+			return
+		}
 
 		if req.URL.Scheme == "" {
 			if req.TLS != nil {
@@ -1598,6 +1822,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 		if req.URL.Host == "" {
 			req.URL.Host = req.Host
 		}
+		removeHopByHopRequestHeaders(req.Header)
 		// the request body size may be zero
 		if req.ContentLength == 0 {
 			if req.Body != nil {
@@ -1613,8 +1838,19 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 				RemoteAddr: req.RemoteAddr,
 				Error:      err,
 			})
+			status := http.StatusBadGateway
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+			} else {
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					status = http.StatusGatewayTimeout
+				}
+			}
+			http.Error(rw, http.StatusText(status), status)
 			return
 		}
+		removeHopByHopHeaders(response.Header)
 		for k, vv := range response.Header {
 			for _, v := range vv {
 				rw.Header().Add(k, v)
@@ -1625,7 +1861,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 		if body != nil {
 			defer body.Close()
 			// CAN NOT use response.Write(rw) because it is used for HTTP1
-			if err = r.forwardStreamBody(rw, body); err != nil {
+			if err = r.forwardStreamBody(rw, body, shouldFlushHTTP2Response(response)); err != nil {
 				handleErrorWithConfig(connCtx.config, ErrorContext{
 					Hostport:   reqCtx.Hostport,
 					RemoteAddr: req.RemoteAddr,
@@ -1644,7 +1880,15 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 	})
 }
 
-func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Reader) error {
+func shouldFlushHTTP2Response(response *http.Response) bool {
+	if response == nil {
+		return false
+	}
+	contentType := strings.ToLower(response.Header.Get(HttpHeaderContentType))
+	return response.ContentLength < 0 || strings.HasPrefix(contentType, "text/event-stream")
+}
+
+func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Reader, flushEachWrite bool) error {
 	flusher, ok := rw.(http.Flusher)
 	if !ok {
 		// This should never happen for http2
@@ -1658,8 +1902,9 @@ func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Rea
 			if _, writeErr := rw.Write(buffer[:n]); writeErr != nil {
 				return fmt.Errorf("write to http.ResponseWriter failed: %s", writeErr)
 			}
-			// Flush the response to keep the client happy
-			flusher.Flush()
+			if flushEachWrite {
+				flusher.Flush()
+			}
 		}
 		if err == io.EOF {
 			break

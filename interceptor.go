@@ -2,9 +2,15 @@ package mitmproxy
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/josexy/mitmproxy-go/buf"
+)
+
+var (
+	ErrWebsocketFrameReleased   = errors.New("websocket frame was already invoked or released")
+	ErrWebsocketMessageTooLarge = errors.New("websocket message exceeds configured limit")
 )
 
 // WSDirection indicates the direction of a WebSocket message

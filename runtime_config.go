@@ -14,7 +14,13 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-var ErrInvalidWebsocketFrameBufferSize = errors.New("websocket frame buffer size must be greater than 0")
+var (
+	ErrInvalidWebsocketFrameBufferSize = errors.New("websocket frame buffer size must be greater than 0")
+	ErrInvalidWebsocketMessageSize     = errors.New("websocket message size must be greater than 0")
+	ErrInvalidWebsocketBufferedBytes   = errors.New("websocket buffered bytes must be at least the maximum message size")
+	ErrInvalidHTTPHeaderSize           = errors.New("HTTP header size must be greater than 0")
+	ErrInvalidHandshakeTimeout         = errors.New("handshake timeout must be greater than 0")
+)
 
 type RuntimeConfigManager interface {
 	SetProxy(proxy string) error
@@ -37,9 +43,21 @@ type RuntimeConfigManager interface {
 	SetMaxWebsocketFramesPerForward(maxFrames int) error
 }
 
+type RuntimeResourceLimitManager interface {
+	SetHandshakeTimeout(timeout time.Duration) error
+	SetMaxHTTPHeaderBytes(maxBytes int) error
+	SetMaxWebsocketMessageBytes(maxBytes int64) error
+	SetMaxWebsocketBufferedBytes(maxBytes int64) error
+}
+
 type DynamicMitmProxyHandler interface {
 	MitmProxyHandler
 	RuntimeConfigManager
+}
+
+type ResourceLimitedDynamicMitmProxyHandler interface {
+	DynamicMitmProxyHandler
+	RuntimeResourceLimitManager
 }
 
 type runtimeConfigState struct {
@@ -56,7 +74,11 @@ type runtimeConfigState struct {
 	logger        *slog.Logger
 
 	idleConnTimeout       time.Duration
+	handshakeTimeout      time.Duration
+	maxHTTPHeaderBytes    int
 	wsMaxFramesPerForward int
+	wsMaxMessageBytes     int64
+	wsMaxBufferedBytes    int64
 
 	clientCerts map[string]ClientCert
 
@@ -92,7 +114,11 @@ func newRuntimeConfigStateFromOptions(opts *options) runtimeConfigState {
 		dialer:                opts.dialer,
 		logger:                opts.logger,
 		idleConnTimeout:       opts.idleConnTimeout,
+		handshakeTimeout:      opts.handshakeTimeout,
+		maxHTTPHeaderBytes:    opts.maxHTTPHeaderBytes,
 		wsMaxFramesPerForward: opts.wsMaxFramesPerForward,
+		wsMaxMessageBytes:     opts.wsMaxMessageBytes,
+		wsMaxBufferedBytes:    opts.wsMaxBufferedBytes,
 		clientCerts:           cloneClientCerts(opts.clientCerts),
 		errHandler:            opts.errHandler,
 		httpInt:               opts.httpInt,
@@ -122,6 +148,18 @@ func buildRuntimeConfig(state runtimeConfigState) (*runtimeConfig, error) {
 	if state.wsMaxFramesPerForward <= 0 {
 		return nil, ErrInvalidWebsocketFrameBufferSize
 	}
+	if state.wsMaxMessageBytes <= 0 {
+		return nil, ErrInvalidWebsocketMessageSize
+	}
+	if state.wsMaxBufferedBytes < state.wsMaxMessageBytes {
+		return nil, ErrInvalidWebsocketBufferedBytes
+	}
+	if state.maxHTTPHeaderBytes <= 0 {
+		return nil, ErrInvalidHTTPHeaderSize
+	}
+	if state.handshakeTimeout <= 0 {
+		return nil, ErrInvalidHandshakeTimeout
+	}
 
 	proxyURL, err := parseProxyFrom(state.disableProxy, state.proxy)
 	if err != nil {
@@ -146,7 +184,7 @@ func buildRuntimeConfig(state runtimeConfigState) (*runtimeConfig, error) {
 
 	cfg := &runtimeConfig{
 		state:          state,
-		proxyDialer:    NewProxyDialer(proxyURL, state.dialer),
+		proxyDialer:    newConfiguredProxyDialer(proxyURL, state.dialer, !state.disableProxy && state.proxy == ""),
 		rootCACertPool: rootPool,
 		clientCertPool: clientCertPool,
 		httpInt:        buildHTTPInterceptorChain(state.httpInt, state.chainHttpInts),
@@ -198,7 +236,7 @@ func loadClientCertPool(clientCerts map[string]ClientCert) (map[string]utls.Cert
 		if err != nil {
 			return nil, fmt.Errorf("failed to load client cert: %s:%s %w", cc.CertPath, cc.KeyPath, err)
 		}
-		pool[hostname] = tlsCert
+		pool[normalizeDomain(hostname)] = tlsCert
 	}
 	return pool, nil
 }

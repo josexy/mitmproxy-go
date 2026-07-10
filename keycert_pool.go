@@ -4,7 +4,6 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"errors"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -15,53 +14,26 @@ import (
 var errNoPriKey = errors.New("no available private key")
 
 type priKeyPool struct {
-	mu   sync.Mutex
-	rand *rand.Rand
-	keys []*rsa.PrivateKey
+	once sync.Once
+	key  *rsa.PrivateKey
+	err  error
 }
 
-func newPriKeyPool(maxSize int) *priKeyPool {
-	if maxSize <= 0 {
-		maxSize = 10
-	}
-	pool := &priKeyPool{
-		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
-		keys: make([]*rsa.PrivateKey, 0, maxSize),
-	}
-	return pool
+func newPriKeyPool() *priKeyPool {
+	return &priKeyPool{}
 }
 
 func (p *priKeyPool) Get() (*rsa.PrivateKey, error) {
-	p.mu.Lock()
-	n, m := len(p.keys), cap(p.keys)
-	if m == 0 {
-		p.mu.Unlock()
+	p.once.Do(func() {
+		p.key, p.err = cert.GeneratePrivateKey()
+	})
+	if p.err != nil {
+		return nil, p.err
+	}
+	if p.key == nil {
 		return nil, errNoPriKey
 	}
-	if n >= m {
-		// pool is full: reuse an existing key. math/rand is not safe for
-		// concurrent use, so the pick must stay under the lock.
-		key := p.keys[p.rand.Intn(n)]
-		p.mu.Unlock()
-		return key, nil
-	}
-	p.mu.Unlock()
-
-	// Generate the key without holding the lock: RSA key generation is
-	// expensive and would otherwise serialize every concurrent cert mint.
-	key, err := cert.GeneratePrivateKey()
-	if err != nil {
-		return nil, err
-	}
-
-	p.mu.Lock()
-	// Another goroutine may have filled the pool meanwhile; only append while
-	// there is still room so the pool stays bounded by its capacity.
-	if len(p.keys) < cap(p.keys) {
-		p.keys = append(p.keys, key)
-	}
-	p.mu.Unlock()
-	return key, nil
+	return p.key, nil
 }
 
 type certPool struct {

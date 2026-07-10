@@ -79,7 +79,13 @@ func requestURL(req *http.Request) string {
 	if req == nil || req.URL == nil {
 		return ""
 	}
-	return req.URL.String()
+	u := *req.URL
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
 }
 
 func requestProto(req *http.Request) string {

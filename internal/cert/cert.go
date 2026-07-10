@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/url"
@@ -51,28 +52,47 @@ func LoadCACertificate(certPath, keyPath string) (cert *Cert, err error) {
 	if err != nil {
 		return nil, err
 	}
-	caPriKey, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
-	if err == nil {
-		return &Cert{
-			cert:       caCert,
-			privateKey: caPriKey,
-			certBytes:  certBlock.Bytes,
-		}, nil
-	}
-	priKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
-	if err == nil {
+	caPriKey, parseErr := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+	if parseErr != nil {
+		priKey, pkcs8Err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+		if pkcs8Err != nil {
+			return nil, parseErr
+		}
 		var ok bool
-		if caPriKey, ok = priKey.(*rsa.PrivateKey); !ok {
-			err = errors.New("private key is not of RSA type")
-		} else {
-			return &Cert{
-				cert:       caCert,
-				privateKey: caPriKey,
-				certBytes:  certBlock.Bytes,
-			}, nil
+		caPriKey, ok = priKey.(*rsa.PrivateKey)
+		if !ok {
+			return nil, errors.New("private key is not of RSA type")
 		}
 	}
-	return
+	if err := validateCACertificateAndKey(caCert, caPriKey); err != nil {
+		return nil, err
+	}
+	return &Cert{
+		cert:       caCert,
+		privateKey: caPriKey,
+		certBytes:  certBlock.Bytes,
+	}, nil
+}
+
+func validateCACertificateAndKey(caCert *x509.Certificate, caKey *rsa.PrivateKey) error {
+	if !caCert.IsCA || !caCert.BasicConstraintsValid {
+		return errors.New("certificate is not a valid CA")
+	}
+	if caCert.KeyUsage != 0 && caCert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("certificate does not permit certificate signing")
+	}
+	if err := caKey.Validate(); err != nil {
+		return fmt.Errorf("invalid CA private key: %w", err)
+	}
+	publicKey, ok := caCert.PublicKey.(*rsa.PublicKey)
+	if !ok || !publicKey.Equal(&caKey.PublicKey) {
+		return errors.New("CA certificate and private key do not match")
+	}
+	now := time.Now()
+	if now.Before(caCert.NotBefore) || now.After(caCert.NotAfter) {
+		return errors.New("CA certificate is not currently valid")
+	}
+	return nil
 }
 
 type Cert struct {
@@ -129,8 +149,9 @@ func (b *CaBuilder) Subject(subject pkix.Name) *CaBuilder {
 }
 
 func (b *CaBuilder) ValidateDays(days int) *CaBuilder {
-	b.params.NotBefore = time.Now()
-	b.params.NotAfter = b.params.NotBefore.AddDate(0, 0, days)
+	now := time.Now()
+	b.params.NotBefore = now.Add(-5 * time.Minute)
+	b.params.NotAfter = now.AddDate(0, 0, days)
 	return b
 }
 
@@ -212,8 +233,9 @@ func (b *CertificateBuilder) ClientAuth() *CertificateBuilder {
 }
 
 func (b *CertificateBuilder) ValidateDays(days int) *CertificateBuilder {
-	b.params.NotBefore = time.Now()
-	b.params.NotAfter = b.params.NotBefore.AddDate(0, 0, days)
+	now := time.Now()
+	b.params.NotBefore = now.Add(-5 * time.Minute)
+	b.params.NotAfter = now.AddDate(0, 0, days)
 	return b
 }
 
@@ -247,6 +269,15 @@ func (b *CertificateBuilder) BuildFromCACertAndKey(caCert *x509.Certificate, caP
 	if caPriKey != nil && caCert != nil {
 		parentCert = caCert
 		caPrivateKey = caPriKey
+		if b.params.NotBefore.Before(caCert.NotBefore) {
+			b.params.NotBefore = caCert.NotBefore
+		}
+		if b.params.NotAfter.After(caCert.NotAfter) {
+			b.params.NotAfter = caCert.NotAfter
+		}
+		if !b.params.NotAfter.After(b.params.NotBefore) {
+			return nil, errors.New("certificate validity does not overlap CA validity")
+		}
 	}
 	certBytes, err := x509.CreateCertificate(rand.Reader, b.params, parentCert, &b.priKey.PublicKey, caPrivateKey)
 	if err != nil {

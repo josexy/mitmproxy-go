@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -88,6 +89,59 @@ func TestHTTPProxyDialerDial(t *testing.T) {
 		}
 	})
 
+	t.Run("CONNECT response honors context cancellation", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go func() {
+			_, _ = http.ReadRequest(bufio.NewReader(server))
+			_, _ = io.Copy(io.Discard, server)
+		}()
+		proxyURL, _ := url.Parse("http://proxy.example")
+		dialer := &httpProxyDialer{
+			proxyURL: proxyURL,
+			forwardDial: func(string, string) (net.Conn, error) {
+				return client, nil
+			},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		if _, err := dialer.DialContext(ctx, "tcp", "target.example:443"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("DialContext err = %v; want context deadline exceeded", err)
+		}
+	})
+
+	t.Run("HTTPS proxy", func(t *testing.T) {
+		requestCh := make(chan *http.Request, 1)
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			requestCh <- req
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+		proxyURL, _ := url.Parse(server.URL)
+		tlsConfig := server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+		dialer := &httpProxyDialer{
+			proxyURL:  proxyURL,
+			tlsConfig: tlsConfig,
+			forwardDial: func(network, addr string) (net.Conn, error) {
+				return net.Dial(network, server.Listener.Addr().String())
+			},
+		}
+		conn, err := dialer.Dial("tcp", "target.invalid:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		select {
+		case req := <-requestCh:
+			if req.Method != http.MethodConnect || req.Host != "target.invalid:443" {
+				t.Fatalf("request = %s %s", req.Method, req.Host)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("HTTPS proxy did not receive CONNECT")
+		}
+	})
+
 	t.Run("forward dial error", func(t *testing.T) {
 		wantErr := errors.New("dial failed")
 		proxyURL, _ := url.Parse("http://proxy.example")
@@ -120,6 +174,56 @@ func TestHTTPProxyDialerDial(t *testing.T) {
 		err := dialHTTPProxyResponse(t, "not-http\r\n\r\n")
 		if err == nil {
 			t.Fatalf("expected response parse error")
+		}
+	})
+
+	t.Run("bounded CONNECT response headers", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go func() {
+			_, _ = http.ReadRequest(bufio.NewReader(server))
+			_, _ = server.Write([]byte("HTTP/1.1 200 OK\r\nX-Large: " + strings.Repeat("a", 128)))
+		}()
+		proxyURL, _ := url.Parse("http://proxy.example")
+		dialer := &httpProxyDialer{
+			proxyURL:       proxyURL,
+			maxHeaderBytes: 64,
+			forwardDial: func(string, string) (net.Conn, error) {
+				return client, nil
+			},
+		}
+		if _, err := dialer.Dial("tcp", "target.example:443"); !errors.Is(err, ErrHTTPHeaderTooLarge) {
+			t.Fatalf("Dial err = %v; want ErrHTTPHeaderTooLarge", err)
+		}
+	})
+
+	t.Run("preserves bytes after CONNECT response", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go func() {
+			_, _ = http.ReadRequest(bufio.NewReader(server))
+			_, _ = server.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\nhello"))
+		}()
+		proxyURL, _ := url.Parse("http://proxy.example")
+		dialer := &httpProxyDialer{
+			proxyURL: proxyURL,
+			forwardDial: func(string, string) (net.Conn, error) {
+				return client, nil
+			},
+		}
+		conn, err := dialer.Dial("tcp", "target.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		data := make([]byte, 5)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "hello" {
+			t.Fatalf("buffered data = %q; want hello", data)
 		}
 	})
 }
@@ -183,6 +287,83 @@ func TestProxyDialerDirectDialAndRemoteAddr(t *testing.T) {
 	<-done
 }
 
+func TestProxyDialerTimeoutIncludesProxyHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan struct{})
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		close(accepted)
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	proxyURL := &url.URL{Scheme: "http", Host: listener.Addr().String()}
+	dialer := NewProxyDialer(proxyURL, &net.Dialer{Timeout: 30 * time.Millisecond})
+	start := time.Now()
+	if _, err := dialer.DialContext(context.Background(), "tcp", "localhost:443"); err == nil {
+		t.Fatal("DialContext succeeded; want proxy handshake timeout")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("proxy handshake timeout took %s", elapsed)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not accept the connection")
+	}
+}
+
+func TestProxyDialerResolvesProxyTargetLocally(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	targetCh := make(chan string, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		req, readErr := http.ReadRequest(bufio.NewReader(conn))
+		if readErr != nil {
+			return
+		}
+		targetCh <- req.Host
+		_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}()
+
+	proxyURL := &url.URL{Scheme: "http", Host: listener.Addr().String()}
+	dialer := NewProxyDialer(proxyURL, &net.Dialer{Timeout: time.Second})
+	conn, err := dialer.DialContext(context.Background(), "tcp", "localhost:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	proxyTarget := <-targetCh
+	host, port, err := net.SplitHostPort(proxyTarget)
+	if err != nil {
+		t.Fatalf("proxy target = %q: %v", proxyTarget, err)
+	}
+	if net.ParseIP(host) == nil || port != "443" {
+		t.Fatalf("proxy target = %q; want a locally resolved IP on port 443", proxyTarget)
+	}
+	if conn.RemoteAddr().String() != proxyTarget {
+		t.Fatalf("RemoteAddr = %q; want %q", conn.RemoteAddr(), proxyTarget)
+	}
+}
+
 func TestProxyDialerRecordsConnectionTimestampsForHostnames(t *testing.T) {
 	dialer := NewProxyDialer(nil, &net.Dialer{Timeout: time.Second})
 	md := metadata.NewMD()
@@ -230,6 +411,58 @@ func TestProxyDialerDialContextErrors(t *testing.T) {
 	}
 	if _, err := dialer.DialContext(context.Background(), "tcp", "bad-address"); err == nil {
 		t.Fatalf("invalid address should fail")
+	}
+}
+
+func TestProxyDialerDNSUsesDialContext(t *testing.T) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	dialer := NewProxyDialer(nil, &net.Dialer{Resolver: resolver})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := dialer.DialContext(ctx, "tcp", "unresolvable.invalid:80"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DialContext err = %v; want context deadline exceeded", err)
+	}
+}
+
+func TestEnvironmentProxyHonorsNoProxy(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://proxy.example:8080")
+	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("NO_PROXY", "private.example")
+	proxyURL, err := parseProxyFrom(false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := newConfiguredProxyDialer(proxyURL, nil, true)
+	got, err := dialer.proxyURLForAddress("private.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("proxy URL = %v; want direct connection", got)
+	}
+}
+
+func TestEnvironmentHTTPSProxyIsSelected(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "")
+	t.Setenv("HTTPS_PROXY", "http://secure-proxy.example:8443")
+	t.Setenv("NO_PROXY", "")
+	proxyURL, err := parseProxyFrom(false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := newConfiguredProxyDialer(proxyURL, nil, true)
+	got, err := dialer.proxyURLForAddress("public.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Host != "secure-proxy.example:8443" {
+		t.Fatalf("proxy URL = %v; want secure-proxy.example:8443", got)
 	}
 }
 

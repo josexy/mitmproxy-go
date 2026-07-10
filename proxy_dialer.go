@@ -3,12 +3,18 @@ package mitmproxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http/httpproxy"
@@ -18,14 +24,23 @@ import (
 const dialTimeout = 15 * time.Second
 
 func init() {
-	proxy.RegisterDialerType("http", func(proxyURL *url.URL, forwardDialer proxy.Dialer) (proxy.Dialer, error) {
-		return &httpProxyDialer{proxyURL: proxyURL, forwardDial: forwardDialer.Dial}, nil
-	})
+	newHTTPProxyDialer := func(proxyURL *url.URL, forwardDialer proxy.Dialer) (proxy.Dialer, error) {
+		dialer := &httpProxyDialer{proxyURL: proxyURL, forwardDial: forwardDialer.Dial}
+		if contextDialer, ok := forwardDialer.(proxy.ContextDialer); ok {
+			dialer.forwardDialContext = contextDialer.DialContext
+		}
+		return dialer, nil
+	}
+	proxy.RegisterDialerType("http", newHTTPProxyDialer)
+	proxy.RegisterDialerType("https", newHTTPProxyDialer)
 }
 
 type httpProxyDialer struct {
-	proxyURL    *url.URL
-	forwardDial func(network, addr string) (net.Conn, error)
+	proxyURL           *url.URL
+	forwardDial        func(network, addr string) (net.Conn, error)
+	forwardDialContext func(context.Context, string, string) (net.Conn, error)
+	tlsConfig          *tls.Config
+	maxHeaderBytes     int
 }
 
 func hostPortNoPort(u *url.URL) (hostPort, hostNoPort string) {
@@ -47,20 +62,48 @@ func hostPortNoPort(u *url.URL) (hostPort, hostNoPort string) {
 }
 
 func (hpd *httpProxyDialer) Dial(network string, addr string) (net.Conn, error) {
+	return hpd.DialContext(context.Background(), network, addr)
+}
+
+func (hpd *httpProxyDialer) DialContext(ctx context.Context, network string, addr string) (net.Conn, error) {
 	hostPort, _ := hostPortNoPort(hpd.proxyURL)
-	conn, err := hpd.forwardDial(network, hostPort)
+	var conn net.Conn
+	var err error
+	if hpd.forwardDialContext != nil {
+		conn, err = hpd.forwardDialContext(ctx, network, hostPort)
+	} else {
+		conn, err = hpd.forwardDial(network, hostPort)
+	}
 	if err != nil {
 		return nil, err
 	}
+	if hpd.proxyURL.Scheme == "https" {
+		tlsConfig := hpd.tlsConfig
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		} else {
+			tlsConfig = tlsConfig.Clone()
+		}
+		if tlsConfig.ServerName == "" {
+			tlsConfig.ServerName = hpd.proxyURL.Hostname()
+		}
+		tlsConn := tls.Client(conn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake with HTTPS proxy: %w", err)
+		}
+		conn = tlsConn
+	}
+	clearDeadline := setDeadlineFromContext(ctx, conn)
+	defer clearDeadline()
 
 	var connectHeader http.Header
 	if user := hpd.proxyURL.User; user != nil {
 		proxyUser := user.Username()
-		if proxyPassword, passwordSet := user.Password(); passwordSet {
-			credential := base64.StdEncoding.EncodeToString([]byte(proxyUser + ":" + proxyPassword))
-			connectHeader = make(http.Header)
-			connectHeader.Set("Proxy-Authorization", "Basic "+credential)
-		}
+		proxyPassword, _ := user.Password()
+		credential := base64.StdEncoding.EncodeToString([]byte(proxyUser + ":" + proxyPassword))
+		connectHeader = make(http.Header)
+		connectHeader.Set("Proxy-Authorization", "Basic "+credential)
 	}
 
 	connectReq := &http.Request{
@@ -72,16 +115,18 @@ func (hpd *httpProxyDialer) Dial(network string, addr string) (net.Conn, error) 
 
 	if err := connectReq.Write(conn); err != nil {
 		conn.Close()
-		return nil, err
+		return nil, contextAwareError(ctx, err)
 	}
 
-	// Read response. It's OK to use and discard buffered reader here becaue
-	// the remote server does not speak until spoken to.
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, connectReq)
+	// Preserve bytes buffered after the CONNECT response for server-first protocols.
+	maxHeaderBytes := hpd.maxHeaderBytes
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = http.DefaultMaxHeaderBytes
+	}
+	resp, br, err := readBoundedHTTPResponse(bufio.NewReader(conn), connectReq, maxHeaderBytes)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, contextAwareError(ctx, err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -92,7 +137,41 @@ func (hpd *httpProxyDialer) Dial(network string, addr string) (net.Conn, error) 
 		}
 		return nil, errors.New(resp.Status)
 	}
-	return conn, nil
+	if err := ctx.Err(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return &bufConnExt{Conn: conn, Reader: br}, nil
+}
+
+func contextAwareError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
+}
+
+func setDeadlineFromContext(ctx context.Context, conn net.Conn) func() {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(done)
+	})
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if !stop() {
+				<-done
+			}
+			_ = conn.SetDeadline(time.Time{})
+		})
+	}
 }
 
 type netDialerFunc func(network, addr string) (net.Conn, error)
@@ -111,8 +190,9 @@ func (c *addrConn) RemoteAddr() net.Addr {
 }
 
 type proxyDialer struct {
-	proxyURL *url.URL
-	dialer   *net.Dialer
+	proxyURL  *url.URL
+	dialer    *net.Dialer
+	proxyFunc func(*url.URL) (*url.URL, error)
 }
 
 type dialTimestampRecorder interface {
@@ -127,6 +207,24 @@ func NewProxyDialer(proxyURL *url.URL, dialer *net.Dialer) *proxyDialer {
 		dialer = &net.Dialer{Timeout: dialTimeout}
 	}
 	return &proxyDialer{proxyURL: proxyURL, dialer: dialer}
+}
+
+func newConfiguredProxyDialer(proxyURL *url.URL, dialer *net.Dialer, useEnvironment bool) *proxyDialer {
+	d := NewProxyDialer(proxyURL, dialer)
+	if useEnvironment {
+		cfg := httpproxy.FromEnvironment()
+		proxyFunc := cfg.ProxyFunc()
+		targetScheme := "http"
+		if cfg.HTTPProxy == "" && cfg.HTTPSProxy != "" {
+			targetScheme = "https"
+		}
+		d.proxyFunc = func(target *url.URL) (*url.URL, error) {
+			targetCopy := *target
+			targetCopy.Scheme = targetScheme
+			return proxyFunc(&targetCopy)
+		}
+	}
+	return d
 }
 
 func (d *proxyDialer) DialTCP(addr string) (net.Conn, error) {
@@ -154,51 +252,150 @@ func (d *proxyDialer) dial(ctx context.Context, network, addr string) (net.Conn,
 }
 
 func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string, md dialTimestampRecorder) (net.Conn, error) {
-	var raddr net.Addr
-	netDial := func(network, addr string) (net.Conn, error) {
-		dialAddr := addr
-		recordDNS := md != nil && shouldRecordDNSLookup(dialAddr)
-		if recordDNS {
-			md.SetDNSLookupStartTs(time.Now())
+	proxyURL, err := d.proxyURLForAddress(addr)
+	if err != nil {
+		return nil, err
+	}
+	forward := &contextNetDialer{dialer: d.dialer, md: md}
+	if proxyURL == nil {
+		return forward.DialContext(ctx, network, addr)
+	}
+	dialCtx := ctx
+	cancel := func() {}
+	if d.dialer.Timeout > 0 {
+		dialCtx, cancel = context.WithTimeout(ctx, d.dialer.Timeout)
+	}
+	defer cancel()
+	resolvedAddr, err := d.resolveTCPAddr(dialCtx, network, addr, md)
+	if err != nil {
+		return nil, err
+	}
+	// The destination lookup above is the DNS phase represented by the
+	// connection metadata. Do not overwrite it when resolving the proxy host.
+	forward.skipDNSMetadata = true
+	dialer, err := proxy.FromURL(proxyURL, forward)
+	if err != nil {
+		return nil, err
+	}
+	var conn net.Conn
+	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+		conn, err = contextDialer.DialContext(dialCtx, network, resolvedAddr.String())
+	} else {
+		conn, err = dialer.Dial(network, resolvedAddr.String())
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &addrConn{raddr: resolvedAddr, Conn: conn}, nil
+}
+
+func (d *proxyDialer) resolveTCPAddr(ctx context.Context, network, addr string, md dialTimestampRecorder) (*net.TCPAddr, error) {
+	host, portString, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		lookupNetwork := network
+		if lookupNetwork == "tcp4" || lookupNetwork == "tcp6" {
+			lookupNetwork = "tcp"
 		}
-		resolvedAddr, err := net.ResolveTCPAddr(network, dialAddr)
-		if recordDNS {
-			md.SetDNSLookupCompletedTs(time.Now())
-		}
+		port, err = net.LookupPort(lookupNetwork, portString)
 		if err != nil {
 			return nil, err
 		}
-		if raddr == nil {
-			raddr = resolvedAddr
-		}
-		dialAddr = resolvedAddr.String()
-		if md != nil {
-			md.SetSocketConnectStartTs(time.Now())
-		}
-		conn, err := d.dialer.DialContext(ctx, network, dialAddr)
-		if md != nil {
-			md.SetSocketConnectCompletedTs(time.Now())
-		}
-		return conn, err
 	}
-	if d.proxyURL == nil {
-		return netDial(network, addr)
+	if port < 0 || port > 65535 {
+		return nil, net.InvalidAddrError("invalid port " + portString)
 	}
-	var err error
-	raddr, err = net.ResolveTCPAddr(network, addr)
+
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if ip := net.ParseIP(host); ip != nil {
+		return &net.TCPAddr{IP: ip, Port: port}, nil
+	}
+
+	if md != nil {
+		md.SetDNSLookupStartTs(time.Now())
+		defer func() {
+			md.SetDNSLookupCompletedTs(time.Now())
+		}()
+	}
+	resolver := d.dialer.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	ips, err := resolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, err
 	}
-	dialer, err := proxy.FromURL(d.proxyURL, netDialerFunc(netDial))
-	if err != nil {
-		return nil, err
+	for _, ip := range ips {
+		if network == "tcp4" && ip.IP.To4() == nil {
+			continue
+		}
+		if network == "tcp6" && (ip.IP.To4() != nil || ip.IP.To16() == nil) {
+			continue
+		}
+		return &net.TCPAddr{IP: ip.IP, Port: port, Zone: ip.Zone}, nil
 	}
-	netDial = dialer.Dial
-	conn, err := netDial(network, addr)
-	if err != nil {
-		return nil, err
+	return nil, &net.DNSError{Name: host, Err: "no suitable address found"}
+}
+
+func (d *proxyDialer) proxyURLForAddress(addr string) (*url.URL, error) {
+	if d.proxyFunc == nil {
+		return d.proxyURL, nil
 	}
-	return &addrConn{raddr, conn}, nil
+	return d.proxyFunc(&url.URL{Scheme: "http", Host: addr})
+}
+
+type contextNetDialer struct {
+	dialer          *net.Dialer
+	md              dialTimestampRecorder
+	skipDNSMetadata bool
+}
+
+func (d *contextNetDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, addr)
+}
+
+func (d *contextNetDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	recordDNS := d.md != nil && !d.skipDNSMetadata && shouldRecordDNSLookup(addr)
+	if recordDNS {
+		d.md.SetDNSLookupStartTs(time.Now())
+	}
+	dialer := *d.dialer
+	originalControlContext := dialer.ControlContext
+	originalControl := dialer.Control
+	dialer.Control = nil
+	var connectStartOnce sync.Once
+	var connectStarted atomic.Bool
+	dialer.ControlContext = func(ctx context.Context, network, address string, rawConn syscall.RawConn) error {
+		connectStartOnce.Do(func() {
+			connectStarted.Store(true)
+			now := time.Now()
+			if recordDNS {
+				d.md.SetDNSLookupCompletedTs(now)
+			}
+			if d.md != nil {
+				d.md.SetSocketConnectStartTs(now)
+			}
+		})
+		if originalControlContext != nil {
+			return originalControlContext(ctx, network, address, rawConn)
+		}
+		if originalControl != nil {
+			return originalControl(network, address, rawConn)
+		}
+		return nil
+	}
+	conn, err := dialer.DialContext(ctx, network, addr)
+	now := time.Now()
+	if recordDNS && !connectStarted.Load() {
+		d.md.SetDNSLookupCompletedTs(now)
+	}
+	if d.md != nil && connectStarted.Load() {
+		d.md.SetSocketConnectCompletedTs(now)
+	}
+	return conn, err
 }
 
 func shouldRecordDNSLookup(addr string) bool {
@@ -228,6 +425,16 @@ func parseProxyFrom(disabled bool, proxy string) (proxyURL *url.URL, err error) 
 			if proxyURL, err = url.Parse(proxyConfig.HTTPSProxy); err != nil {
 				return
 			}
+		}
+	}
+	if proxyURL != nil {
+		switch proxyURL.Scheme {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			return nil, fmt.Errorf("unsupported proxy scheme %q", proxyURL.Scheme)
+		}
+		if proxyURL.Host == "" {
+			return nil, errors.New("proxy URL host is empty")
 		}
 	}
 	return

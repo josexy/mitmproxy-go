@@ -69,8 +69,8 @@ func main() {
 	}
 	defer handler.Cleanup()
 
-	fmt.Println("proxy listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", handler))
+	fmt.Println("proxy listening on 127.0.0.1:8080")
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", handler))
 }
 ```
 
@@ -174,13 +174,13 @@ func main() {
 	}
 	defer handler.Cleanup()
 
-	ln, err := net.Listen("tcp", ":1080")
+	ln, err := net.Listen("tcp", "127.0.0.1:1080")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer ln.Close()
 
-	fmt.Println("SOCKS5 proxy listening on :1080")
+	fmt.Println("SOCKS5 proxy listening on 127.0.0.1:1080")
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -195,6 +195,8 @@ func main() {
 }
 ```
 
+The examples intentionally listen on loopback. The handler does not authenticate downstream HTTP proxy clients, and SOCKS5 currently supports only the no-authentication method. Before exposing either listener on a non-loopback address, enforce client authentication and destination ACLs in the surrounding server or network layer. Otherwise the process becomes an open proxy and may expose localhost, private networks, or cloud metadata endpoints.
+
 ## Options
 
 ### Core Options
@@ -207,7 +209,7 @@ mitmproxy.WithLogger(slog.Default())
 mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {})
 ```
 
-Internal proxy logging is disabled by default. Pass `WithLogger(logger)` to enable structured `slog` output; pass `WithLogger(nil)` to disable it. Log messages are prefixed with `[mitmproxy-go]`. Core logs include connection, routing, TLS, HTTP, HTTP/2, WebSocket, transport retry, and runtime config metadata, but do not log headers, bodies, WebSocket payloads, or raw certificates.
+Internal proxy logging is disabled by default. Pass `WithLogger(logger)` to enable structured `slog` output; pass `WithLogger(nil)` to disable it. Log messages are prefixed with `[mitmproxy-go]`. Core logs include connection, routing, TLS, HTTP, HTTP/2, WebSocket, transport retry, and runtime config metadata, but do not log URL credentials/query strings, headers, bodies, WebSocket payloads, or raw certificates.
 
 ### Upstream and Transport
 
@@ -217,11 +219,13 @@ mitmproxy.WithProxy("socks5://127.0.0.1:1080")
 mitmproxy.WithDisableProxy()
 mitmproxy.WithDialer(&net.Dialer{Timeout: 30 * time.Second})
 mitmproxy.WithIdleConnTimeout(60 * time.Second)
+mitmproxy.WithHandshakeTimeout(10 * time.Second)
+mitmproxy.WithMaxHTTPHeaderBytes(1 << 20)
 mitmproxy.WithDisableHTTP2()
 mitmproxy.WithSkipVerifySSLFromServer()
 ```
 
-If `WithProxy` is not set, `HTTP_PROXY` and `HTTPS_PROXY` environment variables are considered. `WithDisableProxy` disables both explicit and environment proxy settings.
+If `WithProxy` is not set, `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables are considered. HTTP, HTTPS CONNECT, SOCKS5, and SOCKS5H upstream proxy URLs are supported. Destination hostnames are resolved locally before the resolved IP address is sent to an upstream proxy. `WithDisableProxy` disables both explicit and environment proxy settings.
 
 `WithDisableHTTP2` forces HTTP/1.1 upstream traffic and disables h2c handling. When HTTP/2 is enabled, h2c prior-knowledge connections can be inspected; HTTP/1.1 `Upgrade: h2c` handshakes are forwarded transparently as passthrough tunnels.
 
@@ -247,6 +251,8 @@ mitmproxy.WithHTTPInterceptor(httpInterceptor)
 mitmproxy.WithChainHTTPInterceptor(interceptor1, interceptor2, interceptor3)
 mitmproxy.WithWebsocketInterceptor(websocketInterceptor)
 mitmproxy.WithMaxWebsocketFramesPerForward(4096)
+mitmproxy.WithMaxWebsocketMessageBytes(16 << 20)
+mitmproxy.WithMaxWebsocketBufferedBytes(64 << 20)
 ```
 
 When both `WithHTTPInterceptor` and `WithChainHTTPInterceptor` are configured, the single interceptor runs first and then the chain runs in the order provided.
@@ -264,10 +270,10 @@ mitmproxy.WithExcludeHosts("*.cdn.com", "static.example.com")
 
 ## Dynamic Runtime Config
 
-Use `NewDynamicMitmProxyHandler` when runtime updates are needed:
+Use `NewResourceLimitedDynamicMitmProxyHandler` when runtime updates, including resource limits, are needed. `NewDynamicMitmProxyHandler` remains available with its original interface for source compatibility:
 
 ```go
-handler, err := mitmproxy.NewDynamicMitmProxyHandler(
+handler, err := mitmproxy.NewResourceLimitedDynamicMitmProxyHandler(
 	mitmproxy.WithCACertPath("certs/ca.crt"),
 	mitmproxy.WithCAKeyPath("certs/ca.key"),
 	mitmproxy.WithHTTPInterceptor(initialInterceptor),
@@ -300,6 +306,8 @@ handler.SetClientCerts(map[string]mitmproxy.ClientCert{
 })
 
 handler.SetIdleConnTimeout(60 * time.Second)
+err := handler.SetHandshakeTimeout(10 * time.Second)
+err = handler.SetMaxHTTPHeaderBytes(1 << 20)
 handler.SetSkipVerifySSLFromServer(true)
 handler.SetHTTP2Disabled(true)
 handler.SetStreamBaseContext(ctx)
@@ -309,10 +317,12 @@ handler.SetErrorHandler(errorHandler)
 handler.SetHTTPInterceptor(httpInterceptor)
 handler.SetChainHTTPInterceptors(interceptor1, interceptor2)
 handler.SetWebsocketInterceptor(websocketInterceptor)
-err := handler.SetMaxWebsocketFramesPerForward(4096)
+err = handler.SetMaxWebsocketFramesPerForward(4096)
+err = handler.SetMaxWebsocketMessageBytes(16 << 20)
+err = handler.SetMaxWebsocketBufferedBytes(64 << 20)
 ```
 
-`SetRootCAs`, `SetClientCerts`, `SetProxy`, `SetProxyDisabled`, `SetDialer`, and `SetMaxWebsocketFramesPerForward` can return errors. If validation fails, the previous runtime config remains active.
+`SetRootCAs`, `SetClientCerts`, `SetProxy`, `SetProxyDisabled`, `SetDialer`, and resource-limit setters can return errors. If validation fails, the previous runtime config remains active.
 
 `SetHTTPInterceptor` replaces any previously configured HTTP interceptor chain. `SetChainHTTPInterceptors` replaces any previously configured single HTTP interceptor.
 
