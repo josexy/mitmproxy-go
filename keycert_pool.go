@@ -4,7 +4,6 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"errors"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -15,41 +14,26 @@ import (
 var errNoPriKey = errors.New("no available private key")
 
 type priKeyPool struct {
-	mu   sync.Mutex
-	rand *rand.Rand
-	keys []*rsa.PrivateKey
+	once sync.Once
+	key  *rsa.PrivateKey
+	err  error
 }
 
-func newPriKeyPool(maxSize int) *priKeyPool {
-	if maxSize <= 0 {
-		maxSize = 10
-	}
-	pool := &priKeyPool{
-		rand: rand.New(rand.NewSource(time.Now().UnixNano())),
-		keys: make([]*rsa.PrivateKey, 0, maxSize),
-	}
-	return pool
+func newPriKeyPool() *priKeyPool {
+	return &priKeyPool{}
 }
 
 func (p *priKeyPool) Get() (*rsa.PrivateKey, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var n, m = len(p.keys), cap(p.keys)
-	if m == 0 {
+	p.once.Do(func() {
+		p.key, p.err = cert.GeneratePrivateKey()
+	})
+	if p.err != nil {
+		return nil, p.err
+	}
+	if p.key == nil {
 		return nil, errNoPriKey
 	}
-	if n < m {
-		key, err := cert.GeneratePrivateKey()
-		if err != nil {
-			return nil, err
-		}
-		p.keys = append(p.keys, key)
-		return key, nil
-	}
-	index := p.rand.Intn(n)
-	key := p.keys[index]
-	return key, nil
+	return p.key, nil
 }
 
 type certPool struct {

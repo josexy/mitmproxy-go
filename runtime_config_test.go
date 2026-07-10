@@ -37,7 +37,7 @@ func TestNewDynamicMitmProxyHandler(t *testing.T) {
 
 func TestRuntimeConfigSettersDoNotPublishOnError(t *testing.T) {
 	certPath, keyPath := writeRuntimeTestCA(t, "dynamic ca")
-	handler, err := NewDynamicMitmProxyHandler(
+	handler, err := NewResourceLimitedDynamicMitmProxyHandler(
 		WithCACertPath(certPath),
 		WithCAKeyPath(keyPath),
 		WithHTTPInterceptor(headerInterceptor("old")),
@@ -74,6 +74,21 @@ func TestRuntimeConfigSettersDoNotPublishOnError(t *testing.T) {
 	}
 	if got := h.config.Load(); got != oldCfg {
 		t.Fatalf("invalid websocket frame size published a new config")
+	}
+	if err := handler.SetHandshakeTimeout(0); !errors.Is(err, ErrInvalidHandshakeTimeout) {
+		t.Fatalf("SetHandshakeTimeout err = %v; want ErrInvalidHandshakeTimeout", err)
+	}
+	if err := handler.SetMaxHTTPHeaderBytes(0); !errors.Is(err, ErrInvalidHTTPHeaderSize) {
+		t.Fatalf("SetMaxHTTPHeaderBytes err = %v; want ErrInvalidHTTPHeaderSize", err)
+	}
+	if err := handler.SetMaxWebsocketMessageBytes(128 << 20); !errors.Is(err, ErrInvalidWebsocketBufferedBytes) {
+		t.Fatalf("SetMaxWebsocketMessageBytes err = %v; want ErrInvalidWebsocketBufferedBytes", err)
+	}
+	if err := handler.SetMaxWebsocketBufferedBytes(1); !errors.Is(err, ErrInvalidWebsocketBufferedBytes) {
+		t.Fatalf("SetMaxWebsocketBufferedBytes err = %v; want ErrInvalidWebsocketBufferedBytes", err)
+	}
+	if got := h.config.Load(); got != oldCfg {
+		t.Fatalf("invalid resource limits published a new config")
 	}
 }
 

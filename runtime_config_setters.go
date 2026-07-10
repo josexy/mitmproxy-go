@@ -59,6 +59,26 @@ func (r *mitmProxyHandler) SetIdleConnTimeout(timeout time.Duration) {
 	})
 }
 
+func (r *mitmProxyHandler) SetHandshakeTimeout(timeout time.Duration) error {
+	if timeout <= 0 {
+		return ErrInvalidHandshakeTimeout
+	}
+	return r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+		state.handshakeTimeout = timeout
+		return state, runtimeConfigParts{handshakeTimeout: true}, nil
+	})
+}
+
+func (r *mitmProxyHandler) SetMaxHTTPHeaderBytes(maxBytes int) error {
+	if maxBytes <= 0 {
+		return ErrInvalidHTTPHeaderSize
+	}
+	return r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+		state.maxHTTPHeaderBytes = maxBytes
+		return state, runtimeConfigParts{httpHeader: true}, nil
+	})
+}
+
 func (r *mitmProxyHandler) SetSkipVerifySSLFromServer(skip bool) {
 	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.skipVerifySSL = skip
@@ -135,6 +155,32 @@ func (r *mitmProxyHandler) SetMaxWebsocketFramesPerForward(maxFrames int) error 
 	})
 }
 
+func (r *mitmProxyHandler) SetMaxWebsocketMessageBytes(maxBytes int64) error {
+	if maxBytes <= 0 {
+		return ErrInvalidWebsocketMessageSize
+	}
+	return r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+		if state.wsMaxBufferedBytes < maxBytes {
+			return state, runtimeConfigParts{websocket: true}, ErrInvalidWebsocketBufferedBytes
+		}
+		state.wsMaxMessageBytes = maxBytes
+		return state, runtimeConfigParts{websocket: true}, nil
+	})
+}
+
+func (r *mitmProxyHandler) SetMaxWebsocketBufferedBytes(maxBytes int64) error {
+	if maxBytes <= 0 {
+		return ErrInvalidWebsocketBufferedBytes
+	}
+	return r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+		if maxBytes < state.wsMaxMessageBytes {
+			return state, runtimeConfigParts{websocket: true}, ErrInvalidWebsocketBufferedBytes
+		}
+		state.wsMaxBufferedBytes = maxBytes
+		return state, runtimeConfigParts{websocket: true}, nil
+	})
+}
+
 type runtimeConfigParts struct {
 	proxy                bool
 	rootCAs              bool
@@ -143,6 +189,8 @@ type runtimeConfigParts struct {
 	httpInterceptor      bool
 	logger               bool
 	idleConnTimeout      bool
+	handshakeTimeout     bool
+	httpHeader           bool
 	skipVerifySSL        bool
 	http2                bool
 	streamBaseContext    bool
@@ -173,6 +221,12 @@ func (p runtimeConfigParts) names() []string {
 	}
 	if p.idleConnTimeout {
 		names = append(names, "idle_conn_timeout")
+	}
+	if p.handshakeTimeout {
+		names = append(names, "handshake_timeout")
+	}
+	if p.httpHeader {
+		names = append(names, "max_http_header_bytes")
 	}
 	if p.skipVerifySSL {
 		names = append(names, "skip_verify_ssl")
@@ -248,7 +302,7 @@ func rebuildRuntimeConfig(oldCfg *runtimeConfig, state runtimeConfigState, parts
 		if err != nil {
 			return nil, err
 		}
-		cfg.proxyDialer = NewProxyDialer(proxyURL, state.dialer)
+		cfg.proxyDialer = newConfiguredProxyDialer(proxyURL, state.dialer, !state.disableProxy && state.proxy == "")
 	}
 	if parts.rootCAs {
 		rootPool, err := loadRootCAPool(state.rootCAs)

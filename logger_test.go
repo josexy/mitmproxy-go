@@ -12,6 +12,16 @@ import (
 	"time"
 )
 
+func TestRequestURLRedactsCredentialsAndQuery(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://user:secret@example.test/path?token=secret#fragment", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := requestURL(req); got != "https://example.test/path" {
+		t.Fatalf("requestURL = %q; want sanitized URL", got)
+	}
+}
+
 type capturedLogRecord struct {
 	level   slog.Level
 	message string

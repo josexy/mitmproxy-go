@@ -17,7 +17,7 @@ func newTrieNode() *trieNode {
 }
 
 func (node *trieNode) insert(pattern string) {
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	pattern = normalizeDomain(pattern)
 	if pattern == "" {
 		return
 	}
@@ -39,11 +39,16 @@ func (node *trieNode) insert(pattern string) {
 }
 
 func (node *trieNode) match(domain string) bool {
-	domain = strings.ToLower(strings.TrimSpace(domain))
+	domain = normalizeDomain(domain)
 	if domain == "" {
 		return false
 	}
 	return node.matchSuffix(domain, len(domain))
+}
+
+func normalizeDomain(domain string) string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	return strings.TrimRight(domain, ".")
 }
 
 func (node *trieNode) matchSuffix(domain string, end int) bool {

@@ -2,12 +2,19 @@ package mitmproxy
 
 import (
 	"context"
-	"crypto/x509"
 	"log/slog"
 	"net"
+	"net/http"
 	"time"
 
 	"github.com/josexy/mitmproxy-go/internal/cert"
+)
+
+const (
+	defaultHandshakeTimeout          = 10 * time.Second
+	defaultMaxHTTPHeaderBytes        = http.DefaultMaxHeaderBytes
+	defaultMaxWebsocketMessageBytes  = int64(16 << 20)
+	defaultMaxWebsocketBufferedBytes = int64(64 << 20)
 )
 
 type ClientCert struct {
@@ -39,9 +46,13 @@ type options struct {
 	dialer        *net.Dialer // Custom dialer for outbound connections
 	logger        *slog.Logger
 
-	idleConnTimeout time.Duration // Idle timeout for connections
+	idleConnTimeout    time.Duration // Idle timeout for connections
+	handshakeTimeout   time.Duration
+	maxHTTPHeaderBytes int
 
 	wsMaxFramesPerForward int // Max frames channel size per single websocket forward
+	wsMaxMessageBytes     int64
+	wsMaxBufferedBytes    int64
 
 	clientCerts map[string]ClientCert // Client certificate configuration
 
@@ -52,8 +63,7 @@ type options struct {
 		ExpireSecond   int // Certificate cache expiration time in seconds
 	}
 
-	rootCACertPool *x509.CertPool // System and custom root CA certificate pool
-	caCert         *cert.Cert     // Loaded CA certificate for TLS interception
+	caCert *cert.Cert // Loaded CA certificate for TLS interception
 
 	errHandler    ErrorHandler
 	httpInt       HTTPInterceptor
@@ -67,6 +77,10 @@ func newOptions(opt ...Option) *options {
 	options := &options{
 		dialer:                &net.Dialer{Timeout: 15 * time.Second},
 		wsMaxFramesPerForward: 2048,
+		wsMaxMessageBytes:     defaultMaxWebsocketMessageBytes,
+		wsMaxBufferedBytes:    defaultMaxWebsocketBufferedBytes,
+		handshakeTimeout:      defaultHandshakeTimeout,
+		maxHTTPHeaderBytes:    defaultMaxHTTPHeaderBytes,
 		streamBaseCtx:         context.Background(),
 	}
 	for _, o := range opt {
@@ -252,6 +266,20 @@ func WithIdleConnTimeout(timeout time.Duration) Option {
 	})
 }
 
+// WithHandshakeTimeout limits protocol sniffing and TLS/SOCKS handshakes.
+func WithHandshakeTimeout(timeout time.Duration) Option {
+	return OptionFunc(func(o *options) {
+		o.handshakeTimeout = timeout
+	})
+}
+
+// WithMaxHTTPHeaderBytes limits HTTP/1 request headers parsed inside tunnels.
+func WithMaxHTTPHeaderBytes(maxBytes int) Option {
+	return OptionFunc(func(o *options) {
+		o.maxHTTPHeaderBytes = maxBytes
+	})
+}
+
 // WithSkipVerifySSLFromServer disables SSL certificate verification when the proxy
 // connects to upstream servers. This allows connecting to servers with self-signed
 // certificates or invalid certificate chains.
@@ -293,8 +321,8 @@ func WithDisableHTTP2() Option {
 //
 // Parameters:
 //   - capacity: Maximum number of certificates to cache (e.g., 2048). capacity must be a multiple of 256
-//   - interval: How often to run cache cleanup in milliseconds (e.g., 60 for 1 minute)
-//   - expireSecond: How long certificates stay in cache in milliseconds (e.g., 15 for 15 seconds)
+//   - intervalSecond: How often to run cache cleanup in seconds
+//   - expireSecond: How long certificates stay in cache in seconds
 //
 // If not specified, default values are used.
 //
@@ -328,6 +356,20 @@ func WithCertCachePool(capacity, intervalSecond, expireSecond int) Option {
 func WithMaxWebsocketFramesPerForward(maxFrames int) Option {
 	return OptionFunc(func(o *options) {
 		o.wsMaxFramesPerForward = maxFrames
+	})
+}
+
+// WithMaxWebsocketMessageBytes limits a single WebSocket message.
+func WithMaxWebsocketMessageBytes(maxBytes int64) Option {
+	return OptionFunc(func(o *options) {
+		o.wsMaxMessageBytes = maxBytes
+	})
+}
+
+// WithMaxWebsocketBufferedBytes limits frames waiting for an interceptor.
+func WithMaxWebsocketBufferedBytes(maxBytes int64) Option {
+	return OptionFunc(func(o *options) {
+		o.wsMaxBufferedBytes = maxBytes
 	})
 }
 

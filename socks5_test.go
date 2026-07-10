@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -107,8 +108,29 @@ func TestSocks5HandshakeAndRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects unoffered no-auth method", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		errCh := make(chan error, 1)
+		go func() { errCh <- handler.handleSocks5Handshake(context.Background(), server) }()
+		if _, err := client.Write([]byte{5, 1, 2}); err != nil {
+			t.Fatal(err)
+		}
+		reply := make([]byte, 2)
+		if _, err := io.ReadFull(client, reply); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(reply, []byte{5, 0xff}) {
+			t.Fatalf("reply = %v; want [5 255]", reply)
+		}
+		if err := <-errCh; !errors.Is(err, ErrUnsupportedSocks5Auth) {
+			t.Fatalf("err = %v; want ErrUnsupportedSocks5Auth", err)
+		}
+	})
+
 	t.Run("invalid handshake version", func(t *testing.T) {
-		if err := handler.handleSocks5Handshake(context.Background(), bytesConn{Reader: bytes.NewReader([]byte{4})}); !errors.Is(err, ErrInvalidSocks5Version) {
+		if err := handler.handleSocks5Handshake(context.Background(), &bytesConn{Reader: bytes.NewReader([]byte{4})}); !errors.Is(err, ErrInvalidSocks5Version) {
 			t.Fatalf("err = %v; want ErrInvalidSocks5Version", err)
 		}
 	})
@@ -130,28 +152,106 @@ func TestSocks5HandshakeAndRequest(t *testing.T) {
 		if _, err := client.Write(packet); err != nil {
 			t.Fatalf("write request: %v", err)
 		}
-		reply := make([]byte, 10)
-		if _, err := client.Read(reply); err != nil {
-			t.Fatalf("read request reply: %v", err)
-		}
-		if !bytes.Equal(reply, []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}) {
-			t.Fatalf("request reply = %v", reply)
-		}
 		if err := <-errCh; err != nil {
 			t.Fatalf("request err = %v", err)
 		}
 		if host := <-hostCh; host != "example.com:443" {
 			t.Fatalf("hostport = %q; want example.com:443", host)
 		}
+		_ = client.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		if _, err := client.Read(make([]byte, 1)); err == nil {
+			t.Fatal("request parser sent success before the upstream dial")
+		}
 	})
 
 	t.Run("unsupported command", func(t *testing.T) {
 		packet := []byte{5, 2, 0, 1, 127, 0, 0, 1, 0, 80}
-		conn := bytesConn{Reader: bytes.NewReader(packet)}
+		conn := &bytesConn{Reader: bytes.NewReader(packet)}
 		if _, err := handler.handleSocks5Request(context.Background(), conn); !errors.Is(err, ErrUnsupportedSocks5Command) {
 			t.Fatalf("err = %v; want ErrUnsupportedSocks5Command", err)
 		}
 	})
+
+	t.Run("invalid reserved byte", func(t *testing.T) {
+		packet := []byte{5, 1, 1, 1, 127, 0, 0, 1, 0, 80}
+		conn := &bytesConn{Reader: bytes.NewReader(packet)}
+		if _, err := handler.handleSocks5Request(context.Background(), conn); !errors.Is(err, ErrInvalidSocks5Reserved) {
+			t.Fatalf("err = %v; want ErrInvalidSocks5Reserved", err)
+		}
+		if got := conn.Buffer.Bytes(); len(got) != 10 || got[1] != socks5ReplyGeneralFailure {
+			t.Fatalf("reply = %v", got)
+		}
+	})
+
+	t.Run("empty domain", func(t *testing.T) {
+		packet := []byte{5, 1, 0, 3, 0, 0, 80}
+		conn := &bytesConn{Reader: bytes.NewReader(packet)}
+		if _, err := handler.handleSocks5Request(context.Background(), conn); !errors.Is(err, ErrInvalidSocks5Address) {
+			t.Fatalf("err = %v; want ErrInvalidSocks5Address", err)
+		}
+		if got := conn.Buffer.Bytes(); len(got) != 10 || got[1] != socks5ReplyAddressTypeUnsupported {
+			t.Fatalf("reply = %v", got)
+		}
+	})
+}
+
+func TestWriteSocks5Reply(t *testing.T) {
+	var dst bytes.Buffer
+	err := writeSocks5Reply(&dst, socks5ReplySucceeded, &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{5, 0, 0, 1, 127, 0, 0, 1, 0x1f, 0x90}
+	if !bytes.Equal(dst.Bytes(), want) {
+		t.Fatalf("reply = %v; want %v", dst.Bytes(), want)
+	}
+}
+
+func TestServeSOCKS5ReportsDialFailureBeforeClosing(t *testing.T) {
+	certPath, keyPath := writeTestCA(t)
+	handler, err := NewMitmProxyHandler(
+		WithCACertPath(certPath),
+		WithCAKeyPath(keyPath),
+		WithDisableProxy(),
+		WithDialer(&net.Dialer{Timeout: 100 * time.Millisecond}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Cleanup()
+
+	client, server := net.Pipe()
+	defer client.Close()
+	closedListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := closedListener.Addr().(*net.TCPAddr).Port
+	_ = closedListener.Close()
+	errCh := make(chan error, 1)
+	go func() { errCh <- handler.ServeSOCKS5(context.Background(), server) }()
+
+	if _, err := client.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	methodReply := make([]byte, 2)
+	if _, err := io.ReadFull(client, methodReply); err != nil {
+		t.Fatal(err)
+	}
+	request := []byte{5, 1, 0, 1, 127, 0, 0, 1, byte(port >> 8), byte(port)}
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(client, connectReply); err != nil {
+		t.Fatal(err)
+	}
+	if connectReply[1] == socks5ReplySucceeded {
+		t.Fatalf("connect reply = %v; want failure", connectReply)
+	}
+	if err := <-errCh; err == nil {
+		t.Fatal("ServeSOCKS5 unexpectedly succeeded")
+	}
 }
 
 type bytesConn struct {
@@ -159,14 +259,14 @@ type bytesConn struct {
 	bytes.Buffer
 }
 
-func (c bytesConn) Read(p []byte) (int, error)       { return c.Reader.Read(p) }
-func (c bytesConn) Write(p []byte) (int, error)      { return c.Buffer.Write(p) }
-func (c bytesConn) Close() error                     { return nil }
-func (c bytesConn) LocalAddr() net.Addr              { return dummyAddr("local") }
-func (c bytesConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
-func (c bytesConn) SetDeadline(time.Time) error      { return nil }
-func (c bytesConn) SetReadDeadline(time.Time) error  { return nil }
-func (c bytesConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *bytesConn) Read(p []byte) (int, error)       { return c.Reader.Read(p) }
+func (c *bytesConn) Write(p []byte) (int, error)      { return c.Buffer.Write(p) }
+func (c *bytesConn) Close() error                     { return nil }
+func (c *bytesConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (c *bytesConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (c *bytesConn) SetDeadline(time.Time) error      { return nil }
+func (c *bytesConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *bytesConn) SetWriteDeadline(time.Time) error { return nil }
 
 type dummyAddr string
 
