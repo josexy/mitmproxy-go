@@ -308,7 +308,7 @@ func TestProxyDialerTimeoutIncludesProxyHandshake(t *testing.T) {
 	proxyURL := &url.URL{Scheme: "http", Host: listener.Addr().String()}
 	dialer := NewProxyDialer(proxyURL, &net.Dialer{Timeout: 30 * time.Millisecond})
 	start := time.Now()
-	if _, err := dialer.DialContext(context.Background(), "tcp", "target.example:443"); err == nil {
+	if _, err := dialer.DialContext(context.Background(), "tcp", "localhost:443"); err == nil {
 		t.Fatal("DialContext succeeded; want proxy handshake timeout")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
@@ -318,6 +318,49 @@ func TestProxyDialerTimeoutIncludesProxyHandshake(t *testing.T) {
 	case <-accepted:
 	case <-time.After(time.Second):
 		t.Fatal("proxy did not accept the connection")
+	}
+}
+
+func TestProxyDialerResolvesProxyTargetLocally(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	targetCh := make(chan string, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		req, readErr := http.ReadRequest(bufio.NewReader(conn))
+		if readErr != nil {
+			return
+		}
+		targetCh <- req.Host
+		_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}()
+
+	proxyURL := &url.URL{Scheme: "http", Host: listener.Addr().String()}
+	dialer := NewProxyDialer(proxyURL, &net.Dialer{Timeout: time.Second})
+	conn, err := dialer.DialContext(context.Background(), "tcp", "localhost:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	proxyTarget := <-targetCh
+	host, port, err := net.SplitHostPort(proxyTarget)
+	if err != nil {
+		t.Fatalf("proxy target = %q: %v", proxyTarget, err)
+	}
+	if net.ParseIP(host) == nil || port != "443" {
+		t.Fatalf("proxy target = %q; want a locally resolved IP on port 443", proxyTarget)
+	}
+	if conn.RemoteAddr().String() != proxyTarget {
+		t.Fatalf("RemoteAddr = %q; want %q", conn.RemoteAddr(), proxyTarget)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -265,20 +266,78 @@ func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string
 		dialCtx, cancel = context.WithTimeout(ctx, d.dialer.Timeout)
 	}
 	defer cancel()
+	resolvedAddr, err := d.resolveTCPAddr(dialCtx, network, addr, md)
+	if err != nil {
+		return nil, err
+	}
+	// The destination lookup above is the DNS phase represented by the
+	// connection metadata. Do not overwrite it when resolving the proxy host.
+	forward.skipDNSMetadata = true
 	dialer, err := proxy.FromURL(proxyURL, forward)
 	if err != nil {
 		return nil, err
 	}
 	var conn net.Conn
 	if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
-		conn, err = contextDialer.DialContext(dialCtx, network, addr)
+		conn, err = contextDialer.DialContext(dialCtx, network, resolvedAddr.String())
 	} else {
-		conn, err = dialer.Dial(network, addr)
+		conn, err = dialer.Dial(network, resolvedAddr.String())
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &addrConn{raddr: unresolvedNetworkAddr{network: network, address: addr}, Conn: conn}, nil
+	return &addrConn{raddr: resolvedAddr, Conn: conn}, nil
+}
+
+func (d *proxyDialer) resolveTCPAddr(ctx context.Context, network, addr string, md dialTimestampRecorder) (*net.TCPAddr, error) {
+	host, portString, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		lookupNetwork := network
+		if lookupNetwork == "tcp4" || lookupNetwork == "tcp6" {
+			lookupNetwork = "tcp"
+		}
+		port, err = net.LookupPort(lookupNetwork, portString)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if port < 0 || port > 65535 {
+		return nil, net.InvalidAddrError("invalid port " + portString)
+	}
+
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if ip := net.ParseIP(host); ip != nil {
+		return &net.TCPAddr{IP: ip, Port: port}, nil
+	}
+
+	if md != nil {
+		md.SetDNSLookupStartTs(time.Now())
+		defer func() {
+			md.SetDNSLookupCompletedTs(time.Now())
+		}()
+	}
+	resolver := d.dialer.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	for _, ip := range ips {
+		if network == "tcp4" && ip.IP.To4() == nil {
+			continue
+		}
+		if network == "tcp6" && (ip.IP.To4() != nil || ip.IP.To16() == nil) {
+			continue
+		}
+		return &net.TCPAddr{IP: ip.IP, Port: port, Zone: ip.Zone}, nil
+	}
+	return nil, &net.DNSError{Name: host, Err: "no suitable address found"}
 }
 
 func (d *proxyDialer) proxyURLForAddress(addr string) (*url.URL, error) {
@@ -289,8 +348,9 @@ func (d *proxyDialer) proxyURLForAddress(addr string) (*url.URL, error) {
 }
 
 type contextNetDialer struct {
-	dialer *net.Dialer
-	md     dialTimestampRecorder
+	dialer          *net.Dialer
+	md              dialTimestampRecorder
+	skipDNSMetadata bool
 }
 
 func (d *contextNetDialer) Dial(network, addr string) (net.Conn, error) {
@@ -298,7 +358,7 @@ func (d *contextNetDialer) Dial(network, addr string) (net.Conn, error) {
 }
 
 func (d *contextNetDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	recordDNS := d.md != nil && shouldRecordDNSLookup(addr)
+	recordDNS := d.md != nil && !d.skipDNSMetadata && shouldRecordDNSLookup(addr)
 	if recordDNS {
 		d.md.SetDNSLookupStartTs(time.Now())
 	}
@@ -337,14 +397,6 @@ func (d *contextNetDialer) DialContext(ctx context.Context, network, addr string
 	}
 	return conn, err
 }
-
-type unresolvedNetworkAddr struct {
-	network string
-	address string
-}
-
-func (a unresolvedNetworkAddr) Network() string { return a.network }
-func (a unresolvedNetworkAddr) String() string  { return a.address }
 
 func shouldRecordDNSLookup(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)

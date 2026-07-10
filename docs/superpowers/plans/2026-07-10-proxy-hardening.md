@@ -64,9 +64,9 @@
 - Modify: `proxy_dialer_test.go`
 - Modify: `runtime_config.go`
 
-- [ ] Add failing tests proving direct DNS uses the supplied dial context, proxy targets are not resolved locally, NO_PROXY bypasses environment proxies, stalled CONNECT handshakes cancel, and HTTPS proxy URLs establish TLS.
+- [ ] Add failing tests proving direct DNS uses the supplied dial context, proxy targets are resolved locally, NO_PROXY bypasses environment proxies, stalled CONNECT handshakes cancel, and HTTPS proxy URLs establish TLS.
 - [ ] Let `net.Dialer.DialContext` resolve direct destinations instead of pre-resolving one address with `ResolveTCPAddr`.
-- [ ] Keep proxied destination addresses unresolved and use a logical remote address for metadata.
+- [ ] Resolve proxied destination addresses locally and use the resolved address for the upstream proxy and metadata.
 - [ ] Implement `DialContext` for HTTP proxy CONNECT, set connection deadlines from the context, preserve buffered tunnel bytes, and wrap HTTPS proxy connections in verified TLS.
 - [ ] Validate supported proxy schemes and required hosts while building runtime configuration.
 - [ ] Apply the environment proxy function per destination so NO_PROXY is honored.
