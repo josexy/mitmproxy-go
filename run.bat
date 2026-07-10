@@ -1,1 +1,0 @@
-catgo run -p .\examples\dumper\main.go -- -cacert .\certs\ca.crt -cakey .\certs\ca.key -mode http -port 8080
