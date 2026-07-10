@@ -872,7 +872,10 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	}
 	// send client hello and do tls handshake
 	md.SetSSLHandshakeStartTs(time.Now())
-	if err := tlsClientConn.HandshakeContext(ctx); err != nil {
+	clearHandshakeDeadline := setDeadlineForTimeout(conn, cfg.state.handshakeTimeout)
+	err = tlsClientConn.HandshakeContext(ctx)
+	clearHandshakeDeadline()
+	if err != nil {
 		return nil, nil, fmt.Errorf("upstream tls handshake: %w", err)
 	}
 	tlsConnEstTs := time.Now()
@@ -1018,6 +1021,17 @@ func setReadDeadlineForTimeout(conn net.Conn, timeout time.Duration) func() {
 	return func() { _ = conn.SetReadDeadline(time.Time{}) }
 }
 
+// setDeadlineForTimeout bounds a blocking handshake (which both reads and
+// writes) so a hung peer cannot pin the goroutine and connection forever. The
+// returned func clears the deadline so subsequent I/O is not affected.
+func setDeadlineForTimeout(conn net.Conn, timeout time.Duration) func() {
+	if timeout <= 0 {
+		return func() {}
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	return func() { _ = conn.SetDeadline(time.Time{}) }
+}
+
 func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequest bool) (err error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
@@ -1090,7 +1104,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				}
 			}
 		}(dstConn)
-		// read client hello and do tls handshake
+		// Bound both sides of the coordinated downstream/upstream handshake.
 		if err = tlsConn.HandshakeContext(handshakeCtx); err != nil {
 			cancelHandshake()
 			clearDeadline()

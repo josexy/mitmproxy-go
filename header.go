@@ -95,6 +95,9 @@ func sanitizeWebsocketUpgradeHeaders(header http.Header) {
 		}
 	}
 	header.Del(HttpHeaderProxyAgent)
+	// The upstream WebSocket handshake uses a new connection. Recreate only
+	// the connection option required by RFC 6455.
+	header.Set(HttpHeaderConnection, HttpHeaderUpgrade)
 }
 
 func isWebsocketHandshakeHeader(name string) bool {

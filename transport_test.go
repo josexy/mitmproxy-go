@@ -138,13 +138,27 @@ func TestSingleConnTransportRoundTripClosesOnError(t *testing.T) {
 		0,
 		false,
 	)
-	req, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
+	body := &closeTrackingBody{Reader: strings.NewReader("payload")}
+	req, _ := http.NewRequest(http.MethodPost, "http://example.com/", body)
 	if _, err := tr.RoundTrip(req); err == nil {
 		t.Fatalf("expected round trip error")
+	}
+	if !body.closed {
+		t.Fatalf("request body should be closed on round trip error")
 	}
 	if tr.closed {
 		t.Fatalf("dial error should not mark transport closed")
 	}
+}
+
+type closeTrackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.closed = true
+	return nil
 }
 
 func TestSingleConnTransportDoesNotCloseOnCanceledHTTP2Stream(t *testing.T) {

@@ -3,11 +3,9 @@ package cache
 import (
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -267,10 +265,21 @@ func (s *cacheShard[K, V]) removeOldest() {
 	}
 }
 
+// StringHasher computes an FNV-1 hash of s. It is implemented inline (rather
+// than via hash/fnv) so it allocates nothing and avoids unsafe; the result is
+// only used to select a shard, so the exact value need not be stable across
+// builds, but it stays bit-for-bit compatible with fnv.New64.
 func StringHasher(s string) uint64 {
-	h := fnv.New64()
-	h.Write(unsafe.Slice(unsafe.StringData(s), len(s)))
-	return h.Sum64()
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(s); i++ {
+		h *= prime64
+		h ^= uint64(s[i])
+	}
+	return h
 }
 
 func NewStringCache[V any](opt ...Option) Cache[string, V] {

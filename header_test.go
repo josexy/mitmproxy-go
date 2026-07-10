@@ -56,8 +56,8 @@ func TestSanitizeWebsocketUpgradeHeaders(t *testing.T) {
 
 	sanitizeWebsocketUpgradeHeaders(header)
 
-	if got := header.Get(HttpHeaderConnection); got != "keep-alive, Upgrade, X-Hop, Sec-Websocket-Extensions" {
-		t.Fatalf("Connection was changed: %q", got)
+	if got := header.Get(HttpHeaderConnection); got != HttpHeaderUpgrade {
+		t.Fatalf("Connection = %q; want Upgrade", got)
 	}
 	if got := header.Get(HttpHeaderUpgrade); got != "websocket" {
 		t.Fatalf("Upgrade = %q; want websocket", got)
