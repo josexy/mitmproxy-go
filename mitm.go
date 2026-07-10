@@ -1444,8 +1444,10 @@ type wsFrameImpl struct {
 	msgType int
 	dataBuf *buf.Buffer
 
-	state         atomic.Uint32
-	dst           *websocket.Conn
+	state atomic.Uint32
+	dst   *websocket.Conn
+	// Invoked exactly once when the frame is forwarded or discarded so its
+	// payload no longer counts against the interceptor's buffered-byte budget.
 	onRelease     func(int64)
 	reservedBytes int64
 }
@@ -1480,8 +1482,10 @@ func (f *wsFrameImpl) releaseResources() {
 }
 
 type wsFramesWatcherImpl struct {
-	framesCh       chan WsFrame
-	closeOnce      sync.Once
+	framesCh  chan WsFrame
+	closeOnce sync.Once
+	// bufferedBytes includes frames queued in framesCh and frames currently
+	// held by the interceptor. The budget is shared by both traffic directions.
 	bufferedBytes  atomic.Int64
 	maxBuffered    int64
 	budgetReleased chan struct{}
@@ -1491,6 +1495,8 @@ func (w *wsFramesWatcherImpl) Receive() <-chan WsFrame { return w.framesCh }
 
 func (w *wsFramesWatcherImpl) send(ctx context.Context, frame *wsFrameImpl) bool {
 	size := int64(frame.dataBuf.Len())
+	// Reserve bytes before publishing the frame so every frame visible to the
+	// interceptor is already included in the aggregate memory budget.
 	if !w.reserve(ctx, size) {
 		return false
 	}
@@ -1518,6 +1524,8 @@ func (w *wsFramesWatcherImpl) reserve(ctx context.Context, size int64) bool {
 		case <-ctx.Done():
 			return false
 		case <-w.budgetReleased:
+			// Waiting here applies backpressure to the corresponding WebSocket
+			// reader until the interceptor invokes or releases another frame.
 		}
 	}
 }
@@ -1533,6 +1541,8 @@ func (w *wsFramesWatcherImpl) release(size int64) {
 func (w *wsFramesWatcherImpl) close() {
 	w.closeOnce.Do(func() {
 		close(w.framesCh)
+		// Return buffers and byte reservations for frames that the interceptor
+		// did not consume before the connection shut down.
 		for frame := range w.framesCh {
 			frame.Release()
 		}
@@ -1579,6 +1589,8 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 		wsDstConn.Close()
 		return err
 	}
+	// Enforce the per-message limit on complete logical messages from both
+	// peers; fragmented WebSocket messages still count as one combined message.
 	wsSrcConn.SetReadLimit(cfg.state.wsMaxMessageBytes)
 	wsDstConn.SetReadLimit(cfg.state.wsMaxMessageBytes)
 	logConfigAttrs(ctx, cfg, slog.LevelDebug, "websocket upgraded",
@@ -1598,6 +1610,9 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 
 	var fw *wsFramesWatcherImpl
 	if cfg.state.wsInt != nil {
+		// framesCh bounds the number of pending interceptor items, while
+		// maxBuffered independently bounds their combined payload bytes across
+		// both relay directions.
 		fw = &wsFramesWatcherImpl{
 			framesCh:       make(chan WsFrame, cfg.state.wsMaxFramesPerForward*2),
 			maxBuffered:    cfg.state.wsMaxBufferedBytes,
@@ -1620,6 +1635,8 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 				return
 			default:
 			}
+			// The interceptor API exposes a complete message buffer, so reject an
+			// oversized message while reading it rather than after it is queued.
 			msgType, buffer, err := readBufferFromWSConn(src, cfg.state.wsMaxMessageBytes)
 			if err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
@@ -1645,7 +1662,8 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 				slog.Int("bytes", buffer.Len()),
 			)
 			if fw != nil {
-				// MUST release buffer manually
+				// Ownership of buffer transfers to the frame. Invoke or Release returns
+				// both the pooled buffer and its buffered-byte reservation.
 				frame := &wsFrameImpl{
 					dir:     dir,
 					msgType: msgType,

@@ -359,14 +359,31 @@ func WithMaxWebsocketFramesPerForward(maxFrames int) Option {
 	})
 }
 
-// WithMaxWebsocketMessageBytes limits a single WebSocket message.
+// WithMaxWebsocketMessageBytes sets the maximum payload size, in bytes, of a
+// single WebSocket message read from either the downstream client or the
+// upstream server. The limit applies to the complete message, even when the
+// message is split across multiple WebSocket frames. A message that exceeds
+// the limit is rejected and terminates the WebSocket relay.
+//
+// maxBytes must be greater than zero and must not exceed the value configured
+// by WithMaxWebsocketBufferedBytes. If not specified, the default is 16 MiB.
 func WithMaxWebsocketMessageBytes(maxBytes int64) Option {
 	return OptionFunc(func(o *options) {
 		o.wsMaxMessageBytes = maxBytes
 	})
 }
 
-// WithMaxWebsocketBufferedBytes limits frames waiting for an interceptor.
+// WithMaxWebsocketBufferedBytes sets the maximum combined payload size, in
+// bytes, of WebSocket messages retained for a WebsocketInterceptor across both
+// traffic directions. A message continues to count toward the limit after the
+// interceptor receives it, until the interceptor calls WsFrame.Invoke or
+// WsFrame.Release. When the budget is exhausted, WebSocket reading applies
+// backpressure until the interceptor releases enough buffered data.
+//
+// maxBytes must be greater than or equal to the maximum single-message size
+// configured by WithMaxWebsocketMessageBytes. This option only affects
+// connections that use a WebsocketInterceptor. If not specified, the default
+// is 64 MiB.
 func WithMaxWebsocketBufferedBytes(maxBytes int64) Option {
 	return OptionFunc(func(o *options) {
 		o.wsMaxBufferedBytes = maxBytes
