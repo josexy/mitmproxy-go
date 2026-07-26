@@ -188,6 +188,20 @@ func isClientConnUnusableRoundTripError(err error) bool {
 		strings.Contains(msg, "server's graceful shutdown goaway")
 }
 
+// unusableClientConnReason reports why a cached client connection can no longer
+// serve a request, or "" when it is still good. A connection at its concurrency
+// limit reports no available slots too, so in-flight requests are what tells a
+// busy connection apart from a closed one.
+func unusableClientConnReason(clientConn *http.ClientConn) string {
+	if clientConn.Err() != nil {
+		return "error"
+	}
+	if clientConn.Available() == 0 && clientConn.InFlight() == 0 {
+		return "closed"
+	}
+	return ""
+}
+
 func shouldCloseDiscardedClientConn(clientConn *http.ClientConn, err error) bool {
 	if clientConn.Err() != nil {
 		return true
@@ -341,12 +355,26 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 		return nil, net.ErrClosed
 	}
 	if t.clientConn != nil {
-		logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "transport client connection reused",
+		// An upstream that closed the connection while it sat idle is only
+		// noticed once a request has been written, and by then a request with a
+		// body can no longer be replayed. Check before handing it out.
+		reason := unusableClientConnReason(t.clientConn)
+		if reason == "" {
+			logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "transport client connection reused",
+				slog.String("hostport", t.hostport),
+				slog.String("method", requestMethod(req)),
+				slog.String("url", requestURL(req)),
+			)
+			return t.clientConn, nil
+		}
+		stale := t.clientConn
+		t.clientConn = nil
+		logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "transport stale client connection dropped",
 			slog.String("hostport", t.hostport),
-			slog.String("method", requestMethod(req)),
-			slog.String("url", requestURL(req)),
+			slog.String("reason", reason),
+			clientConnErrorAttr(stale),
 		)
-		return t.clientConn, nil
+		_ = stale.Close()
 	}
 
 	scheme := req.URL.Scheme

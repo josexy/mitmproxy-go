@@ -225,6 +225,8 @@ mitmproxy.WithDisableHTTP2()
 mitmproxy.WithSkipVerifySSLFromServer()
 ```
 
+`WithIdleConnTimeout` defaults to 90 seconds and bounds how long an idle HTTP keep-alive connection, together with the upstream connection pinned to it, is kept around. Pass `0` to disable it.
+
 If `WithProxy` is not set, `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables are considered. HTTP, HTTPS CONNECT, SOCKS5, and SOCKS5H upstream proxy URLs are supported. Destination hostnames are resolved locally before the resolved IP address is sent to an upstream proxy. `WithDisableProxy` disables both explicit and environment proxy settings.
 
 `WithDisableHTTP2` forces HTTP/1.1 upstream traffic and disables h2c handling. When HTTP/2 is enabled, h2c prior-knowledge connections can be inspected; HTTP/1.1 `Upgrade: h2c` handshakes are forwarded transparently as passthrough tunnels.
