@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"net/http/httputil"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -149,14 +151,7 @@ func main() {
 		// mitmproxy.WithIncludeHosts("ifconfig.co", "*.example.com", "example.com", "*.bilibili.com"),
 		// mitmproxy.WithIncludeHosts("api.bilibili.com"),
 		// mitmproxy.WithExcludeHosts("www.baidu.com"),
-		mitmproxy.WithExcludeHosts(
-			"storeedgefd.dsx.mp.microsoft.com",
-			"cdn.storeedgefd.dsx.mp.microsoft.com",
-			"displaycatalog.mp.microsoft.com",
-			"purchase.md.mp.microsoft.com",
-			"licensing.mp.microsoft.com",
-		),
-		mitmproxy.WithProxy("http://127.0.0.1:7890"),
+		// mitmproxy.WithProxy("http://127.0.0.1:7900"),
 		// mitmproxy.WithDisableProxy(),
 		// mitmproxy.WithDisableHTTP2(),
 		// mitmproxy.WithSkipVerifySSLFromServer(),
@@ -227,33 +222,33 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 		slog.String("proto", req.Proto),
 		slog.String("method", req.Method),
 		slog.String("url", req.URL.String()),
-		// slog.Any("headers", map[string][]string(req.Header)),
+		slog.Any("headers", map[string][]string(req.Header)),
 	)
 
-	// if md.TLSState != nil {
-	// 	slog.Debug("tls state",
-	// 		slog.String("server_name", md.TLSState.ServerName),
-	// 		slog.String("alpn", strings.Join(md.TLSState.ALPN, ",")),
-	// 		slog.String("selected_ciphersuite", tls.CipherSuiteName(md.TLSState.SelectedCipherSuite)),
-	// 		slog.String("selected_version", tls.VersionName(md.TLSState.SelectedTLSVersion)),
-	// 		slog.String("selected_alpn", md.TLSState.SelectedALPN),
-	// 	)
-	// }
-	// if md.ServerCertificate != nil {
-	// 	slog.Debug("server certificate",
-	// 		slog.Int("version", md.ServerCertificate.Version),
-	// 		slog.String("not_after", md.ServerCertificate.NotAfter.String()),
-	// 		slog.String("not_before", md.ServerCertificate.NotBefore.String()),
-	// 		slog.String("subject", md.ServerCertificate.Subject.String()),
-	// 		slog.String("issuer", md.ServerCertificate.Issuer.String()),
-	// 		slog.String("serial_number", md.ServerCertificate.SerialNumberHex()),
-	// 		slog.String("signature_algorithm", md.ServerCertificate.SignatureAlgorithm.String()),
-	// 		slog.String("sha1_fingerprint", md.ServerCertificate.Sha1FingerprintHex()),
-	// 		slog.String("sha256_fingerprint", md.ServerCertificate.Sha256FingerprintHex()),
-	// 		slog.String("dns", strings.Join(md.ServerCertificate.DNSNames, ",")),
-	// 		slog.Any("ip", md.ServerCertificate.IPAddresses),
-	// 	)
-	// }
+	if md.TLSState != nil {
+		slog.Debug("tls state",
+			slog.String("server_name", md.TLSState.ServerName),
+			slog.String("alpn", strings.Join(md.TLSState.ALPN, ",")),
+			slog.String("selected_ciphersuite", tls.CipherSuiteName(md.TLSState.SelectedCipherSuite)),
+			slog.String("selected_version", tls.VersionName(md.TLSState.SelectedTLSVersion)),
+			slog.String("selected_alpn", md.TLSState.SelectedALPN),
+		)
+	}
+	if md.ServerCertificate != nil {
+		slog.Debug("server certificate",
+			slog.Int("version", md.ServerCertificate.Version),
+			slog.String("not_after", md.ServerCertificate.NotAfter.String()),
+			slog.String("not_before", md.ServerCertificate.NotBefore.String()),
+			slog.String("subject", md.ServerCertificate.Subject.String()),
+			slog.String("issuer", md.ServerCertificate.Issuer.String()),
+			slog.String("serial_number", md.ServerCertificate.SerialNumberHex()),
+			slog.String("signature_algorithm", md.ServerCertificate.SignatureAlgorithm.String()),
+			slog.String("sha1_fingerprint", md.ServerCertificate.Sha1FingerprintHex()),
+			slog.String("sha256_fingerprint", md.ServerCertificate.Sha256FingerprintHex()),
+			slog.String("dns", strings.Join(md.ServerCertificate.DNSNames, ",")),
+			slog.Any("ip", md.ServerCertificate.IPAddresses),
+		)
+	}
 
 	req.Body, _ = newBodyDecoder(req.Body, req.Header.Get("Content-Encoding"), CHUNK_TYPE_REQ)
 
@@ -265,19 +260,19 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	slog.Debug("response",
 		slog.Time("local_connection_establishment", md.LocalConnectionEstablishedTs),
 		slog.Time("remote_connection_establishment", md.RemoteConnectionEstablishedTs),
-		// slog.Time("dns_lookup_start", md.DNSLookupStartTs),
-		// slog.Time("dns_lookup_completed", md.DNSLookupCompletedTs),
-		// slog.Duration("dns_lookup_duration", durationBetween(md.DNSLookupStartTs, md.DNSLookupCompletedTs)),
-		// slog.Time("socket_connect_start", md.SocketConnectStartTs),
-		// slog.Time("socket_connect_completed", md.SocketConnectCompletedTs),
-		// slog.Duration("socket_connect_duration", durationBetween(md.SocketConnectStartTs, md.SocketConnectCompletedTs)),
-		// slog.Time("ssl_handshake_start", md.SSLHandshakeStartTs),
-		// slog.Time("ssl_handshake_completed", md.SSLHandshakeCompletedTs),
-		// slog.Duration("ssl_handshake_duration", durationBetween(md.SSLHandshakeStartTs, md.SSLHandshakeCompletedTs)),
-		// slog.Time("request_processed", md.RequestProcessedTs),
+		slog.Time("dns_lookup_start", md.DNSLookupStartTs),
+		slog.Time("dns_lookup_completed", md.DNSLookupCompletedTs),
+		slog.Duration("dns_lookup_duration", durationBetween(md.DNSLookupStartTs, md.DNSLookupCompletedTs)),
+		slog.Time("socket_connect_start", md.SocketConnectStartTs),
+		slog.Time("socket_connect_completed", md.SocketConnectCompletedTs),
+		slog.Duration("socket_connect_duration", durationBetween(md.SocketConnectStartTs, md.SocketConnectCompletedTs)),
+		slog.Time("ssl_handshake_start", md.SSLHandshakeStartTs),
+		slog.Time("ssl_handshake_completed", md.SSLHandshakeCompletedTs),
+		slog.Duration("ssl_handshake_duration", durationBetween(md.SSLHandshakeStartTs, md.SSLHandshakeCompletedTs)),
+		slog.Time("request_processed", md.RequestProcessedTs),
 		slog.String("status", rsp.Status),
 		slog.String("protocol", rsp.Proto),
-		// slog.Any("headers", map[string][]string(rsp.Header)),
+		slog.Any("headers", map[string][]string(rsp.Header)),
 	)
 
 	rsp.Body, err = newBodyDecoder(rsp.Body, rsp.Header.Get("Content-Encoding"), CHUNK_TYPE_RSP)
@@ -316,30 +311,30 @@ func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Resp
 	data, _ = httputil.DumpResponse(rsp, false)
 	fmt.Printf("%s\n", string(data))
 
-	// if md.TLSState != nil {
-	// 	slog.Debug("tls state",
-	// 		slog.String("server_name", md.TLSState.ServerName),
-	// 		slog.String("alpn", strings.Join(md.TLSState.ALPN, ",")),
-	// 		slog.String("selected_ciphersuite", tls.CipherSuiteName(md.TLSState.SelectedCipherSuite)),
-	// 		slog.String("selected_version", tls.VersionName(md.TLSState.SelectedTLSVersion)),
-	// 		slog.String("selected_alpn", md.TLSState.SelectedALPN),
-	// 	)
-	// }
-	// if md.ServerCertificate != nil {
-	// 	slog.Debug("server certificate",
-	// 		slog.Int("version", md.ServerCertificate.Version),
-	// 		slog.String("not_after", md.ServerCertificate.NotAfter.String()),
-	// 		slog.String("not_before", md.ServerCertificate.NotBefore.String()),
-	// 		slog.String("subject", md.ServerCertificate.Subject.String()),
-	// 		slog.String("issuer", md.ServerCertificate.Issuer.String()),
-	// 		slog.String("serial_number", md.ServerCertificate.SerialNumberHex()),
-	// 		slog.String("signature_algorithm", md.ServerCertificate.SignatureAlgorithm.String()),
-	// 		slog.String("sha1_fingerprint", md.ServerCertificate.Sha1FingerprintHex()),
-	// 		slog.String("sha256_fingerprint", md.ServerCertificate.Sha256FingerprintHex()),
-	// 		slog.String("dns", strings.Join(md.ServerCertificate.DNSNames, ",")),
-	// 		slog.Any("ip", md.ServerCertificate.IPAddresses),
-	// 	)
-	// }
+	if md.TLSState != nil {
+		slog.Debug("tls state",
+			slog.String("server_name", md.TLSState.ServerName),
+			slog.String("alpn", strings.Join(md.TLSState.ALPN, ",")),
+			slog.String("selected_ciphersuite", tls.CipherSuiteName(md.TLSState.SelectedCipherSuite)),
+			slog.String("selected_version", tls.VersionName(md.TLSState.SelectedTLSVersion)),
+			slog.String("selected_alpn", md.TLSState.SelectedALPN),
+		)
+	}
+	if md.ServerCertificate != nil {
+		slog.Debug("server certificate",
+			slog.Int("version", md.ServerCertificate.Version),
+			slog.String("not_after", md.ServerCertificate.NotAfter.String()),
+			slog.String("not_before", md.ServerCertificate.NotBefore.String()),
+			slog.String("subject", md.ServerCertificate.Subject.String()),
+			slog.String("issuer", md.ServerCertificate.Issuer.String()),
+			slog.String("serial_number", md.ServerCertificate.SerialNumberHex()),
+			slog.String("signature_algorithm", md.ServerCertificate.SignatureAlgorithm.String()),
+			slog.String("sha1_fingerprint", md.ServerCertificate.Sha1FingerprintHex()),
+			slog.String("sha256_fingerprint", md.ServerCertificate.Sha256FingerprintHex()),
+			slog.String("dns", strings.Join(md.ServerCertificate.DNSNames, ",")),
+			slog.Any("ip", md.ServerCertificate.IPAddresses),
+		)
+	}
 
 	for {
 		select {

@@ -198,6 +198,54 @@ func TestUnknownLengthResponseClosesConnection(t *testing.T) {
 	}
 }
 
+func TestHEADResponseWithoutContentLengthKeepsConnection(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+
+	served := make(chan error, 1)
+	go func() {
+		conn, err := upstream.Accept()
+		if err != nil {
+			served <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for range 2 {
+			request, err := http.ReadRequest(reader)
+			if err != nil {
+				served <- err
+				return
+			}
+			_ = request.Body.Close()
+			if _, err := io.WriteString(conn, "HTTP/1.1 200 OK\r\n\r\n"); err != nil {
+				served <- err
+				return
+			}
+		}
+		served <- nil
+	}()
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	conn, reader := dialProxy(t, listener)
+	host := upstream.Addr().String()
+	for range 2 {
+		if _, err := fmt.Fprintf(conn, "HEAD http://%s/x HTTP/1.1\r\nHost: %s\r\n\r\n", host, host); err != nil {
+			t.Fatal(err)
+		}
+		response, _ := readProxyResponse(t, reader, http.MethodHead)
+		if response.Close {
+			t.Fatal("HEAD response without Content-Length unexpectedly closed the connection")
+		}
+	}
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // An upstream that drops its keep-alive connection while idle must not turn the
 // next request into a dropped client connection.
 func TestStaleUpstreamConnectionIsReplaced(t *testing.T) {
@@ -273,6 +321,51 @@ func TestPlainProxyKeepAliveRetargets(t *testing.T) {
 		response, body := readProxyResponse(t, reader, http.MethodGet)
 		if response.StatusCode != http.StatusOK || body != want.body {
 			t.Fatalf("response = %d %q; want 200 %q", response.StatusCode, body, want.body)
+		}
+	}
+}
+
+func TestPlainProxyRetargetHonorsHostFilters(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	listener := startKeepAliveProxy(t,
+		WithDisableHTTP2(),
+		WithExcludeHosts("127.0.0.1"),
+		WithHTTPInterceptor(func(ctx context.Context, req *http.Request, next HTTPDelegatedInvoker) (*http.Response, error) {
+			response, err := next.Invoke(req)
+			if err == nil {
+				response.Header.Set("X-Intercepted", "yes")
+			}
+			return response, err
+		}))
+	conn, reader := dialProxy(t, listener)
+
+	ipHost := strings.TrimPrefix(upstream.URL, "http://")
+	_, port, err := net.SplitHostPort(ipHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localHost := net.JoinHostPort("localhost", port)
+	for _, test := range []struct {
+		target      string
+		host        string
+		intercepted string
+	}{
+		{"http://" + localHost + "/first", localHost, "yes"},
+		{upstream.URL + "/second", ipHost, ""},
+	} {
+		if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\n\r\n", test.target, test.host); err != nil {
+			t.Fatal(err)
+		}
+		response, body := readProxyResponse(t, reader, http.MethodGet)
+		if response.StatusCode != http.StatusOK || body != "ok" {
+			t.Fatalf("response = %d %q; want 200 ok", response.StatusCode, body)
+		}
+		if got := response.Header.Get("X-Intercepted"); got != test.intercepted {
+			t.Fatalf("X-Intercepted = %q; want %q", got, test.intercepted)
 		}
 	}
 }
@@ -553,7 +646,7 @@ func TestStalledClientResponseWriteTimesOut(t *testing.T) {
 // An upgrade that arrives after an ordinary request must not be written onto
 // the tunnel connection, which by then belongs to the transport.
 func TestUpgradeAfterKeepAliveRequestUsesFreshUpstream(t *testing.T) {
-	upstream := startUpgradeAwareUpstream(t)
+	upstream, firstConnectionClosed := startUpgradeAwareUpstream(t)
 	listener := startKeepAliveProxy(t)
 	conn, reader := dialProxy(t, listener)
 
@@ -581,6 +674,11 @@ func TestUpgradeAfterKeepAliveRequestUsesFreshUpstream(t *testing.T) {
 	if line != "ECHO-READY\r\n" {
 		t.Fatalf("upgrade response = %q; want ECHO-READY", line)
 	}
+	select {
+	case <-firstConnectionClosed:
+	case <-time.After(time.Second):
+		t.Fatal("ordinary-request upstream remained open after protocol upgrade")
+	}
 	if _, err := io.WriteString(conn, "tunnelled\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -591,21 +689,27 @@ func TestUpgradeAfterKeepAliveRequestUsesFreshUpstream(t *testing.T) {
 
 // startUpgradeAwareUpstream answers ordinary requests with a fixed body and
 // turns into an echo server once it sees an h2c upgrade.
-func startUpgradeAwareUpstream(t *testing.T) string {
+func startUpgradeAwareUpstream(t *testing.T) (string, <-chan struct{}) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
+	firstConnectionClosed := make(chan struct{})
+	var accepted atomic.Int64
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
+			connectionNumber := accepted.Add(1)
 			go func() {
 				defer conn.Close()
+				if connectionNumber == 1 {
+					defer close(firstConnectionClosed)
+				}
 				reader := bufio.NewReader(conn)
 				for {
 					request, err := http.ReadRequest(reader)
@@ -627,7 +731,7 @@ func startUpgradeAwareUpstream(t *testing.T) string {
 			}()
 		}
 	}()
-	return listener.Addr().String()
+	return listener.Addr().String(), firstConnectionClosed
 }
 
 func startEchoServer(t *testing.T) string {
