@@ -192,14 +192,39 @@ func (c *remoteClientConn) Close() error {
 }
 
 type biConnContext struct {
-	local     *localClientConn
-	remote    *remoteClientConn
-	transport *singleConnTransport
-	config    *runtimeConfig
+	local  *localClientConn
+	remote *remoteClientConn
+	config *runtimeConfig
 
 	baseMetadata connectionMetadataRecorder
 	remoteDialMu sync.Mutex
 	remoteDialFn func(context.Context, string, string) (net.Conn, error)
+
+	// transport is replaced when a plain proxy connection is reused for a new
+	// origin, and it is read by Cleanup from another goroutine.
+	transportMu sync.Mutex
+	transport   *singleConnTransport
+}
+
+func (c *biConnContext) currentTransport() *singleConnTransport {
+	c.transportMu.Lock()
+	defer c.transportMu.Unlock()
+	return c.transport
+}
+
+// setTransport installs transport and returns the one it replaced.
+func (c *biConnContext) setTransport(transport *singleConnTransport) *singleConnTransport {
+	c.transportMu.Lock()
+	previous := c.transport
+	c.transport = transport
+	c.transportMu.Unlock()
+	return previous
+}
+
+func (c *biConnContext) closeTransport() {
+	if transport := c.setTransport(nil); transport != nil {
+		_ = transport.Close()
+	}
 }
 
 func (c *biConnContext) dialRemote(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -278,6 +303,8 @@ type MitmProxyHandler interface {
 	// high-level application api
 	// ServeSOCKS5 will take over net.Conn and call the Close function
 	ServeSOCKS5(context.Context, net.Conn) error
+	// ServeHTTP requires Request.Body to be untouched on entry. Do not wrap
+	// this handler with middleware that reads or replaces Body.
 	ServeHTTP(http.ResponseWriter, *http.Request)
 
 	Cleanup()
@@ -406,8 +433,10 @@ func (r *mitmProxyHandler) closeActiveConns() int {
 	r.activeMu.Unlock()
 
 	for _, conn := range conns {
-		if conn.connCtx != nil && conn.connCtx.transport != nil {
-			_ = conn.connCtx.transport.Close()
+		if conn.connCtx != nil {
+			if transport := conn.connCtx.currentTransport(); transport != nil {
+				_ = transport.Close()
+			}
 		}
 		_ = conn.Close()
 	}
@@ -439,9 +468,6 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		return
 	}
-	if rw != nil {
-		conn = newBufConnExt(conn, rw)
-	}
 	request := req
 	hostport, err = ParseHostPort(req)
 	if err != nil {
@@ -450,11 +476,20 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if req.Method == http.MethodConnect {
 		request = nil
+		if rw != nil {
+			conn = newBufConnExt(conn, rw)
+		}
 	} else if req.URL != nil && len(req.URL.Scheme) == 0 {
 		// directly access proxy server and url scheme is empty
 		err = ErrInvalidProxyRequest
 		conn.Close()
 		return
+	} else {
+		request, conn, err = rebindRequestBodyAfterHijack(req, conn, rw)
+		if err != nil {
+			conn.Close()
+			return
+		}
 	}
 	_ = r.Serve(AppendToRequestContext(req.Context(), ReqContext{
 		Hostport:          hostport,
@@ -582,8 +617,13 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	initialRemoteConn := remote.innerConn
 	initialRemoteConnUsed := false
 	connCtx.setRemoteDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == "" {
+			addr = reqCtx.Hostport
+		}
 		connCtx.remoteDialMu.Lock()
-		if !initialRemoteConnUsed {
+		// The already established connection belongs to the target it was
+		// dialed for; a retargeted transport has to dial its own.
+		if !initialRemoteConnUsed && addr == reqCtx.Hostport {
 			initialRemoteConnUsed = true
 			conn := initialRemoteConn
 			connCtx.remoteDialMu.Unlock()
@@ -593,14 +633,16 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 			return conn, nil
 		}
 		connCtx.remoteDialMu.Unlock()
-		return connCtx.dialTCPWithMetadata(ctx, reqCtx.Hostport)
+		return connCtx.dialTCPWithMetadata(ctx, addr)
 	})
-	connCtx.transport = newTransport(reqCtx.Hostport, func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return connCtx.dialRemote(ctx, network, addr)
-	}, cfg.state.idleConnTimeout, cfg.state.disableHTTP2)
+	connCtx.setTransport(newTransportForTarget(connCtx, reqCtx.Hostport))
 
 	defer local.Close()
-	defer connCtx.transport.Close()
+	defer func() {
+		if transport := connCtx.currentTransport(); transport != nil {
+			_ = transport.Close()
+		}
+	}()
 
 	if reqCtx.HttpConnectMethod {
 		if _, err = conn.Write(HttpResponseConnectionEstablished); err != nil {
@@ -628,6 +670,30 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 	return r.handleTunnelRequest(ctx, reqCtx.Request != nil)
 }
 
+func newTransportForTarget(connCtx *biConnContext, hostport string) *singleConnTransport {
+	return newTransport(hostport, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return connCtx.dialRemote(ctx, network, addr)
+	}, connCtx.config.state.idleConnTimeout, connCtx.config.state.disableHTTP2)
+}
+
+// retargetTunnel points a plain proxy connection at a new upstream. Such a
+// connection is not bound to a single origin: clients reuse it for any host,
+// and Go's own http.Transport does exactly that because it leaves the target
+// out of the pool key for http:// requests sent through an HTTP proxy.
+func (r *mitmProxyHandler) retargetTunnel(ctx context.Context, connCtx *biConnContext, hostport string) error {
+	if r.isClosed() {
+		return net.ErrClosed
+	}
+	previous := connCtx.setTransport(newTransportForTarget(connCtx, hostport))
+	if previous != nil {
+		_ = previous.Close()
+	}
+	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http keep-alive retargeted",
+		slog.String("hostport", hostport),
+	)
+	return nil
+}
+
 func shouldPassthroughRequest(cfg *runtimeConfig, hostport string) (bool, string) {
 	host, _, _ := net.SplitHostPort(hostport)
 
@@ -653,7 +719,8 @@ func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn, dstCo
 	if reqCtx.Request != nil {
 		// we should copy the request to dst connection firstly
 		// TODO: if upload large file, this will cause performance problem
-		if err := reqCtx.Request.Write(dstConn); err != nil {
+		request := withoutForwardedExpectContinue(reqCtx.Request)
+		if err := request.Write(dstConn); err != nil {
 			return err
 		}
 	} else {
@@ -1127,7 +1194,9 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		clearDeadline()
 		dstConn = result.conn
 		connCtx.remote.innerConn = dstConn
-		connCtx.transport.setNegotiatedProtocol(result.negotiatedProtocol)
+		if transport := connCtx.currentTransport(); transport != nil {
+			transport.setNegotiatedProtocol(result.negotiatedProtocol)
+		}
 		r.setTLSRemoteDialer(connCtx, reqCtx.Hostport, dstConn, result.hello)
 		srcConn = tlsConn
 		fakerw = newFakeHttpResponseWriter(srcConn)
@@ -1161,12 +1230,21 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 
 	request := reqCtx.Request
 	firstRead := request == nil
+	// Only a plain proxy connection carries absolute-URI requests that the
+	// client may point at any origin. A CONNECT tunnel, a SOCKS5 connection and
+	// a transparent connection are all pinned to the target their client
+	// selected out of band, so for those a changing authority is a request
+	// smuggling attempt rather than ordinary connection reuse.
+	canRetarget := consumedRequest && !reqCtx.HttpConnectMethod && !reqCtx.Socks5Connect
 	for {
 		reqCtx, _ := FromRequestContext(ctx)
 		nextCtx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest, firstRead)
 		if err != nil || earlyDone {
 			if request == nil && isExpectedIdleReadClose(err) {
 				return nil
+			}
+			if _, ok := errors.AsType[*requestParseError](err); ok {
+				writeHTTP1ErrorResponse(srcConn, statusCodeForRequestError(err))
 			}
 			return err
 		}
@@ -1175,17 +1253,48 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 
 		nextReqCtx, _ := FromRequestContext(nextCtx)
 		if !requestMatchesHostport(nextReqCtx.Request, reqCtx.Hostport) {
-			return fmt.Errorf("http keep-alive target changed from %s to %s", reqCtx.Hostport, nextReqCtx.Request.Host)
+			if !canRetarget {
+				writeHTTP1ErrorResponse(srcConn, http.StatusMisdirectedRequest)
+				return fmt.Errorf("http keep-alive target changed from %s to %s", reqCtx.Hostport, nextReqCtx.Request.Host)
+			}
+			hostport, err := ParseHostPort(nextReqCtx.Request)
+			if err != nil {
+				writeHTTP1ErrorResponse(srcConn, http.StatusBadRequest)
+				return err
+			}
+			if err = r.retargetTunnel(ctx, connCtx, hostport); err != nil {
+				writeHTTP1ErrorResponse(srcConn, http.StatusBadGateway)
+				return err
+			}
+			reqCtx.Hostport, nextReqCtx.Hostport = hostport, hostport
+			ctx = AppendToRequestContext(ctx, reqCtx)
+			nextCtx = AppendToRequestContext(nextCtx, nextReqCtx)
 		}
 		nextCtx = cloneMetadataContext(nextCtx)
 		if md, ok := metadata.FromContext(nextCtx); ok {
 			md.SetRequestReceivedTs(time.Now())
+			md.SetRequestHostport(nextReqCtx.Hostport)
 		}
+		passthrough, passthroughReason := shouldPassthroughRequest(connCtx.config, nextReqCtx.Hostport)
+		logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "http keep-alive interception decision",
+			slog.String("hostport", nextReqCtx.Hostport),
+			slog.Bool("passthrough", passthrough),
+			slog.String("reason", passthroughReason),
+		)
 
 		if isWsUpgrade {
-			return r.relayConnForWS(nextCtx, newBufConnExt(srcConn, fakerw.bufRW), dstConn)
+			// Take the upstream connection from the dialer rather than reusing
+			// the one established with the tunnel: on a keep-alive connection
+			// an earlier request may already have handed it to the transport,
+			// and writing a handshake onto it would corrupt that stream.
+			connCtx.closeTransport()
+			wsConn, err := connCtx.dialRemote(nextCtx, "tcp", nextReqCtx.Hostport)
+			if err != nil {
+				return err
+			}
+			return r.relayConnForWS(nextCtx, newBufConnExt(srcConn, fakerw.bufRW), wsConn)
 		}
-		response, err := r.relayConnForHTTP(nextCtx, srcConn)
+		response, err := r.relayConnForHTTP(nextCtx, srcConn, !passthrough)
 		if err != nil {
 			return err
 		}
@@ -1203,6 +1312,168 @@ func shouldCloseHTTP1(req *http.Request, response *http.Response) bool {
 		return true
 	}
 	return response != nil && response.Close
+}
+
+// requestParseError marks a failure to read or parse an HTTP/1 request from the
+// client, as opposed to a failure that happened once the connection had already
+// been handed over to another protocol. Only the former can still be answered
+// with an HTTP error response.
+type requestParseError struct{ err error }
+
+func (e *requestParseError) Error() string { return e.err.Error() }
+func (e *requestParseError) Unwrap() error { return e.err }
+
+// prepareHTTP1Response settles the response framing before a single byte
+// reaches the client, so that shouldCloseHTTP1 agrees with what is actually put
+// on the wire.
+//
+// [http.Response.Write] applies the "unknown body length implies close" rule to
+// a private copy of the response, so a response written with Connection: close
+// would otherwise leave response.Close false and the proxy would keep waiting
+// for another request on a connection the client believes is ending.
+func prepareHTTP1Response(req *http.Request, response *http.Response) error {
+	if response == nil {
+		return nil
+	}
+	if response.Request == nil {
+		// [http.Response.Write] needs it to know a response to HEAD carries no
+		// body despite its Content-Length.
+		response.Request = req
+	}
+	// Mirror the probe [http.Response.Write] performs to tell an empty body
+	// apart from one of unknown length.
+	if response.ContentLength == 0 && response.Body != nil && response.Body != http.NoBody {
+		var probe [1]byte
+		n, err := response.Body.Read(probe[:])
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n == 0 {
+			response.Body = http.NoBody
+		} else {
+			response.ContentLength = -1
+			response.Body = struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(bytes.NewReader(probe[:1]), response.Body), response.Body}
+		}
+	}
+
+	// RFC 9112 7.1: chunked must not be sent to an HTTP/1.0 client. Drop back
+	// to a body delimited by connection close, which every HTTP/1.0 client
+	// understands.
+	if requestIsHTTP10(req) && chunkedTransferEncoding(response.TransferEncoding) {
+		response.TransferEncoding = nil
+		response.ContentLength = -1
+	}
+
+	// A body of unknown length can only be delimited by closing the connection.
+	// HEAD, 1xx, 204 and 304 responses have no body, so their missing length
+	// does not affect connection reuse.
+	if response.ContentLength < 0 && !chunkedTransferEncoding(response.TransferEncoding) {
+		if http1ResponseBodyAllowed(req, response.StatusCode) {
+			response.Close = true
+		} else {
+			// Response.Write otherwise applies its unknown-length close rule to
+			// a private copy even though no body needs delimiting.
+			response.ContentLength = 0
+		}
+	}
+
+	// An HTTP/1.0 client assumes the connection closes after the response
+	// unless it is told otherwise.
+	if requestIsHTTP10(req) && !response.Close && !req.Close {
+		response.Header.Set(HttpHeaderConnection, "keep-alive")
+	}
+	return nil
+}
+
+func requestIsHTTP10(req *http.Request) bool {
+	return req != nil && req.ProtoMajor == 1 && req.ProtoMinor == 0
+}
+
+func chunkedTransferEncoding(te []string) bool {
+	return len(te) > 0 && strings.EqualFold(te[len(te)-1], "chunked")
+}
+
+func http1ResponseBodyAllowed(req *http.Request, statusCode int) bool {
+	if req != nil && req.Method == http.MethodHead {
+		return false
+	}
+	return statusCode >= 200 &&
+		statusCode != http.StatusNoContent &&
+		statusCode != http.StatusNotModified
+}
+
+// writeHTTP1Response coalesces the status line and header block into a single
+// write. [http.Response.Write] emits four writes per header field, which on a
+// raw connection is four syscalls and on a TLS connection four TLS records. The
+// body is streamed straight through so responses that trickle are not delayed.
+func writeHTTP1Response(dst io.Writer, response *http.Response) error {
+	writer := &http1ResponseWriter{dst: dst}
+	err := response.Write(writer)
+	if flushErr := writer.flush(); err == nil {
+		err = flushErr
+	}
+	return err
+}
+
+// maxBufferedResponseHeaderBytes bounds how much of a response is held back
+// while looking for the end of the header block.
+const maxBufferedResponseHeaderBytes = 64 << 10
+
+type http1ResponseWriter struct {
+	dst        io.Writer
+	buf        []byte
+	headerDone bool
+}
+
+func (w *http1ResponseWriter) Write(data []byte) (int, error) {
+	if w.headerDone {
+		return w.dst.Write(data)
+	}
+	w.buf = append(w.buf, data...)
+	if index := bytes.Index(w.buf, []byte("\r\n\r\n")); index >= 0 {
+		w.headerDone = true
+		pending := w.buf
+		w.buf = nil
+		if _, err := w.dst.Write(pending); err != nil {
+			return 0, err
+		}
+		return len(data), nil
+	}
+	if len(w.buf) >= maxBufferedResponseHeaderBytes {
+		if err := w.flush(); err != nil {
+			return 0, err
+		}
+		w.headerDone = true
+	}
+	return len(data), nil
+}
+
+func (w *http1ResponseWriter) flush() error {
+	if len(w.buf) == 0 {
+		return nil
+	}
+	pending := w.buf
+	w.buf = nil
+	_, err := w.dst.Write(pending)
+	return err
+}
+
+// writeHTTP1ErrorResponse answers a request the proxy could not act on. Without
+// it the client only sees the connection disappear and cannot tell a rejected
+// request apart from a network failure.
+func writeHTTP1ErrorResponse(dst io.Writer, statusCode int) {
+	_, _ = fmt.Fprintf(dst, "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		statusCode, http.StatusText(statusCode))
+}
+
+func statusCodeForRequestError(err error) int {
+	if errors.Is(err, ErrHTTPHeaderTooLarge) {
+		return http.StatusRequestHeaderFieldsTooLarge
+	}
+	return http.StatusBadRequest
 }
 
 func requestMatchesHostport(req *http.Request, hostport string) bool {
@@ -1264,7 +1535,7 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	// Handle h2c with prior knowledge (RFC 7540 Section 3.4)
 	if req.Method == "PRI" && len(req.Header) == 0 && req.URL.Path == "*" && req.Proto == "HTTP/2.0" {
-		conn, err := initH2CWithPriorKnowledge(rw)
+		conn, err := initH2CWithPriorKnowledge(rw, connCtx.config.state.handshakeTimeout)
 		if err != nil {
 			return false, err
 		}
@@ -1308,6 +1579,7 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 // upstream and then tunnels the upgraded HTTP/2 bytes in both directions.
 func (r *mitmProxyHandler) passthroughH2CUpgrade(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	reqCtx, _ := FromRequestContext(ctx)
 	srcConn, rwc, err := http.NewResponseController(rw).Hijack()
 	if err != nil {
 		return err
@@ -1316,10 +1588,17 @@ func (r *mitmProxyHandler) passthroughH2CUpgrade(ctx context.Context, rw http.Re
 		srcConn = newBufConnExt(srcConn, rwc)
 	}
 
-	if err := writeH2CUpgradeRequestHeaders(connCtx.remote, req); err != nil {
+	// As for the WebSocket handshake, the tunnel connection may already belong
+	// to the transport by the time a keep-alive connection reaches an upgrade.
+	connCtx.closeTransport()
+	dstConn, err := connCtx.dialRemote(ctx, "tcp", reqCtx.Hostport)
+	if err != nil {
 		return err
 	}
-	return iocopy.IoCopyBidirectional(connCtx.remote, srcConn)
+	if err := writeH2CUpgradeRequestHeaders(dstConn, req); err != nil {
+		return err
+	}
+	return iocopy.IoCopyBidirectional(dstConn, srcConn)
 }
 
 func writeH2CUpgradeRequestHeaders(dst io.Writer, req *http.Request) error {
@@ -1376,7 +1655,6 @@ func writeH2CUpgradeRequestHeaders(dst io.Writer, req *http.Request) error {
 func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *fakeHttpResponseWriter, request *http.Request, tlsRequest, firstRead bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
-	clearDeadline := func() {}
 
 	// Read the http request for https/wss via tls tunnel
 
@@ -1386,24 +1664,27 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 		if firstRead {
 			readTimeout = connCtx.config.state.handshakeTimeout
 		}
-		clearDeadline = setReadDeadlineForTimeout(fakerw.conn, readTimeout)
+		// The deadline must be cleared before anything that takes over the
+		// connection for its whole lifetime (an h2c session, an upgrade
+		// passthrough), otherwise that connection inherits it and dies once it
+		// expires no matter how much traffic is flowing.
+		clearDeadline := setReadDeadlineForTimeout(fakerw.conn, readTimeout)
 		var err error
 		request, err = fakerw.ReadRequest(connCtx.config.state.maxHTTPHeaderBytes)
+		clearDeadline()
 		if err != nil {
-			clearDeadline()
-			retErr = err
+			retErr = &requestParseError{err: err}
 			return
 		}
 	}
+	request = prepareHijackedRequestBody(request, request, fakerw.conn)
 
 	if !connCtx.config.state.disableHTTP2 {
 		earlyDone, retErr = r.handlePrefaceOrH2CRequest(ctx, fakerw, request)
 		if retErr != nil || earlyDone {
-			clearDeadline()
 			return
 		}
 	}
-	clearDeadline()
 
 	if tlsRequest {
 		request.URL.Scheme = "https"
@@ -1723,25 +2004,60 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	return
 }
 
-func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn net.Conn) (response *http.Response, err error) {
+func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn net.Conn, intercept bool) (response *http.Response, err error) {
+	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
-	response, err = r.roundTripWithContext(ctx, reqCtx.Request)
+	response, err = r.roundTripWithContextMode(ctx, reqCtx.Request, intercept)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
 	removeHopByHopHeaders(response.Header)
-	if err = response.Write(srcConn); err != nil {
+	if !beginHijackedFinalResponse(reqCtx.Request) {
+		response.Close = true
+	}
+	if err = prepareHTTP1Response(reqCtx.Request, response); err != nil {
+		return nil, err
+	}
+	// A client that stops reading must not pin this goroutine and the upstream
+	// connection forever. The deadline is per write, so a slow but progressing
+	// transfer of any size is unaffected.
+	writer := &stallGuardConn{Conn: srcConn, timeout: connCtx.config.state.idleConnTimeout}
+	defer writer.clearDeadline()
+	if err = writeHTTP1Response(writer, response); err != nil {
 		return nil, err
 	}
 	return
 }
 
+type stallGuardConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *stallGuardConn) Write(data []byte) (int, error) {
+	if c.timeout > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
+	}
+	return c.Conn.Write(data)
+}
+
+func (c *stallGuardConn) clearDeadline() {
+	if c.timeout > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Time{})
+	}
+}
+
 func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.Request) (response *http.Response, err error) {
+	return r.roundTripWithContextMode(ctx, req, true)
+}
+
+func (r *mitmProxyHandler) roundTripWithContextMode(ctx context.Context, req *http.Request, intercept bool) (response *http.Response, err error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
 	md, _ := metadata.FromContext(ctx)
-	if connCtx.transport == nil {
+	transport := connCtx.currentTransport()
+	if transport == nil {
 		return nil, errors.New("transport missing in connection context")
 	}
 
@@ -1756,10 +2072,10 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 		slog.String("proto", requestProto(req)),
 	)
 	// Only one http interceptor will be invoked
-	if connCtx.config.httpInt != nil {
-		response, err = connCtx.config.httpInt(ctx, req, HTTPDelegatedInvokerFunc(connCtx.transport.RoundTrip))
+	if intercept && connCtx.config.httpInt != nil {
+		response, err = connCtx.config.httpInt(ctx, req, HTTPDelegatedInvokerFunc(transport.RoundTrip))
 	} else {
-		response, err = connCtx.transport.RoundTrip(req)
+		response, err = transport.RoundTrip(req)
 	}
 	if err != nil {
 		err = fmt.Errorf("transport RoundTrip %s failed: %w", reqCtx.Hostport, err)

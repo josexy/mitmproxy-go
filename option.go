@@ -12,6 +12,7 @@ import (
 
 const (
 	defaultHandshakeTimeout          = 10 * time.Second
+	defaultIdleConnTimeout           = 90 * time.Second
 	defaultMaxHTTPHeaderBytes        = http.DefaultMaxHeaderBytes
 	defaultMaxWebsocketMessageBytes  = int64(16 << 20)
 	defaultMaxWebsocketBufferedBytes = int64(64 << 20)
@@ -80,6 +81,7 @@ func newOptions(opt ...Option) *options {
 		wsMaxMessageBytes:     defaultMaxWebsocketMessageBytes,
 		wsMaxBufferedBytes:    defaultMaxWebsocketBufferedBytes,
 		handshakeTimeout:      defaultHandshakeTimeout,
+		idleConnTimeout:       defaultIdleConnTimeout,
 		maxHTTPHeaderBytes:    defaultMaxHTTPHeaderBytes,
 		streamBaseCtx:         context.Background(),
 	}
@@ -253,7 +255,10 @@ func WithDialer(dialer *net.Dialer) Option {
 //
 // This helps to free up resources and prevent hanging connections.
 //
-// If not specified, no idle timeout is applied.
+// It also bounds how long an idle HTTP keep-alive connection, and the upstream
+// connection pinned to it, are kept around. Defaults to 90 seconds. Pass 0 to
+// disable it, at the cost of idle clients holding a goroutine and an upstream
+// connection indefinitely.
 //
 // Example:
 //
