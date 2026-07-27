@@ -126,6 +126,7 @@ func (t *singleConnTransport) shouldUseHTTP1Pipeline(req *http.Request) bool {
 }
 
 func (t *singleConnTransport) roundTripHTTP1(req *http.Request) (*http.Response, error) {
+	logger := loggerFromContext(req.Context())
 	for attempt := 0; ; attempt++ {
 		conn, err := t.getHTTP1PipelineConn(req.Context())
 		if err != nil {
@@ -139,7 +140,19 @@ func (t *singleConnTransport) roundTripHTTP1(req *http.Request) (*http.Response,
 
 		nextReq, retry := replayableRequest(req)
 		retry = attempt == 0 && retry
-		t.discardHTTP1PipelineConn(conn)
+		degraded := t.discardHTTP1PipelineConn(conn)
+		info := http1RequestInfo(req)
+		logAttrs(req.Context(), logger, slog.LevelWarn, "http1 upstream round trip failed",
+			slog.Uint64("pipeline_sequence", info.sequence),
+			slog.String("target", info.target),
+			slog.String("hostport", t.hostport),
+			slog.String("method", requestMethod(req)),
+			slog.String("url", requestURL(req)),
+			slog.Int("attempt", attempt),
+			slog.Bool("retry", retry),
+			slog.Bool("degraded", degraded),
+			errorAttr(err),
+		)
 		if retry {
 			req = nextReq
 			continue
@@ -171,19 +184,26 @@ func (t *singleConnTransport) getHTTP1PipelineConn(ctx context.Context) (*http1P
 		depth = 1
 	}
 	t.http1Conn = newHTTP1PipelineConn(conn, depth, t.idleTimeout)
+	logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "http1 upstream connection created",
+		slog.String("hostport", t.hostport),
+		slog.Int("pipeline_depth", depth),
+		slog.Bool("degraded", t.http1Degraded),
+	)
 	return t.http1Conn, nil
 }
 
-func (t *singleConnTransport) discardHTTP1PipelineConn(conn *http1PipelineConn) {
+func (t *singleConnTransport) discardHTTP1PipelineConn(conn *http1PipelineConn) bool {
 	t.mu.Lock()
 	if t.http1Conn != conn {
+		degraded := t.http1Degraded
 		t.mu.Unlock()
-		return
+		return degraded
 	}
 	t.http1Conn = nil
 	t.http1Degraded = true
 	t.mu.Unlock()
 	_ = conn.Close()
+	return true
 }
 
 func closeRequestBody(req *http.Request) {

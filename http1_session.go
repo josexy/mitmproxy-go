@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -18,12 +19,13 @@ type http1SessionResult struct {
 }
 
 type http1SessionItem struct {
-	ctx     context.Context
-	request *http.Request
-	result  chan http1SessionResult
-	ticket  *http1TargetTicket
-	prior   <-chan struct{}
-	written chan struct{}
+	ctx      context.Context
+	request  *http.Request
+	result   chan http1SessionResult
+	ticket   *http1TargetTicket
+	prior    <-chan struct{}
+	written  chan struct{}
+	queuedAt time.Time
 }
 
 type http1PriorResponsesDoneKey struct{}
@@ -53,11 +55,14 @@ func newHTTP1TargetPool(connCtx *biConnContext, initialKey string, limit int) *h
 	return pool
 }
 
-func (p *http1TargetPool) register(key, hostport string) *http1TargetTicket {
+func (p *http1TargetPool) register(ctx context.Context, key, hostport string) *http1TargetTicket {
 	p.mu.Lock()
 	var evicted *singleConnTransport
+	evictedTarget := ""
+	created := false
 	entry := p.entries[key]
 	if entry == nil {
+		created = true
 		if len(p.entries) >= p.limit {
 			var victimKey string
 			var victim *http1TargetEntry
@@ -70,6 +75,7 @@ func (p *http1TargetPool) register(key, hostport string) *http1TargetTicket {
 			if victim != nil {
 				delete(p.entries, victimKey)
 				evicted = victim.transport
+				evictedTarget = victimKey
 			}
 		}
 		ready := make(chan struct{})
@@ -86,10 +92,19 @@ func (p *http1TargetPool) register(key, hostport string) *http1TargetTicket {
 	turn := entry.tail
 	next := make(chan struct{})
 	entry.tail = next
+	targetCount := len(p.entries)
+	targetInFlight := entry.active
 	p.mu.Unlock()
 	if evicted != nil {
 		_ = evicted.Close()
 	}
+	logConfigAttrs(ctx, p.connCtx.config, slog.LevelDebug, "http1 pipeline target selected",
+		slog.String("target", key),
+		slog.Bool("created", created),
+		slog.String("evicted_target", evictedTarget),
+		slog.Int("target_count", targetCount),
+		slog.Int("target_in_flight", targetInFlight),
+	)
 	return &http1TargetTicket{transport: entry.transport, turn: turn, next: next, pool: p, entry: entry}
 }
 
@@ -182,9 +197,17 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 	request *http.Request,
 	tlsRequest, firstRead, canRetarget bool,
 	srcConn net.Conn,
-) error {
+) (retErr error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	baseReqCtx, _ := FromRequestContext(ctx)
+	started := time.Now()
+	defer func() {
+		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http1 pipeline session stopped",
+			slog.String("hostport", baseReqCtx.Hostport),
+			slog.Duration("session_duration", time.Since(started)),
+			errorAttr(retErr),
+		)
+	}()
 	initialScheme := "http"
 	if tlsRequest {
 		initialScheme = "https"
@@ -193,6 +216,12 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 	defer pool.Close()
 
 	depth := connCtx.config.state.http1PipelineDepth
+	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http1 pipeline session started",
+		slog.String("hostport", baseReqCtx.Hostport),
+		slog.Int("pipeline_depth", depth),
+		slog.Bool("tls", tlsRequest),
+		slog.Bool("can_retarget", canRetarget),
+	)
 	items := make(chan *http1SessionItem, depth)
 	slots := make(chan struct{}, depth)
 	stop := make(chan struct{})
@@ -209,6 +238,7 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 
 	priorWritten := make(chan struct{})
 	close(priorWritten)
+	var sequence uint64
 	for {
 		select {
 		case slots <- struct{}{}:
@@ -262,6 +292,11 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 		}
 
 		if wsUpgrade {
+			logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "http1 pipeline upgrade barrier",
+				slog.String("upgrade", "websocket"),
+				slog.String("hostport", hostport),
+				slog.Int("in_flight", len(slots)-1),
+			)
 			<-slots
 			if err := waitWriter(); err != nil {
 				return err
@@ -276,15 +311,28 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 
 		passthrough, _ := shouldPassthroughRequest(connCtx.config, hostport)
 		scheme := nextReqCtx.Request.URL.Scheme
-		ticket := pool.register(scheme+"://"+hostport, hostport)
+		target := scheme + "://" + hostport
+		ticket := pool.register(nextCtx, target, hostport)
+		sequence++
+		requestInfo := http1PipelineRequestInfo{sequence: sequence, target: target}
+		nextReqCtx.Request = nextReqCtx.Request.WithContext(context.WithValue(nextReqCtx.Request.Context(), http1PipelineRequestInfoKey{}, requestInfo))
 		item := &http1SessionItem{
-			ctx:     nextCtx,
-			request: nextReqCtx.Request,
-			result:  make(chan http1SessionResult, 1),
-			ticket:  ticket,
-			prior:   priorWritten,
-			written: make(chan struct{}),
+			ctx:      nextCtx,
+			request:  nextReqCtx.Request,
+			result:   make(chan http1SessionResult, 1),
+			ticket:   ticket,
+			prior:    priorWritten,
+			written:  make(chan struct{}),
+			queuedAt: time.Now(),
 		}
+		logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "http1 pipeline request queued",
+			slog.Uint64("pipeline_sequence", sequence),
+			slog.String("target", target),
+			slog.Int("in_flight", len(slots)),
+			slog.Int("pipeline_depth", depth),
+			slog.Bool("expect_continue", hijackedRequestNeedsContinue(item.request)),
+			slog.Bool("connection_close", item.request.Close),
+		)
 		priorWritten = item.written
 		select {
 		case items <- item:
@@ -295,6 +343,10 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 		}
 		go func() {
 			if hijackedRequestNeedsContinue(item.request) {
+				logConfigAttrs(item.ctx, connCtx.config, slog.LevelDebug, "http1 pipeline expect-continue barrier",
+					slog.Uint64("pipeline_sequence", requestInfo.sequence),
+					slog.String("target", requestInfo.target),
+				)
 				<-item.prior
 			}
 			response, roundTripErr := r.roundTripWithInvoker(item.ctx, item.request, !passthrough, ticket)
@@ -326,6 +378,12 @@ func (r *mitmProxyHandler) writeHTTP1Session(srcConn net.Conn, items <-chan *htt
 		result := <-item.result
 		response := result.response
 		if result.err != nil || response == nil {
+			info := http1RequestInfo(item.request)
+			logAttrs(item.ctx, loggerFromContext(item.ctx), slog.LevelWarn, "http1 pipeline request failed",
+				slog.Uint64("pipeline_sequence", info.sequence),
+				slog.String("target", info.target),
+				errorAttr(result.err),
+			)
 			response = &http.Response{
 				StatusCode:    http.StatusBadGateway,
 				Status:        "502 Bad Gateway",
@@ -355,6 +413,21 @@ func (r *mitmProxyHandler) writeHTTP1Session(srcConn net.Conn, items <-chan *htt
 		err := writeHTTP1Response(writer, response)
 		writer.clearDeadline()
 		closeErr := response.Body.Close()
+		info := http1RequestInfo(item.request)
+		level := slog.LevelDebug
+		if err != nil || closeErr != nil {
+			level = slog.LevelWarn
+		}
+		logAttrs(item.ctx, loggerFromContext(item.ctx), level, "http1 pipeline response written",
+			slog.Uint64("pipeline_sequence", info.sequence),
+			slog.String("target", info.target),
+			slog.Int("status_code", response.StatusCode),
+			slog.Bool("connection_close", shouldCloseHTTP1(item.request, response)),
+			slog.Int("in_flight", len(slots)),
+			slog.Duration("request_duration", time.Since(item.queuedAt)),
+			errorAttr(err),
+			namedErrorAttr("body_close_error", closeErr),
+		)
 		item.ticket.complete()
 		close(item.written)
 		<-slots

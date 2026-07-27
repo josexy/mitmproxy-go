@@ -139,6 +139,22 @@ func TestWithLoggerRecordsHTTPProxyFlow(t *testing.T) {
 	if got := attrString(responseLog, "hostport"); got == "" {
 		t.Fatalf("http response hostport was empty")
 	}
+	pipelineStart := requireLogMessage(t, sink, "http1 pipeline session started")
+	if got := attrInt(pipelineStart, "pipeline_depth"); got != defaultHTTP1PipelineDepth {
+		t.Fatalf("pipeline start depth = %d; want %d", got, defaultHTTP1PipelineDepth)
+	}
+	queued := requireLogMessage(t, sink, "http1 pipeline request queued")
+	if got := attrInt(queued, "pipeline_sequence"); got != 1 {
+		t.Fatalf("pipeline queued sequence = %d; want 1", got)
+	}
+	if got := attrString(queued, "target"); got == "" {
+		t.Fatal("pipeline queued target was empty")
+	}
+	requireLogMessage(t, sink, "http1 upstream request queued")
+	written := requireLogMessage(t, sink, "http1 pipeline response written")
+	if got := attrInt(written, "status_code"); got != http.StatusOK {
+		t.Fatalf("pipeline written status = %d; want 200", got)
+	}
 }
 
 func TestLoggerDefaultsToNoop(t *testing.T) {
@@ -372,6 +388,8 @@ func attrInt(record capturedLogRecord, key string) int {
 	case int:
 		return val
 	case int64:
+		return int(val)
+	case uint64:
 		return int(val)
 	default:
 		return 0

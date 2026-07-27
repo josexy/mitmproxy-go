@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -29,12 +30,29 @@ type http1PipelineResult struct {
 	err      error
 }
 
+type http1PipelineRequestInfo struct {
+	sequence uint64
+	target   string
+}
+
+type http1PipelineRequestInfoKey struct{}
+
+func http1RequestInfo(req *http.Request) http1PipelineRequestInfo {
+	if req == nil {
+		return http1PipelineRequestInfo{}
+	}
+	info, _ := req.Context().Value(http1PipelineRequestInfoKey{}).(http1PipelineRequestInfo)
+	return info
+}
+
 type http1PipelineExchange struct {
 	request *http.Request
 	result  chan http1PipelineResult
 
 	pipeline    *http1PipelineConn
 	releaseOnce sync.Once
+	queuedAt    time.Time
+	info        http1PipelineRequestInfo
 }
 
 func (e *http1PipelineExchange) release() {
@@ -107,10 +125,18 @@ func (p *http1PipelineConn) RoundTrip(req *http.Request) (*http.Response, error)
 		request:  req,
 		result:   make(chan http1PipelineResult, 1),
 		pipeline: p,
+		queuedAt: time.Now(),
+		info:     http1RequestInfo(req),
 	}
 	select {
 	case p.writeQueue <- exchange:
 		notifyHTTP1PipelineQueued(req)
+		logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "http1 upstream request queued",
+			slog.Uint64("pipeline_sequence", exchange.info.sequence),
+			slog.String("target", exchange.info.target),
+			slog.Int("in_flight", len(p.slots)),
+			slog.Int("pipeline_depth", cap(p.slots)),
+		)
 	case <-p.done:
 		exchange.release()
 		return nil, p.connectionError()
@@ -227,6 +253,11 @@ func (p *http1PipelineConn) writeLoop() {
 				p.closeWithError(err)
 				return
 			}
+			logAttrs(exchange.request.Context(), loggerFromContext(exchange.request.Context()), slog.LevelDebug, "http1 upstream request written",
+				slog.Uint64("pipeline_sequence", exchange.info.sequence),
+				slog.String("target", exchange.info.target),
+				slog.Duration("queue_duration", time.Since(exchange.queuedAt)),
+			)
 			select {
 			case p.readQueue <- exchange:
 			case <-p.done:
@@ -257,6 +288,12 @@ func (p *http1PipelineConn) readLoop() {
 				return
 			}
 			response.Request = exchange.request
+			logAttrs(exchange.request.Context(), loggerFromContext(exchange.request.Context()), slog.LevelDebug, "http1 upstream response received",
+				slog.Uint64("pipeline_sequence", exchange.info.sequence),
+				slog.String("target", exchange.info.target),
+				slog.Int("status_code", response.StatusCode),
+				slog.Duration("round_trip_duration", time.Since(exchange.queuedAt)),
+			)
 			body := newHTTP1PipelineResponseBody(p, exchange, response.Body)
 			response.Body = body
 			exchange.result <- http1PipelineResult{response: response}

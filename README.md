@@ -211,6 +211,8 @@ mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {})
 
 Internal proxy logging is disabled by default. Pass `WithLogger(logger)` to enable structured `slog` output; pass `WithLogger(nil)` to disable it. Log messages are prefixed with `[mitmproxy-go]`. Core logs include connection, routing, TLS, HTTP, HTTP/2, WebSocket, transport retry, and runtime config metadata, but do not log URL credentials/query strings, headers, bodies, WebSocket payloads, or raw certificates.
 
+HTTP/1 pipeline diagnostics are emitted at `Debug` with messages beginning `http1 pipeline` or `http1 upstream`. Correlate a request with `pipeline_sequence` and `target`; `in_flight`, `pipeline_depth`, `status_code`, and duration fields show where it is waiting. Upstream failures, downstream write failures, and automatic serial downgrade are emitted at `Warn` with error and retry/degrade fields.
+
 ### Upstream and Transport
 
 ```go
