@@ -673,7 +673,7 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 func newTransportForTarget(connCtx *biConnContext, hostport string) *singleConnTransport {
 	return newTransport(hostport, func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return connCtx.dialRemote(ctx, network, addr)
-	}, connCtx.config.state.idleConnTimeout, connCtx.config.state.disableHTTP2)
+	}, connCtx.config.state.idleConnTimeout, connCtx.config.state.disableHTTP2, connCtx.config.state.http1PipelineDepth)
 }
 
 // retargetTunnel points a plain proxy connection at a new upstream. Such a
@@ -1236,6 +1236,9 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	// selected out of band, so for those a changing authority is a request
 	// smuggling attempt rather than ordinary connection reuse.
 	canRetarget := consumedRequest && !reqCtx.HttpConnectMethod && !reqCtx.Socks5Connect
+	if connCtx.config.state.http1PipelineDepth > 1 {
+		return r.serveHTTP1Pipeline(ctx, fakerw, request, tlsRequest, firstRead, canRetarget, srcConn)
+	}
 	for {
 		reqCtx, _ := FromRequestContext(ctx)
 		nextCtx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest, firstRead)
@@ -1533,8 +1536,14 @@ func isExpectedIdleReadClose(err error) bool {
 
 func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw http.ResponseWriter, req *http.Request) (bool, error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	waitForPriorResponses := func() {
+		if done, _ := ctx.Value(http1PriorResponsesDoneKey{}).(<-chan struct{}); done != nil {
+			<-done
+		}
+	}
 	// Handle h2c with prior knowledge (RFC 7540 Section 3.4)
 	if req.Method == "PRI" && len(req.Header) == 0 && req.URL.Path == "*" && req.Proto == "HTTP/2.0" {
+		waitForPriorResponses()
 		conn, err := initH2CWithPriorKnowledge(rw, connCtx.config.state.handshakeTimeout)
 		if err != nil {
 			return false, err
@@ -1564,6 +1573,10 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 	// Keep this path transparent: forward the upgrade request and then tunnel
 	// the upgraded connection without MITM-parsing the HTTP/2 streams.
 	if isH2CUpgrade(req.Header) {
+		waitForPriorResponses()
+		if closePool, _ := ctx.Value(http1H2CUpgradeClosePoolKey{}).(func()); closePool != nil {
+			closePool()
+		}
 		reqCtx, _ := FromRequestContext(ctx)
 		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "h2c upgrade passthrough",
 			slog.String("hostport", reqCtx.Hostport),
@@ -2054,12 +2067,17 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 
 func (r *mitmProxyHandler) roundTripWithContextMode(ctx context.Context, req *http.Request, intercept bool) (response *http.Response, err error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
-	reqCtx, _ := FromRequestContext(ctx)
-	md, _ := metadata.FromContext(ctx)
 	transport := connCtx.currentTransport()
 	if transport == nil {
 		return nil, errors.New("transport missing in connection context")
 	}
+	return r.roundTripWithInvoker(ctx, req, intercept, HTTPDelegatedInvokerFunc(transport.RoundTrip))
+}
+
+func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.Request, intercept bool, invoker HTTPDelegatedInvoker) (response *http.Response, err error) {
+	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	reqCtx, _ := FromRequestContext(ctx)
+	md, _ := metadata.FromContext(ctx)
 
 	reqCtx.Request = req
 	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
@@ -2073,9 +2091,9 @@ func (r *mitmProxyHandler) roundTripWithContextMode(ctx context.Context, req *ht
 	)
 	// Only one http interceptor will be invoked
 	if intercept && connCtx.config.httpInt != nil {
-		response, err = connCtx.config.httpInt(ctx, req, HTTPDelegatedInvokerFunc(transport.RoundTrip))
+		response, err = connCtx.config.httpInt(ctx, req, invoker)
 	} else {
-		response, err = transport.RoundTrip(req)
+		response, err = invoker.Invoke(req)
 	}
 	if err != nil {
 		err = fmt.Errorf("transport RoundTrip %s failed: %w", reqCtx.Hostport, err)

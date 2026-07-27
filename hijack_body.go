@@ -28,6 +28,8 @@ const (
 type hijackedRequestBodyState struct {
 	lifecycle atomic.Int32
 	closed    atomic.Bool
+	done      chan struct{}
+	doneOnce  sync.Once
 
 	writeMu              sync.Mutex
 	continueConn         net.Conn
@@ -86,6 +88,7 @@ func prepareHijackedRequestBody(req, parsedRequest *http.Request, conn net.Conn)
 
 	state := &hijackedRequestBodyState{
 		continueConn: conn,
+		done:         make(chan struct{}),
 		sendContinue: req.ProtoAtLeast(1, 1) &&
 			req.ContentLength != 0 &&
 			httpguts.HeaderValuesContainsToken(req.Header.Values("Expect"), "100-continue"),
@@ -94,6 +97,7 @@ func prepareHijackedRequestBody(req, parsedRequest *http.Request, conn net.Conn)
 	req = req.WithContext(contextWithHijackedRequestBodyState(req, state))
 	if body == nil || body == http.NoBody {
 		state.lifecycle.Store(hijackedBodyComplete)
+		state.signalDone()
 		req.Body = http.NoBody
 		return req
 	}
@@ -164,6 +168,7 @@ func (b *hijackedRequestBody) Close() error {
 		// 100-continue may still be waiting for a response, and this connection
 		// will be closed instead of being reused.
 		_ = b.state.continueConn.SetReadDeadline(time.Now())
+		b.state.signalDone()
 		return nil
 	}
 	if b.state.lifecycle.Load() != hijackedBodyComplete {
@@ -176,7 +181,32 @@ func (b *hijackedRequestBody) Close() error {
 
 func (b *hijackedRequestBody) finish() {
 	b.copyTrailers()
-	b.state.lifecycle.CompareAndSwap(hijackedBodyActive, hijackedBodyComplete)
+	if b.state.lifecycle.CompareAndSwap(hijackedBodyActive, hijackedBodyComplete) {
+		b.state.signalDone()
+	}
+}
+
+func (s *hijackedRequestBodyState) signalDone() {
+	s.doneOnce.Do(func() { close(s.done) })
+}
+
+func hijackedRequestBodyDone(req *http.Request) <-chan struct{} {
+	if req != nil {
+		if state, _ := req.Context().Value(hijackedRequestBodyContextKey{}).(*hijackedRequestBodyState); state != nil {
+			return state.done
+		}
+	}
+	done := make(chan struct{})
+	close(done)
+	return done
+}
+
+func hijackedRequestNeedsContinue(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	state, _ := req.Context().Value(hijackedRequestBodyContextKey{}).(*hijackedRequestBodyState)
+	return state != nil && state.sendContinue
 }
 
 func (b *hijackedRequestBody) copyTrailers() {
