@@ -14,6 +14,7 @@ const (
 	defaultHandshakeTimeout          = 10 * time.Second
 	defaultIdleConnTimeout           = 90 * time.Second
 	defaultMaxHTTPHeaderBytes        = http.DefaultMaxHeaderBytes
+	defaultHTTP1PipelineDepth        = 8
 	defaultMaxWebsocketMessageBytes  = int64(16 << 20)
 	defaultMaxWebsocketBufferedBytes = int64(64 << 20)
 )
@@ -50,6 +51,7 @@ type options struct {
 	idleConnTimeout    time.Duration // Idle timeout for connections
 	handshakeTimeout   time.Duration
 	maxHTTPHeaderBytes int
+	http1PipelineDepth int
 
 	wsMaxFramesPerForward int // Max frames channel size per single websocket forward
 	wsMaxMessageBytes     int64
@@ -83,6 +85,7 @@ func newOptions(opt ...Option) *options {
 		handshakeTimeout:      defaultHandshakeTimeout,
 		idleConnTimeout:       defaultIdleConnTimeout,
 		maxHTTPHeaderBytes:    defaultMaxHTTPHeaderBytes,
+		http1PipelineDepth:    defaultHTTP1PipelineDepth,
 		streamBaseCtx:         context.Background(),
 	}
 	for _, o := range opt {
@@ -282,6 +285,15 @@ func WithHandshakeTimeout(timeout time.Duration) Option {
 func WithMaxHTTPHeaderBytes(maxBytes int) Option {
 	return OptionFunc(func(o *options) {
 		o.maxHTTPHeaderBytes = maxBytes
+	})
+}
+
+// WithHTTP1PipelineDepth bounds the number of HTTP/1 requests that one client
+// connection may have outstanding. The default is 8. A depth of 1 disables
+// pipelining while retaining HTTP keep-alive.
+func WithHTTP1PipelineDepth(depth int) Option {
+	return OptionFunc(func(o *options) {
+		o.http1PipelineDepth = depth
 	})
 }
 
