@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -149,6 +150,103 @@ func TestSingleConnTransportRoundTripClosesOnError(t *testing.T) {
 	if tr.closed {
 		t.Fatalf("dial error should not mark transport closed")
 	}
+}
+
+func TestSingleConnTransportRetriesUnansweredPipelinedSafeRequest(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	firstRead := make(chan struct{})
+	go func() {
+		firstConn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		reader := bufio.NewReader(firstConn)
+		for range 2 {
+			request, readErr := http.ReadRequest(reader)
+			if readErr != nil {
+				_ = firstConn.Close()
+				return
+			}
+			_ = request.Body.Close()
+			select {
+			case <-firstRead:
+			default:
+				close(firstRead)
+			}
+		}
+		_, _ = io.WriteString(firstConn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+		_ = firstConn.Close()
+
+		secondConn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer secondConn.Close()
+		request, readErr := http.ReadRequest(bufio.NewReader(secondConn))
+		if readErr == nil {
+			_ = request.Body.Close()
+			_, _ = io.WriteString(secondConn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb")
+		}
+	}()
+
+	transport := newTransport(listener.Addr().String(), (&net.Dialer{}).DialContext, time.Second, true, 8)
+	t.Cleanup(func() { _ = transport.Close() })
+	firstResult := make(chan *http.Response, 1)
+	secondResult := make(chan *http.Response, 1)
+	go func() {
+		response, _ := transport.RoundTrip(newTransportTestRequest(listener.Addr().String(), "/a"))
+		firstResult <- response
+	}()
+	select {
+	case <-firstRead:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not reach upstream")
+	}
+	go func() {
+		response, _ := transport.RoundTrip(newTransportTestRequest(listener.Addr().String(), "/b"))
+		secondResult <- response
+	}()
+	firstResponse := <-firstResult
+	if firstResponse == nil || readTransportResponseBody(t, firstResponse) != "a" {
+		t.Fatal("first pipelined response was not delivered")
+	}
+	select {
+	case secondResponse := <-secondResult:
+		if secondResponse == nil || readTransportResponseBody(t, secondResponse) != "b" {
+			t.Fatal("safe unanswered request was not retried")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("safe unanswered request retry timed out")
+	}
+}
+
+func newTransportTestRequest(hostport, path string) *http.Request {
+	return &http.Request{
+		Method:     http.MethodGet,
+		URL:        &url.URL{Scheme: "http", Host: hostport, Path: path},
+		Host:       hostport,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+	}
+}
+
+func readTransportResponseBody(t *testing.T, response *http.Response) string {
+	t.Helper()
+	data, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 type closeTrackingBody struct {
