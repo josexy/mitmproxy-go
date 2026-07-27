@@ -30,6 +30,87 @@ type http1SessionItem struct {
 
 type http1PriorResponsesDoneKey struct{}
 type http1H2CUpgradeClosePoolKey struct{}
+type http1SessionReadStateKey struct{}
+
+// http1SessionReadState separates a genuinely idle downstream connection from
+// one whose next request is being read while earlier responses are still in
+// flight. The latter has no read deadline; once the last response is written,
+// the writer arms the ordinary idle timeout for the blocked reader.
+type http1SessionReadState struct {
+	conn             net.Conn
+	idleTimeout      time.Duration
+	handshakeTimeout time.Duration
+
+	mu      sync.Mutex
+	reading bool
+	active  int
+	stopped bool
+}
+
+func (s *http1SessionReadState) beginRead(first bool) func() {
+	s.mu.Lock()
+	s.reading = true
+	if s.stopped {
+		_ = s.conn.SetReadDeadline(time.Now())
+	} else {
+		timeout := s.idleTimeout
+		if first {
+			timeout = s.handshakeTimeout
+		} else if s.active > 0 {
+			timeout = 0
+		}
+		s.setReadDeadlineLocked(timeout)
+	}
+	s.mu.Unlock()
+
+	return sync.OnceFunc(func() {
+		s.mu.Lock()
+		s.reading = false
+		if s.stopped {
+			_ = s.conn.SetReadDeadline(time.Now())
+		} else {
+			_ = s.conn.SetReadDeadline(time.Time{})
+		}
+		s.mu.Unlock()
+	})
+}
+
+func (s *http1SessionReadState) requestStarted() {
+	s.mu.Lock()
+	s.active++
+	if s.stopped {
+		_ = s.conn.SetReadDeadline(time.Now())
+	}
+	s.mu.Unlock()
+}
+
+func (s *http1SessionReadState) requestFinished() {
+	s.mu.Lock()
+	if s.active > 0 {
+		s.active--
+	}
+	if s.stopped {
+		_ = s.conn.SetReadDeadline(time.Now())
+	} else if s.active == 0 && s.reading {
+		s.setReadDeadlineLocked(s.idleTimeout)
+	}
+	s.mu.Unlock()
+}
+
+func (s *http1SessionReadState) terminateRead() {
+	s.mu.Lock()
+	s.stopped = true
+	_ = s.conn.SetReadDeadline(time.Now())
+	s.mu.Unlock()
+}
+
+func (s *http1SessionReadState) setReadDeadlineLocked(timeout time.Duration) {
+	if timeout <= 0 {
+		_ = s.conn.SetReadDeadline(time.Time{})
+		return
+	}
+	_ = s.conn.SetReadDeadline(time.Now().Add(timeout))
+}
 
 type http1TargetEntry struct {
 	transport *singleConnTransport
@@ -216,6 +297,11 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 	defer pool.Close()
 
 	depth := connCtx.config.state.http1PipelineDepth
+	readState := &http1SessionReadState{
+		conn:             srcConn,
+		idleTimeout:      connCtx.config.state.idleConnTimeout,
+		handshakeTimeout: connCtx.config.state.handshakeTimeout,
+	}
 	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http1 pipeline session started",
 		slog.String("hostport", baseReqCtx.Hostport),
 		slog.Int("pipeline_depth", depth),
@@ -227,7 +313,7 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 	stop := make(chan struct{})
 	writerDone := make(chan error, 1)
 	go func() {
-		writerDone <- r.writeHTTP1Session(srcConn, items, slots, stop, connCtx.config.state.idleConnTimeout)
+		writerDone <- r.writeHTTP1Session(srcConn, items, slots, stop, readState, connCtx.config.state.idleConnTimeout)
 	}()
 
 	closeItems := sync.OnceFunc(func() { close(items) })
@@ -248,6 +334,7 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 
 		parseCtx := context.WithValue(ctx, http1PriorResponsesDoneKey{}, (<-chan struct{})(priorWritten))
 		parseCtx = context.WithValue(parseCtx, http1H2CUpgradeClosePoolKey{}, (func())(pool.Close))
+		parseCtx = context.WithValue(parseCtx, http1SessionReadStateKey{}, readState)
 		nextCtx, earlyDone, wsUpgrade, err := r.distinguishHTTPRequest(parseCtx, fakerw, request, tlsRequest, firstRead)
 		if err != nil || earlyDone {
 			<-slots
@@ -336,6 +423,7 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 		priorWritten = item.written
 		select {
 		case items <- item:
+			readState.requestStarted()
 		case <-stop:
 			<-slots
 			ticket.finish()
@@ -370,7 +458,14 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 	}
 }
 
-func (r *mitmProxyHandler) writeHTTP1Session(srcConn net.Conn, items <-chan *http1SessionItem, slots chan struct{}, stop chan struct{}, idleTimeout time.Duration) (retErr error) {
+func (r *mitmProxyHandler) writeHTTP1Session(
+	srcConn net.Conn,
+	items <-chan *http1SessionItem,
+	slots chan struct{},
+	stop chan struct{},
+	readState *http1SessionReadState,
+	idleTimeout time.Duration,
+) (retErr error) {
 	var stopOnce sync.Once
 	stopWriter := func() { stopOnce.Do(func() { close(stop) }) }
 	defer stopWriter()
@@ -407,6 +502,8 @@ func (r *mitmProxyHandler) writeHTTP1Session(srcConn net.Conn, items <-chan *htt
 			item.ticket.complete()
 			close(item.written)
 			<-slots
+			readState.requestFinished()
+			readState.terminateRead()
 			return err
 		}
 		writer := &stallGuardConn{Conn: srcConn, timeout: idleTimeout}
@@ -431,14 +528,17 @@ func (r *mitmProxyHandler) writeHTTP1Session(srcConn net.Conn, items <-chan *htt
 		item.ticket.complete()
 		close(item.written)
 		<-slots
+		readState.requestFinished()
 		if err != nil {
+			readState.terminateRead()
 			return err
 		}
 		if closeErr != nil {
+			readState.terminateRead()
 			return closeErr
 		}
 		if shouldCloseHTTP1(item.request, response) {
-			_ = srcConn.SetReadDeadline(time.Now())
+			readState.terminateRead()
 			return retErr
 		}
 	}

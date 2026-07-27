@@ -1080,6 +1080,137 @@ func isTLS(data []byte) bool {
 	return data[0] == 0x16 && data[1] == 0x03 && data[2] <= 0x03
 }
 
+type tunnelProtocol uint8
+
+const (
+	tunnelProtocolHTTP tunnelProtocol = iota
+	tunnelProtocolTLS
+	tunnelProtocolRaw
+)
+
+func detectTunnelProtocol(conn *bufConn) (tunnelProtocol, error) {
+	data, err := conn.Peek(3)
+	if err != nil {
+		return tunnelProtocolRaw, err
+	}
+	if isTLS(data) {
+		return tunnelProtocolTLS, nil
+	}
+
+	const (
+		requestLineMethod = iota
+		requestLineTarget
+		requestLineVersion
+	)
+	state := requestLineMethod
+	methodEnd, targetEnd, targetBytes := 0, 0, 0
+	versionStart := 0
+	for width := 1; width <= conn.r.Size(); width++ {
+		data, err = conn.Peek(width)
+		if err != nil {
+			return tunnelProtocolRaw, err
+		}
+		value := data[width-1]
+		switch state {
+		case requestLineMethod:
+			if value == ' ' {
+				if width == 1 {
+					return tunnelProtocolRaw, nil
+				}
+				methodEnd = width - 1
+				state = requestLineTarget
+				continue
+			}
+			if !isHTTPMethodByte(value) {
+				return tunnelProtocolRaw, nil
+			}
+		case requestLineTarget:
+			if value == ' ' {
+				if targetBytes == 0 {
+					return tunnelProtocolRaw, nil
+				}
+				targetEnd = width - 1
+				versionStart = width
+				state = requestLineVersion
+				continue
+			}
+			if value <= ' ' || value >= 0x7f {
+				return tunnelProtocolRaw, nil
+			}
+			targetBytes++
+		case requestLineVersion:
+			if value == '\n' {
+				versionEnd := width - 1
+				if versionEnd > versionStart && data[versionEnd-1] == '\r' {
+					versionEnd--
+				}
+				method := string(data[:methodEnd])
+				target := string(data[methodEnd+1 : targetEnd])
+				version := string(data[versionStart:versionEnd])
+				major, _, ok := http.ParseHTTPVersion(version)
+				if ok && (major == 1 || (method == "PRI" && target == "*" && version == "HTTP/2.0")) {
+					return tunnelProtocolHTTP, nil
+				}
+				return tunnelProtocolRaw, nil
+			}
+			if !isPotentialHTTPVersion(data[versionStart:width]) {
+				return tunnelProtocolRaw, nil
+			}
+		}
+	}
+
+	// A request line longer than the sniff buffer is still HTTP-like once it
+	// has a method and target. Let the bounded HTTP parser apply the configured
+	// header limit instead of silently bypassing interception.
+	if state == requestLineTarget && targetBytes > 0 {
+		return tunnelProtocolHTTP, nil
+	}
+	if state == requestLineVersion && isPotentialHTTPVersion(data[versionStart:]) {
+		return tunnelProtocolHTTP, nil
+	}
+	return tunnelProtocolRaw, nil
+}
+
+func isHTTPMethodByte(value byte) bool {
+	if value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' {
+		return true
+	}
+	switch value {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func isPotentialHTTPVersion(data []byte) bool {
+	const prefix = "HTTP/"
+	if len(data) <= len(prefix) {
+		return string(data) == prefix[:len(data)]
+	}
+
+	majorDigits, minorDigits := 0, 0
+	dot := false
+	version := data[len(prefix):]
+	for index, value := range version {
+		switch {
+		case value >= '0' && value <= '9':
+			if dot {
+				minorDigits++
+			} else {
+				majorDigits++
+			}
+		case value == '.' && !dot && majorDigits > 0:
+			dot = true
+		case value == '\r' && dot && minorDigits > 0 && index == len(version)-1:
+			return true
+		default:
+			return false
+		}
+	}
+	return majorDigits > 0
+}
+
 func setReadDeadlineForTimeout(conn net.Conn, timeout time.Duration) func() {
 	if timeout <= 0 {
 		return func() {}
@@ -1105,24 +1236,31 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	var srcConn net.Conn = connCtx.local
 	var dstConn net.Conn = connCtx.remote
 
-	var data []byte
+	protocol := tunnelProtocolHTTP
 
 	if !consumedRequest {
 		bufConn := newBufConn(srcConn)
 		clearDeadline := setReadDeadlineForTimeout(srcConn, connCtx.config.state.handshakeTimeout)
-		data, err = bufConn.Peek(3)
+		protocol, err = detectTunnelProtocol(bufConn)
 		clearDeadline()
 		if err != nil {
 			return fmt.Errorf("short buffer to peek: %s", err)
 		}
 		srcConn = bufConn
+		if protocol == tunnelProtocolRaw {
+			connCtx.closeTransport()
+			logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "raw tunnel passthrough",
+				slog.String("hostport", reqCtx.Hostport),
+			)
+			return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+		}
 	}
 
 	fakerw := newFakeHttpResponseWriter(srcConn)
 
 	var tlsRequest bool
 	// Check if the common http/websocket request with tls
-	if len(data) >= 3 && isTLS(data) {
+	if protocol == tunnelProtocolTLS {
 		tlsRequest = true
 		clientHelloInfoCh := make(chan capturedClientHello, 1)
 		tlsConnCh := make(chan upstreamTLSHandshakeResult, 1)
@@ -1673,15 +1811,20 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 
 	// Need to read the request
 	if request == nil {
-		readTimeout := connCtx.config.state.idleConnTimeout
-		if firstRead {
-			readTimeout = connCtx.config.state.handshakeTimeout
+		var clearDeadline func()
+		if readState, _ := ctx.Value(http1SessionReadStateKey{}).(*http1SessionReadState); readState != nil {
+			clearDeadline = readState.beginRead(firstRead)
+		} else {
+			readTimeout := connCtx.config.state.idleConnTimeout
+			if firstRead {
+				readTimeout = connCtx.config.state.handshakeTimeout
+			}
+			clearDeadline = setReadDeadlineForTimeout(fakerw.conn, readTimeout)
 		}
 		// The deadline must be cleared before anything that takes over the
 		// connection for its whole lifetime (an h2c session, an upgrade
 		// passthrough), otherwise that connection inherits it and dies once it
 		// expires no matter how much traffic is flowing.
-		clearDeadline := setReadDeadlineForTimeout(fakerw.conn, readTimeout)
 		var err error
 		request, err = fakerw.ReadRequest(connCtx.config.state.maxHTTPHeaderBytes)
 		clearDeadline()
@@ -1689,6 +1832,11 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 			retErr = &requestParseError{err: err}
 			return
 		}
+		// http.ReadRequest does not attach the connection-scoped server
+		// context that net/http gives the initial request. Bind every manually
+		// parsed keep-alive request to this session before adding request-body
+		// state, otherwise downstream cancellation is lost after request one.
+		request = request.WithContext(ctx)
 	}
 	request = prepareHijackedRequestBody(request, request, fakerw.conn)
 
