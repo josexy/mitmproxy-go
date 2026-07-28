@@ -64,29 +64,25 @@ func rawTCPTunnelRecorder(events chan<- rawTCPTunnelObservation) mitmproxy.RawTC
 	}
 }
 
-func assertRawTCPTunnelObservations(t *testing.T, events <-chan rawTCPTunnelObservation, hostport string, source mitmproxy.RawTCPTunnelSource, tls bool) (rawTCPTunnelObservation, rawTCPTunnelObservation) {
+func assertRawTCPTunnelObservation(t *testing.T, events <-chan rawTCPTunnelObservation, hostport string, source mitmproxy.RawTCPTunnelSource, tls bool) rawTCPTunnelObservation {
 	t.Helper()
-	read := func(name string) rawTCPTunnelObservation {
-		t.Helper()
-		select {
-		case observation := <-events:
-			return observation
-		case <-time.After(time.Second):
-			t.Fatalf("timeout waiting for raw TCP %s event", name)
-			return rawTCPTunnelObservation{}
+	select {
+	case observation := <-events:
+		event := observation.event
+		if event.Hostport != hostport || event.Source != source || event.TLS != tls {
+			t.Fatalf("raw TCP observation = %#v; want host=%q source=%v tls=%t", observation, hostport, source, tls)
 		}
+		if source == mitmproxy.RawTCPTunnelSourceHTTPConnect && event.Request == nil {
+			t.Fatal("HTTP CONNECT raw TCP observation has nil Request")
+		}
+		if source != mitmproxy.RawTCPTunnelSourceHTTPConnect && event.Request != nil {
+			t.Fatalf("non-CONNECT raw TCP observation Request = %#v; want nil", event.Request)
+		}
+		return observation
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for raw TCP observation")
+		return rawTCPTunnelObservation{}
 	}
-	started := read("Started")
-	ended := read("Ended")
-	if event := started.event; event.Type != mitmproxy.RawTCPTunnelStarted || event.TunnelID == 0 ||
-		event.Hostport != hostport || event.Source != source || event.TLS != tls || event.Error != nil {
-		t.Fatalf("Started observation = %#v; want host=%q source=%v tls=%t", started, hostport, source, tls)
-	}
-	if event := ended.event; event.Type != mitmproxy.RawTCPTunnelEnded || event.TunnelID != started.event.TunnelID ||
-		event.Hostport != hostport || event.Source != source || event.TLS != tls {
-		t.Fatalf("Ended observation = %#v; want lifecycle pair for %#v", ended, started)
-	}
-	return started, ended
 }
 
 func startSimpleHttpServer(t *testing.T) (testServerAddrs, func()) {
@@ -408,9 +404,12 @@ func TestTLSRawTCPThroughMitm(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = client.Close()
-	started, _ := assertRawTCPTunnelObservations(t, rawEvents, origin.Addr().String(), mitmproxy.RawTCPTunnelSourceHTTPConnect, true)
-	if !started.hasMetadata || started.metadata.TLSState == nil || started.metadata.RequestHostport != origin.Addr().String() {
-		t.Fatalf("TLS raw Started metadata = %#v", started)
+	observation := assertRawTCPTunnelObservation(t, rawEvents, origin.Addr().String(), mitmproxy.RawTCPTunnelSourceHTTPConnect, true)
+	if !observation.hasMetadata || observation.metadata.TLSState == nil || observation.metadata.RequestHostport != origin.Addr().String() {
+		t.Fatalf("TLS raw metadata = %#v", observation)
+	}
+	if req := observation.event.Request; req.Method != http.MethodConnect || req.RequestURI != origin.Addr().String() || req.Host != origin.Addr().String() || req.Body != http.NoBody {
+		t.Fatalf("TLS raw CONNECT request snapshot = %#v", req)
 	}
 	if intercepted.Load() != 0 {
 		t.Fatalf("HTTP interceptor called %d times for TLS raw TCP", intercepted.Load())
@@ -507,22 +506,17 @@ func TestTLSRawTCPServerFirstWithoutALPNThroughMitm(t *testing.T) {
 				t.Fatal(err)
 			}
 			_ = client.Close()
-			started, ended := assertRawTCPTunnelObservations(t, rawEvents, origin.Addr().String(), mitmproxy.RawTCPTunnelSourceHTTPConnect, true)
-			for _, observation := range []struct {
-				name string
-				rawTCPTunnelObservation
-			}{
-				{name: "Started", rawTCPTunnelObservation: started},
-				{name: "Ended", rawTCPTunnelObservation: ended},
-			} {
-				if !observation.hasMetadata || observation.metadata.TLSState == nil ||
-					observation.metadata.RequestHostport != origin.Addr().String() ||
-					observation.metadata.RemoteAddrInfo.DestinationAddr.String() != origin.Addr().String() {
-					t.Fatalf("server-first TLS raw %s metadata = %#v", observation.name, observation.rawTCPTunnelObservation)
-				}
-				if observation.metadata.TLSState.SelectedALPN != "" {
-					t.Fatalf("server-first TLS raw %s selected ALPN = %q; want none", observation.name, observation.metadata.TLSState.SelectedALPN)
-				}
+			observation := assertRawTCPTunnelObservation(t, rawEvents, origin.Addr().String(), mitmproxy.RawTCPTunnelSourceHTTPConnect, true)
+			if !observation.hasMetadata || observation.metadata.TLSState == nil ||
+				observation.metadata.RequestHostport != origin.Addr().String() ||
+				observation.metadata.RemoteAddrInfo.DestinationAddr.String() != origin.Addr().String() {
+				t.Fatalf("server-first TLS raw metadata = %#v", observation)
+			}
+			if observation.metadata.TLSState.SelectedALPN != "" {
+				t.Fatalf("server-first TLS raw selected ALPN = %q; want none", observation.metadata.TLSState.SelectedALPN)
+			}
+			if req := observation.event.Request; req.Method != http.MethodConnect || req.RequestURI != origin.Addr().String() || req.Host != origin.Addr().String() || req.Body != http.NoBody {
+				t.Fatalf("server-first TLS raw CONNECT request snapshot = %#v", req)
 			}
 		})
 	}
@@ -752,9 +746,12 @@ func TestTLSRawTCPWithCustomALPNThroughMitm(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = client.Close()
-	started, _ := assertRawTCPTunnelObservations(t, rawEvents, origin.Addr().String(), mitmproxy.RawTCPTunnelSourceHTTPConnect, true)
-	if !started.hasMetadata || started.metadata.TLSState == nil || started.metadata.TLSState.SelectedALPN != rawALPN {
-		t.Fatalf("custom-ALPN raw Started metadata = %#v", started)
+	observation := assertRawTCPTunnelObservation(t, rawEvents, origin.Addr().String(), mitmproxy.RawTCPTunnelSourceHTTPConnect, true)
+	if !observation.hasMetadata || observation.metadata.TLSState == nil || observation.metadata.TLSState.SelectedALPN != rawALPN {
+		t.Fatalf("custom-ALPN raw metadata = %#v", observation)
+	}
+	if req := observation.event.Request; req.Method != http.MethodConnect || req.RequestURI != origin.Addr().String() || req.Host != origin.Addr().String() || req.Body != http.NoBody {
+		t.Fatalf("custom-ALPN raw CONNECT request snapshot = %#v", req)
 	}
 	if intercepted.Load() != 0 {
 		t.Fatalf("HTTP interceptor called %d times for custom-ALPN TLS raw TCP", intercepted.Load())

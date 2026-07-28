@@ -290,14 +290,16 @@ func durationBetween(start, end time.Time) time.Duration {
 
 func rawTCPInterceptor(ctx context.Context, event mitmproxy.RawTCPTunnelEvent) {
 	attrs := []slog.Attr{
-		slog.Uint64("tunnel_id", event.TunnelID),
-		slog.String("event", rawTCPEventName(event.Type)),
 		slog.String("source", rawTCPSourceName(event.Source)),
 		slog.String("hostport", event.Hostport),
 		slog.Bool("tls", event.TLS),
 	}
-	if event.Error != nil {
-		attrs = append(attrs, slog.String("error", event.Error.Error()))
+	if event.Request != nil {
+		attrs = append(attrs,
+			slog.String("method", event.Request.Method),
+			slog.String("host", event.Request.Host),
+			slog.String("request_uri", event.Request.RequestURI),
+		)
 	}
 	if mdCtx, ok := metadata.FromContext(ctx); ok {
 		md := mdCtx.MD()
@@ -314,17 +316,6 @@ func rawTCPInterceptor(ctx context.Context, event mitmproxy.RawTCPTunnelEvent) {
 		}
 	}
 	slog.LogAttrs(ctx, slog.LevelInfo, "raw TCP tunnel", attrs...)
-}
-
-func rawTCPEventName(eventType mitmproxy.RawTCPTunnelEventType) string {
-	switch eventType {
-	case mitmproxy.RawTCPTunnelStarted:
-		return "started"
-	case mitmproxy.RawTCPTunnelEnded:
-		return "ended"
-	default:
-		return "unknown"
-	}
 }
 
 func rawTCPSourceName(source mitmproxy.RawTCPTunnelSource) string {

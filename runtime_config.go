@@ -41,7 +41,7 @@ type RuntimeConfigManager interface {
 	SetHTTPInterceptor(interceptor HTTPInterceptor)
 	SetChainHTTPInterceptors(interceptors ...HTTPInterceptor)
 	SetWebsocketInterceptor(interceptor WebsocketInterceptor)
-	// SetRawTCPInterceptor replaces the raw TCP lifecycle observer used by new
+	// SetRawTCPInterceptor replaces the raw TCP tunnel observer used by new
 	// connections. Passing nil disables observation for new connections.
 	SetRawTCPInterceptor(interceptor RawTCPInterceptor)
 	SetMaxWebsocketFramesPerForward(maxFrames int) error

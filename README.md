@@ -1,13 +1,13 @@
 # mitmproxy-go
 
-An easy-to-use and flexible MITM proxy library for Go. It can intercept and inspect HTTP, HTTPS, HTTP/2, h2c, WebSocket, and WSS traffic, observe classified raw TCP tunnel lifecycles, and run as either an HTTP proxy or a SOCKS5 proxy.
+An easy-to-use and flexible MITM proxy library for Go. It can intercept and inspect HTTP, HTTPS, HTTP/2, h2c, WebSocket, and WSS traffic, observe classified raw TCP tunnels before relay, and run as either an HTTP proxy or a SOCKS5 proxy.
 
 ## Features
 
 - HTTP/1.1 keep-alive and end-to-end pipelining, HTTP/2 over TLS, and h2c support
 - HTTPS interception with custom CA certificates
 - WebSocket and secure WebSocket interception
-- Lifecycle observation for classified raw TCP tunnels without exposing payloads
+- Pre-relay observation for classified raw TCP tunnels without exposing payloads
 - HTTP proxy mode and SOCKS5 proxy mode
 - HTTP interceptor chaining
 - Host include/exclude filtering with wildcard matching
@@ -270,11 +270,13 @@ HTTP interceptors may be called concurrently for pipelined requests from the sam
 
 For WebSocket frames received from `WebsocketFramesWatcher`, call either `frame.Invoke()` to forward the frame or `frame.Release()` to drop it and release the backing buffer. `frame.Invoke()` releases the backing buffer after forwarding.
 
-`RawTCPInterceptor` is an observation-only lifecycle callback. It receives a synchronous `RawTCPTunnelStarted` event immediately before relay and a matching `RawTCPTunnelEnded` event after relay returns. Both events carry the same handler-scoped `TunnelID`, target `Hostport`, downstream `Source`, and a `TLS` flag. The ended event's `Error` contains the result from the first relay direction to finish; it is nil after normal EOF.
+`RawTCPInterceptor` is an observation-only callback invoked synchronously once for each classified raw TCP tunnel immediately before relay. The event contains the target `Hostport`, downstream `Source`, and a `TLS` flag.
 
 `Source` is `RawTCPTunnelSourceHTTPConnect`, `RawTCPTunnelSourceSOCKS5`, or `RawTCPTunnelSourceDirect` for low-level/transparent `Serve` callers. `TLS=true` means the reported stream is decrypted application data inside a successfully intercepted TLS tunnel.
 
-The callback never receives a connection, buffer, or payload and cannot allow, reject, or modify relay. A slow `Started` callback delays relay; a slow `Ended` callback delays handler return. Events for one tunnel are ordered, while callbacks for different tunnels may run concurrently.
+For HTTP CONNECT tunnels accepted through `ServeHTTP`, `event.Request` is an isolated, bodyless snapshot of the original outer CONNECT request. It remains the outer CONNECT request even when `TLS=true`; it never contains decrypted application data. Direct and SOCKS5 events have a nil `Request`.
+
+The callback never receives a connection, buffer, or payload and cannot allow, reject, or modify relay. A slow callback delays relay, while callbacks for different tunnels may run concurrently.
 
 Only traffic that protocol detection explicitly classifies as non-HTTP raw TCP is reported, including plaintext raw streams and decrypted raw application streams inside MITM TLS tunnels. HTTP, WebSocket, host-filter passthrough, h2c upgrade passthrough, dial failures, and protocol-detection failures do not emit raw TCP events.
 
@@ -309,7 +311,7 @@ handler.SetLogger(slog.Default())
 handler.SetHTTP2Disabled(true)
 ```
 
-Runtime updates are published as immutable config snapshots. A connection captures one snapshot when it enters `Serve`, `ServeHTTP`, or `ServeSOCKS5`; updates only affect new connections. Existing HTTP keep-alive, HTTP/2, WebSocket, and raw TCP tunnels continue using the snapshot they started with, including the interceptor used for their eventual `Ended` event.
+Runtime updates are published as immutable config snapshots. A connection captures one snapshot when it enters `Serve`, `ServeHTTP`, or `ServeSOCKS5`; updates only affect new connections. Existing HTTP keep-alive, HTTP/2, WebSocket, and raw TCP tunnels continue using the snapshot they started with, including a raw TCP callback that occurs after a runtime update.
 
 Available runtime setters:
 
@@ -349,7 +351,7 @@ err = handler.SetMaxWebsocketBufferedBytes(64 << 20)
 
 `SetHTTPInterceptor` replaces any previously configured HTTP interceptor chain. `SetChainHTTPInterceptors` replaces any previously configured single HTTP interceptor.
 
-`SetRawTCPInterceptor(nil)` disables raw TCP lifecycle observation for new connections. Existing connections retain their captured interceptor.
+`SetRawTCPInterceptor(nil)` disables raw TCP observation for new connections. Existing connections retain their captured interceptor.
 
 CA certificate/key and certificate cache pool settings are initialization-only:
 
@@ -425,7 +427,7 @@ func durationBetween(start, end time.Time) time.Duration {
 Current examples in this repository:
 
 - `examples/helloworld`: minimal HTTP proxy with request/response logging
-- `examples/dumper`: HTTP/WebSocket dumping and raw TCP lifecycle observation with metadata logging
+- `examples/dumper`: HTTP/WebSocket dumping and raw TCP tunnel observation with metadata logging
 - `examples/modify-content`: modifies request headers and response body
 - `examples/chain-interceptors`: demonstrates ordered HTTP interceptor chaining
 - `examples/dynamic-config`: demonstrates runtime config updates that affect new connections

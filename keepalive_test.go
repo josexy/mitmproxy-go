@@ -87,29 +87,24 @@ func readConnectResponse(t *testing.T, reader *bufio.Reader) {
 	}
 }
 
-func assertRawTCPTunnelLifecycle(t *testing.T, events <-chan RawTCPTunnelEvent, hostport string, source RawTCPTunnelSource, tls bool) (RawTCPTunnelEvent, RawTCPTunnelEvent) {
+func assertRawTCPTunnelEvent(t *testing.T, events <-chan RawTCPTunnelEvent, hostport string, source RawTCPTunnelSource, tls bool) RawTCPTunnelEvent {
 	t.Helper()
-	readEvent := func(name string) RawTCPTunnelEvent {
-		t.Helper()
-		select {
-		case event := <-events:
-			return event
-		case <-time.After(time.Second):
-			t.Fatalf("timeout waiting for raw TCP %s event", name)
-			return RawTCPTunnelEvent{}
+	select {
+	case event := <-events:
+		if event.Hostport != hostport || event.Source != source || event.TLS != tls {
+			t.Fatalf("raw TCP event = %#v; want host=%q source=%v tls=%t", event, hostport, source, tls)
 		}
+		if source == RawTCPTunnelSourceHTTPConnect && event.Request == nil {
+			t.Fatal("HTTP CONNECT raw TCP event has nil Request")
+		}
+		if source != RawTCPTunnelSourceHTTPConnect && event.Request != nil {
+			t.Fatalf("non-CONNECT raw TCP event Request = %#v; want nil", event.Request)
+		}
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for raw TCP event")
+		return RawTCPTunnelEvent{}
 	}
-	started := readEvent("Started")
-	ended := readEvent("Ended")
-	if started.Type != RawTCPTunnelStarted || started.TunnelID == 0 || started.Hostport != hostport ||
-		started.Source != source || started.TLS != tls || started.Error != nil {
-		t.Fatalf("Started event = %#v; want host=%q source=%v tls=%t", started, hostport, source, tls)
-	}
-	if ended.Type != RawTCPTunnelEnded || ended.TunnelID != started.TunnelID || ended.Hostport != hostport ||
-		ended.Source != source || ended.TLS != tls {
-		t.Fatalf("Ended event = %#v; want lifecycle pair for %#v", ended, started)
-	}
-	return started, ended
 }
 
 // readHeaderBlock consumes one CRLF terminated header block.
@@ -783,7 +778,7 @@ func TestConnectTunnelRelaysRawTCP(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			conn, reader := dialProxy(t, listener)
-			connect := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echo, echo)
+			connect := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nX-Raw-Tunnel-Test: %s\r\n\r\n", echo, echo, name)
 			if _, err := conn.Write(append([]byte(connect), payload...)); err != nil {
 				t.Fatal(err)
 			}
@@ -800,7 +795,12 @@ func TestConnectTunnelRelaysRawTCP(t *testing.T) {
 				t.Fatalf("raw CONNECT echo = %x; want %x", got, payload)
 			}
 			_ = conn.Close()
-			assertRawTCPTunnelLifecycle(t, events, echo, RawTCPTunnelSourceHTTPConnect, false)
+			event := assertRawTCPTunnelEvent(t, events, echo, RawTCPTunnelSourceHTTPConnect, false)
+			if event.Request.Method != http.MethodConnect || event.Request.RequestURI != echo ||
+				event.Request.Host != echo || event.Request.Header.Get("X-Raw-Tunnel-Test") != name ||
+				event.Request.Body != http.NoBody {
+				t.Fatalf("CONNECT request snapshot = %#v", event.Request)
+			}
 		})
 	}
 }

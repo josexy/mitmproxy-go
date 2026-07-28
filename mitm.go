@@ -44,8 +44,9 @@ type contextKey struct {
 func (k *contextKey) String() string { return "mitmproxy-go context value " + k.name }
 
 var (
-	connContextKey = &contextKey{"connection-context"}
-	reqContextKey  = &contextKey{"request-context"}
+	connContextKey                 = &contextKey{"connection-context"}
+	reqContextKey                  = &contextKey{"request-context"}
+	rawTCPConnectRequestContextKey = &contextKey{"raw-tcp-connect-request"}
 )
 
 type ReqContext struct {
@@ -65,6 +66,17 @@ func FromRequestContext(ctx context.Context) (ReqContext, bool) {
 		return ReqContext{}, false
 	}
 	return reqCtx, true
+}
+
+func snapshotRawTCPConnectRequest(req *http.Request) *http.Request {
+	if req == nil {
+		return nil
+	}
+	snapshot := req.Clone(context.Background())
+	snapshot.Body = http.NoBody
+	snapshot.GetBody = nil
+	snapshot.Cancel = nil
+	return snapshot
 }
 
 func ParseHostPort(req *http.Request) (string, error) {
@@ -315,7 +327,6 @@ type mitmProxyHandler struct {
 	configMu       sync.Mutex
 	config         atomic.Pointer[runtimeConfig]
 	runtimeState   runtimeConfigState
-	rawTCPTunnelID atomic.Uint64
 	priKeyPool     *priKeyPool
 	serverCertPool *certPool
 	activeMu       sync.Mutex
@@ -450,6 +461,7 @@ func (r *mitmProxyHandler) CACertPath() string {
 
 func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	cfg := r.config.Load()
+	isConnect := req.Method == http.MethodConnect
 	var err error
 	remoteAddr, hostport := req.RemoteAddr, ""
 	defer func() {
@@ -466,6 +478,10 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		err = ErrHijackNotSupported
 		return
 	}
+	var connectRequest *http.Request
+	if isConnect {
+		connectRequest = snapshotRawTCPConnectRequest(req)
+	}
 	conn, rw, err := hj.Hijack()
 	if err != nil {
 		return
@@ -476,7 +492,7 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		conn.Close()
 		return
 	}
-	if req.Method == http.MethodConnect {
+	if isConnect {
 		request = nil
 		if rw != nil {
 			conn = newBufConnExt(conn, rw)
@@ -493,10 +509,14 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	_ = r.serveWithConfig(AppendToRequestContext(req.Context(), ReqContext{
+	ctx := req.Context()
+	if connectRequest != nil {
+		ctx = context.WithValue(ctx, rawTCPConnectRequestContextKey, connectRequest)
+	}
+	_ = r.serveWithConfig(AppendToRequestContext(ctx, ReqContext{
 		Hostport:          hostport,
 		Request:           request,
-		HttpConnectMethod: req.Method == http.MethodConnect,
+		HttpConnectMethod: isConnect,
 	}), conn, cfg)
 }
 
@@ -729,26 +749,25 @@ func rawTCPTunnelSourceForRequest(reqCtx ReqContext) RawTCPTunnelSource {
 	}
 }
 
-func (r *mitmProxyHandler) relayRawTCPTunnel(ctx context.Context, srcConn, dstConn net.Conn, tls bool) (err error) {
+func (r *mitmProxyHandler) relayRawTCPTunnel(ctx context.Context, srcConn, dstConn net.Conn, tls bool) error {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	interceptor := connCtx.config.state.rawTCPInt
 	if interceptor == nil {
 		return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
 	}
 	reqCtx, _ := FromRequestContext(ctx)
-	event := RawTCPTunnelEvent{
-		TunnelID: r.rawTCPTunnelID.Add(1),
-		Type:     RawTCPTunnelStarted,
-		Source:   rawTCPTunnelSourceForRequest(reqCtx),
+	source := rawTCPTunnelSourceForRequest(reqCtx)
+	var request *http.Request
+	if source == RawTCPTunnelSourceHTTPConnect {
+		request, _ = ctx.Value(rawTCPConnectRequestContextKey).(*http.Request)
+	}
+	interceptor(ctx, RawTCPTunnelEvent{
+		Source:   source,
 		Hostport: reqCtx.Hostport,
 		TLS:      tls,
-	}
-	interceptor(ctx, event)
-	err = r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
-	event.Type = RawTCPTunnelEnded
-	event.Error = err
-	interceptor(ctx, event)
-	return err
+		Request:  request,
+	})
+	return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
 }
 
 func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn, dstConn net.Conn, initialActivityTimeout time.Duration) error {

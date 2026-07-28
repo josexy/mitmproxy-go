@@ -165,22 +165,51 @@ func TestRawTCPTunnelSourceForRequest(t *testing.T) {
 	}
 }
 
-func TestServeReportsDirectRawTCPTunnelLifecycle(t *testing.T) {
+func TestSnapshotRawTCPConnectRequestIsBodylessAndIsolated(t *testing.T) {
+	originalBody := io.NopCloser(bytes.NewBufferString("tunnel payload"))
+	original := &http.Request{
+		Method:     http.MethodConnect,
+		URL:        &url.URL{Host: "example.test:443"},
+		RequestURI: "example.test:443",
+		Host:       "example.test:443",
+		Header:     http.Header{"X-Test": {"original"}},
+		Body:       originalBody,
+		GetBody: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		},
+		Cancel: make(chan struct{}),
+	}
+
+	snapshot := snapshotRawTCPConnectRequest(original)
+	if snapshot == original || snapshot.Method != original.Method || snapshot.RequestURI != original.RequestURI ||
+		snapshot.Host != original.Host || snapshot.Header.Get("X-Test") != "original" {
+		t.Fatalf("CONNECT request snapshot = %#v; want isolated copy of %#v", snapshot, original)
+	}
+	if snapshot.Body != http.NoBody || snapshot.GetBody != nil || snapshot.Cancel != nil {
+		t.Fatalf("snapshot body handles = Body:%#v GetBody-nil:%t Cancel-nil:%t; want NoBody, true, true", snapshot.Body, snapshot.GetBody == nil, snapshot.Cancel == nil)
+	}
+
+	snapshot.Header.Set("X-Test", "changed")
+	snapshot.URL.Host = "changed.example:1"
+	if original.Header.Get("X-Test") != "original" || original.URL.Host != "example.test:443" || original.Body != originalBody {
+		t.Fatalf("snapshot mutation changed original request: %#v", original)
+	}
+}
+
+func TestServeReportsDirectRawTCPTunnelOnce(t *testing.T) {
 	echo := startEchoServer(t)
 	certPath, keyPath := writeTestCA(t)
 	events := make(chan RawTCPTunnelEvent, 2)
-	startedMetadata := make(chan metadata.MD, 1)
+	eventMetadata := make(chan metadata.MD, 1)
 	handler, err := NewMitmProxyHandler(
 		WithCACertPath(certPath),
 		WithCAKeyPath(keyPath),
 		WithDisableProxy(),
 		WithRawTCPInterceptor(func(ctx context.Context, event RawTCPTunnelEvent) {
-			if event.Type == RawTCPTunnelStarted {
-				if md, ok := metadata.FromContext(ctx); ok {
-					startedMetadata <- md.MD()
-				} else {
-					startedMetadata <- metadata.MD{}
-				}
+			if md, ok := metadata.FromContext(ctx); ok {
+				eventMetadata <- md.MD()
+			} else {
+				eventMetadata <- metadata.MD{}
 			}
 			events <- event
 		}),
@@ -213,18 +242,29 @@ func TestServeReportsDirectRawTCPTunnelLifecycle(t *testing.T) {
 	}
 	_ = client.Close()
 
-	_, ended := assertRawTCPTunnelLifecycle(t, events, echo, RawTCPTunnelSourceDirect, false)
-	md := <-startedMetadata
+	var event RawTCPTunnelEvent
+	select {
+	case event = <-events:
+	case <-time.After(time.Second):
+		t.Fatal("raw TCP callback was not invoked")
+	}
+	if event.Hostport != echo || event.Source != RawTCPTunnelSourceDirect || event.TLS || event.Request != nil {
+		t.Fatalf("direct raw TCP event = %#v; want host=%q, direct source, plaintext, nil request", event, echo)
+	}
+	md := <-eventMetadata
 	if md.RequestHostport != echo || md.RemoteAddrInfo.DestinationAddr.String() != echo {
-		t.Fatalf("Started metadata = %#v; want target %q", md, echo)
+		t.Fatalf("raw TCP metadata = %#v; want target %q", md, echo)
 	}
 	select {
 	case serveErr := <-serveDone:
-		if serveErr != ended.Error {
-			t.Fatalf("Serve error = %v; Ended error = %v", serveErr, ended.Error)
-		}
+		_ = serveErr
 	case <-time.After(time.Second):
 		t.Fatal("Serve did not return after direct raw tunnel closed")
+	}
+	select {
+	case duplicate := <-events:
+		t.Fatalf("raw TCP callback invoked more than once: %#v", duplicate)
+	default:
 	}
 }
 
@@ -279,46 +319,46 @@ func TestRawTCPInterceptorNotCalledWhenProtocolDetectionFails(t *testing.T) {
 	}
 }
 
-func TestRelayRawTCPTunnelLifecycleIsSynchronous(t *testing.T) {
+func TestRelayRawTCPTunnelCallbackIsSynchronousAndRunsOnce(t *testing.T) {
 	client, local := net.Pipe()
 	remote, upstream := net.Pipe()
 	defer client.Close()
 	defer upstream.Close()
 
-	started := make(chan RawTCPTunnelEvent, 1)
-	ended := make(chan RawTCPTunnelEvent, 1)
-	releaseStarted := make(chan struct{})
-	releaseEnded := make(chan struct{})
+	events := make(chan RawTCPTunnelEvent, 2)
+	releaseCallback := make(chan struct{})
 	cfg := testRuntimeConfig(t)
 	cfg.state.rawTCPInt = func(_ context.Context, event RawTCPTunnelEvent) {
-		switch event.Type {
-		case RawTCPTunnelStarted:
-			started <- event
-			<-releaseStarted
-		case RawTCPTunnelEnded:
-			ended <- event
-			<-releaseEnded
-		}
+		events <- event
+		<-releaseCallback
 	}
 	handler := &mitmProxyHandler{}
+	connectSnapshot := &http.Request{
+		Method:     http.MethodConnect,
+		RequestURI: "example.test:443",
+		Host:       "example.test:443",
+		Header:     make(http.Header),
+		Body:       http.NoBody,
+	}
 	ctx := AppendToRequestContext(context.Background(), ReqContext{
 		Hostport:          "example.test:443",
 		HttpConnectMethod: true,
 	})
+	ctx = context.WithValue(ctx, rawTCPConnectRequestContextKey, connectSnapshot)
 	ctx = metadata.AppendToContext(ctx, metadata.NewMD())
 	ctx = context.WithValue(ctx, connContextKey, &biConnContext{config: cfg})
 	done := make(chan error, 1)
 	go func() { done <- handler.relayRawTCPTunnel(ctx, local, remote, false) }()
 
-	var startEvent RawTCPTunnelEvent
+	var event RawTCPTunnelEvent
 	select {
-	case startEvent = <-started:
+	case event = <-events:
 	case <-time.After(time.Second):
-		t.Fatal("raw TCP Started event was not emitted")
+		t.Fatal("raw TCP callback was not invoked")
 	}
-	if startEvent.TunnelID == 0 || startEvent.Hostport != "example.test:443" ||
-		startEvent.Source != RawTCPTunnelSourceHTTPConnect || startEvent.TLS || startEvent.Error != nil {
-		t.Fatalf("Started event = %#v; want CONNECT plaintext tunnel metadata", startEvent)
+	if event.Hostport != "example.test:443" ||
+		event.Source != RawTCPTunnelSourceHTTPConnect || event.TLS || event.Request != connectSnapshot {
+		t.Fatalf("raw TCP event = %#v; want CONNECT plaintext tunnel metadata and request snapshot", event)
 	}
 
 	writeDone := make(chan error, 1)
@@ -328,11 +368,11 @@ func TestRelayRawTCPTunnelLifecycleIsSynchronous(t *testing.T) {
 	}()
 	select {
 	case err := <-writeDone:
-		close(releaseStarted)
-		t.Fatalf("client write completed before Started callback returned: %v", err)
+		close(releaseCallback)
+		t.Fatalf("client write completed before raw TCP callback returned: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(releaseStarted)
+	close(releaseCallback)
 	payload := make([]byte, 4)
 	if _, err := io.ReadFull(upstream, payload); err != nil || string(payload) != "ping" {
 		t.Fatalf("upstream payload = %q, %v; want ping", payload, err)
@@ -342,47 +382,36 @@ func TestRelayRawTCPTunnelLifecycleIsSynchronous(t *testing.T) {
 	}
 	_ = client.Close()
 
-	var endEvent RawTCPTunnelEvent
-	select {
-	case endEvent = <-ended:
-	case <-time.After(time.Second):
-		t.Fatal("raw TCP Ended event was not emitted")
-	}
-	if endEvent.TunnelID != startEvent.TunnelID || endEvent.Type != RawTCPTunnelEnded ||
-		endEvent.Hostport != startEvent.Hostport || endEvent.Source != startEvent.Source || endEvent.TLS != startEvent.TLS {
-		t.Fatalf("Ended event = %#v; want same tunnel metadata as %#v", endEvent, startEvent)
-	}
 	select {
 	case err := <-done:
-		close(releaseEnded)
-		t.Fatalf("relay returned before Ended callback completed: %v", err)
-	case <-time.After(20 * time.Millisecond):
+		_ = err
+	case <-time.After(time.Second):
+		t.Fatal("relay did not return after the client closed")
 	}
-	close(releaseEnded)
-	if err := <-done; err != endEvent.Error {
-		t.Fatalf("relay error = %v; Ended error = %v", err, endEvent.Error)
+	select {
+	case duplicate := <-events:
+		t.Fatalf("raw TCP callback invoked more than once: %#v", duplicate)
+	default:
 	}
 }
 
-func TestRelayRawTCPTunnelEndedPreservesRelayError(t *testing.T) {
+func TestRelayRawTCPTunnelPreservesRelayErrorAndCallsInterceptorOnce(t *testing.T) {
 	wantErr := errors.New("raw read failed")
 	remote, upstream := net.Pipe()
 	defer upstream.Close()
-	events := make(chan RawTCPTunnelEvent, 2)
+	var callbackCount atomic.Int32
 	cfg := testRuntimeConfig(t)
-	cfg.state.rawTCPInt = func(_ context.Context, event RawTCPTunnelEvent) { events <- event }
+	cfg.state.rawTCPInt = func(context.Context, RawTCPTunnelEvent) { callbackCount.Add(1) }
 	ctx := AppendToRequestContext(context.Background(), ReqContext{Hostport: "error.example:1"})
 	ctx = context.WithValue(ctx, connContextKey, &biConnContext{config: cfg})
 	handler := &mitmProxyHandler{}
 
 	gotErr := handler.relayRawTCPTunnel(ctx, &immediateReadErrorConn{err: wantErr}, remote, false)
-	started := <-events
-	ended := <-events
-	if started.Type != RawTCPTunnelStarted || ended.Type != RawTCPTunnelEnded {
-		t.Fatalf("events = %#v, %#v; want Started, Ended", started, ended)
+	if gotErr != wantErr {
+		t.Fatalf("relay error = %v; want identical %v", gotErr, wantErr)
 	}
-	if gotErr != wantErr || ended.Error != gotErr {
-		t.Fatalf("relay error = %v, Ended error = %v; want identical %v", gotErr, ended.Error, wantErr)
+	if got := callbackCount.Load(); got != 1 {
+		t.Fatalf("raw TCP callback count = %d; want 1", got)
 	}
 }
 
@@ -404,18 +433,26 @@ func TestRelayRawTCPTunnelUsesConnectionConfigSnapshot(t *testing.T) {
 	ctx = context.WithValue(ctx, connContextKey, &biConnContext{config: oldCfg})
 	done := make(chan error, 1)
 	go func() { done <- handler.relayRawTCPTunnel(ctx, local, remote, false) }()
-	started := <-oldEvents
-	if started.Type != RawTCPTunnelStarted {
-		t.Fatalf("first old event = %#v; want Started", started)
+	var oldEvent RawTCPTunnelEvent
+	select {
+	case oldEvent = <-oldEvents:
+	case <-time.After(time.Second):
+		t.Fatal("old interceptor was not invoked")
+	}
+	if oldEvent.Hostport != "old.example:1" {
+		t.Fatalf("old interceptor event = %#v; want old.example:1", oldEvent)
 	}
 	handler.config.Store(newCfg)
 	_ = client.Close()
-	ended := <-oldEvents
-	if ended.Type != RawTCPTunnelEnded || ended.TunnelID != started.TunnelID {
-		t.Fatalf("old lifecycle = %#v, %#v", started, ended)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("old-config relay did not return")
 	}
-	if err := <-done; err != ended.Error {
-		t.Fatalf("old relay error = %v; Ended error = %v", err, ended.Error)
+	select {
+	case event := <-oldEvents:
+		t.Fatalf("old interceptor was invoked more than once: %#v", event)
+	default:
 	}
 	select {
 	case event := <-newEvents:
@@ -431,20 +468,31 @@ func TestRelayRawTCPTunnelUsesConnectionConfigSnapshot(t *testing.T) {
 	ctx = context.WithValue(ctx, connContextKey, &biConnContext{config: newCfg})
 	done = make(chan error, 1)
 	go func() { done <- handler.relayRawTCPTunnel(ctx, local, remote, false) }()
-	started = <-newEvents
-	_ = client.Close()
-	ended = <-newEvents
-	if started.Type != RawTCPTunnelStarted || ended.Type != RawTCPTunnelEnded || ended.TunnelID != started.TunnelID {
-		t.Fatalf("new lifecycle = %#v, %#v", started, ended)
+	var newEvent RawTCPTunnelEvent
+	select {
+	case newEvent = <-newEvents:
+	case <-time.After(time.Second):
+		t.Fatal("new interceptor was not invoked")
 	}
-	if err := <-done; err != ended.Error {
-		t.Fatalf("new relay error = %v; Ended error = %v", err, ended.Error)
+	if newEvent.Hostport != "new.example:2" {
+		t.Fatalf("new interceptor event = %#v; want new.example:2", newEvent)
+	}
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("new-config relay did not return")
+	}
+	select {
+	case event := <-newEvents:
+		t.Fatalf("new interceptor was invoked more than once: %#v", event)
+	default:
 	}
 }
 
-func TestRawTCPInterceptorTunnelIDsAreUniqueConcurrently(t *testing.T) {
+func TestRawTCPInterceptorCalledOncePerTunnelConcurrently(t *testing.T) {
 	const tunnelCount = 16
-	events := make(chan RawTCPTunnelEvent, tunnelCount*2)
+	events := make(chan RawTCPTunnelEvent, tunnelCount)
 	cfg := testRuntimeConfig(t)
 	cfg.state.rawTCPInt = func(_ context.Context, event RawTCPTunnelEvent) { events <- event }
 	handler := &mitmProxyHandler{}
@@ -469,40 +517,48 @@ func TestRawTCPInterceptorTunnelIDsAreUniqueConcurrently(t *testing.T) {
 		}
 	}()
 
-	startedByID := make(map[uint64]RawTCPTunnelEvent, tunnelCount)
+	eventsByHostport := make(map[string]RawTCPTunnelEvent, tunnelCount)
+	eventDeadline := time.After(time.Second)
 	for range tunnelCount {
-		event := <-events
-		if event.Type != RawTCPTunnelStarted || event.TunnelID == 0 {
-			t.Fatalf("initial event = %#v; want Started", event)
+		var event RawTCPTunnelEvent
+		select {
+		case event = <-events:
+		case <-eventDeadline:
+			t.Fatalf("timeout waiting for raw TCP callbacks; got %d of %d", len(eventsByHostport), tunnelCount)
 		}
-		if _, exists := startedByID[event.TunnelID]; exists {
-			t.Fatalf("duplicate raw TCP tunnel ID %d", event.TunnelID)
+		if previous, exists := eventsByHostport[event.Hostport]; exists {
+			t.Fatalf("hostport %q observed more than once: %#v, %#v", event.Hostport, previous, event)
 		}
-		startedByID[event.TunnelID] = event
+		eventsByHostport[event.Hostport] = event
 	}
-	for id := uint64(1); id <= tunnelCount; id++ {
-		if _, ok := startedByID[id]; !ok {
-			t.Fatalf("missing raw TCP tunnel ID %d from %#v", id, startedByID)
+	if got := len(eventsByHostport); got != tunnelCount {
+		t.Fatalf("raw TCP event target count = %d; want %d", got, tunnelCount)
+	}
+	for index := range tunnelCount {
+		hostport := fmt.Sprintf("target-%d.example:1", index)
+		event, ok := eventsByHostport[hostport]
+		if !ok {
+			t.Fatalf("missing raw TCP callback for %q", hostport)
+		}
+		if event.Source != RawTCPTunnelSourceDirect || event.TLS != (index%2 == 0) || event.Request != nil {
+			t.Fatalf("raw TCP event for %q = %#v; want direct source, tls=%t, nil request", hostport, event, index%2 == 0)
 		}
 	}
 	for _, conn := range clients {
 		_ = conn.Close()
 	}
-	endedByID := make(map[uint64]RawTCPTunnelEvent, tunnelCount)
+	doneDeadline := time.After(time.Second)
 	for range tunnelCount {
-		event := <-events
-		started, ok := startedByID[event.TunnelID]
-		if event.Type != RawTCPTunnelEnded || !ok || event.Hostport != started.Hostport ||
-			event.Source != started.Source || event.TLS != started.TLS {
-			t.Fatalf("Ended event = %#v; Started = %#v", event, started)
+		select {
+		case <-done:
+		case <-doneDeadline:
+			t.Fatal("timeout waiting for concurrent raw TCP relays to return")
 		}
-		if _, exists := endedByID[event.TunnelID]; exists {
-			t.Fatalf("duplicate Ended event for tunnel ID %d", event.TunnelID)
-		}
-		endedByID[event.TunnelID] = event
 	}
-	for range tunnelCount {
-		<-done
+	select {
+	case duplicate := <-events:
+		t.Fatalf("raw TCP callback invoked more than once for a tunnel: %#v", duplicate)
+	default:
 	}
 }
 

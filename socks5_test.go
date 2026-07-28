@@ -282,12 +282,10 @@ func TestServeSOCKS5RelaysRawTCPAndRetainsEntryConfigSnapshot(t *testing.T) {
 		WithCAKeyPath(keyPath),
 		WithDisableProxy(),
 		WithRawTCPInterceptor(func(ctx context.Context, event RawTCPTunnelEvent) {
-			if event.Type == RawTCPTunnelStarted {
-				if md, ok := metadata.FromContext(ctx); ok {
-					startedMetadata <- md.MD()
-				} else {
-					startedMetadata <- metadata.MD{}
-				}
+			if md, ok := metadata.FromContext(ctx); ok {
+				startedMetadata <- md.MD()
+			} else {
+				startedMetadata <- metadata.MD{}
 			}
 			events <- event
 		}),
@@ -350,13 +348,23 @@ func TestServeSOCKS5RelaysRawTCPAndRetainsEntryConfigSnapshot(t *testing.T) {
 	}
 	_ = client.Close()
 
-	_, ended := assertRawTCPTunnelLifecycle(t, events, echo, RawTCPTunnelSourceSOCKS5, false)
+	event := assertRawTCPTunnelEvent(t, events, echo, RawTCPTunnelSourceSOCKS5, false)
+	if event.Request != nil {
+		t.Fatalf("SOCKS5 raw TCP event Request = %#v; want nil", event.Request)
+	}
 	md := <-startedMetadata
 	if md.RequestHostport != echo || md.RemoteAddrInfo.DestinationAddr.String() != echo {
-		t.Fatalf("Started metadata = %#v; want target %q", md, echo)
+		t.Fatalf("raw TCP metadata = %#v; want target %q", md, echo)
 	}
-	if serveErr := <-errCh; serveErr != ended.Error {
-		t.Fatalf("ServeSOCKS5 error = %v; Ended error = %v", serveErr, ended.Error)
+	select {
+	case <-errCh:
+	case <-time.After(time.Second):
+		t.Fatal("ServeSOCKS5 did not return after raw tunnel closed")
+	}
+	select {
+	case duplicate := <-events:
+		t.Fatalf("raw TCP callback invoked more than once: %#v", duplicate)
+	default:
 	}
 	select {
 	case event := <-updatedEvents:

@@ -34,16 +34,6 @@ func (d WSDirection) String() string {
 	}
 }
 
-// RawTCPTunnelEventType identifies a lifecycle event for a classified raw TCP tunnel.
-type RawTCPTunnelEventType byte
-
-const (
-	// RawTCPTunnelStarted is emitted immediately before bidirectional relay begins.
-	RawTCPTunnelStarted RawTCPTunnelEventType = iota
-	// RawTCPTunnelEnded is emitted after bidirectional relay returns.
-	RawTCPTunnelEnded
-)
-
 // RawTCPTunnelSource identifies how the downstream tunnel entered the proxy.
 type RawTCPTunnelSource byte
 
@@ -56,19 +46,15 @@ const (
 	RawTCPTunnelSourceSOCKS5
 )
 
-// RawTCPTunnelEvent describes one lifecycle transition for a classified raw TCP tunnel.
-// It contains metadata only and never exposes the relayed connection or payload.
-// TunnelID is unique within one proxy handler lifetime, but its numeric value does not
-// define callback or relay ordering. Error is always nil for RawTCPTunnelStarted. For
-// RawTCPTunnelEnded, Error is the passthrough relay return value: the copy result from
-// the first direction to finish, which may be nil.
+// RawTCPTunnelEvent describes a classified raw TCP tunnel immediately before relay.
+// Request is a bodyless snapshot of the outer CONNECT request when Source is
+// RawTCPTunnelSourceHTTPConnect and the tunnel entered through ServeHTTP; otherwise
+// Request is nil. The event never exposes a relayed connection or payload.
 type RawTCPTunnelEvent struct {
-	TunnelID uint64                // Identifier unique within one proxy handler lifetime.
-	Type     RawTCPTunnelEventType // Started or Ended.
-	Source   RawTCPTunnelSource    // Downstream tunnel entry point.
-	Hostport string                // Requested target in host:port form.
-	TLS      bool                  // Whether this is a decrypted raw stream inside a MITM TLS tunnel.
-	Error    error                 // Passthrough relay return value for Ended; nil for Started.
+	Source   RawTCPTunnelSource // Downstream tunnel entry point.
+	Hostport string             // Requested target in host:port form.
+	TLS      bool               // Whether this is a decrypted raw stream inside a MITM TLS tunnel.
+	Request  *http.Request      // Bodyless outer CONNECT snapshot for ServeHTTP tunnels; otherwise nil.
 }
 
 type WsFrame interface {
@@ -101,11 +87,9 @@ type (
 
 	HTTPInterceptor      func(context.Context, *http.Request, HTTPDelegatedInvoker) (*http.Response, error)
 	WebsocketInterceptor func(context.Context, *http.Request, *http.Response, WebsocketFramesWatcher)
-	// RawTCPInterceptor observes classified raw TCP tunnel lifecycle events.
-	// For each tunnel, RawTCPTunnelStarted is called synchronously before relay and
-	// RawTCPTunnelEnded is called synchronously after relay. Callbacks for that tunnel
-	// are ordered, while callbacks for different tunnels may run concurrently. A
-	// callback blocks its caller: Started delays relay and Ended delays handler return.
+	// RawTCPInterceptor observes classified raw TCP tunnels. It is called synchronously
+	// once per tunnel immediately before relay, so a slow callback delays relay.
+	// Callbacks for different tunnels may run concurrently.
 	//
 	// RawTCPInterceptor is observation-only. It receives no relayed connection or
 	// payload and cannot allow, reject, or modify relay.
