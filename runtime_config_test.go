@@ -35,6 +35,52 @@ func TestNewDynamicMitmProxyHandler(t *testing.T) {
 	}
 }
 
+func TestHTTP1PipelineDepthConfiguration(t *testing.T) {
+	if got := newOptions().http1PipelineDepth; got != defaultHTTP1PipelineDepth {
+		t.Fatalf("default HTTP/1 pipeline depth = %d; want %d", got, defaultHTTP1PipelineDepth)
+	}
+
+	certPath, keyPath := writeRuntimeTestCA(t, "pipeline config ca")
+	handler, err := NewResourceLimitedDynamicMitmProxyHandler(
+		WithCACertPath(certPath),
+		WithCAKeyPath(keyPath),
+		WithHTTP1PipelineDepth(1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Cleanup()
+
+	h := handler.(*mitmProxyHandler)
+	if got := h.config.Load().state.http1PipelineDepth; got != 1 {
+		t.Fatalf("configured HTTP/1 pipeline depth = %d; want 1", got)
+	}
+	if err := handler.SetHTTP1PipelineDepth(12); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.config.Load().state.http1PipelineDepth; got != 12 {
+		t.Fatalf("runtime HTTP/1 pipeline depth = %d; want 12", got)
+	}
+	if err := handler.SetHTTP1PipelineDepth(0); !errors.Is(err, ErrInvalidHTTP1PipelineDepth) {
+		t.Fatalf("SetHTTP1PipelineDepth err = %v; want ErrInvalidHTTP1PipelineDepth", err)
+	}
+	if got := h.config.Load().state.http1PipelineDepth; got != 12 {
+		t.Fatalf("invalid update published depth %d; want 12", got)
+	}
+}
+
+func TestInvalidHTTP1PipelineDepthRejectsHandler(t *testing.T) {
+	certPath, keyPath := writeRuntimeTestCA(t, "invalid pipeline config ca")
+	_, err := NewMitmProxyHandler(
+		WithCACertPath(certPath),
+		WithCAKeyPath(keyPath),
+		WithHTTP1PipelineDepth(0),
+	)
+	if !errors.Is(err, ErrInvalidHTTP1PipelineDepth) {
+		t.Fatalf("NewMitmProxyHandler err = %v; want ErrInvalidHTTP1PipelineDepth", err)
+	}
+}
+
 func TestRuntimeConfigSettersDoNotPublishOnError(t *testing.T) {
 	certPath, keyPath := writeRuntimeTestCA(t, "dynamic ca")
 	handler, err := NewResourceLimitedDynamicMitmProxyHandler(

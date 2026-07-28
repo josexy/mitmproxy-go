@@ -2,7 +2,9 @@ package mitmproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -124,6 +126,576 @@ func TestPlainProxyAnswersPipelinedRequests(t *testing.T) {
 	}
 }
 
+func TestPlainProxyForwardsPipelinedRequestsUpstream(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	secondBeforeResponse := make(chan bool, 1)
+	go func() {
+		conn, acceptErr := upstream.Accept()
+		if acceptErr != nil {
+			secondBeforeResponse <- false
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		first, readErr := http.ReadRequest(reader)
+		if readErr != nil {
+			secondBeforeResponse <- false
+			return
+		}
+		_ = first.Body.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		second, readErr := http.ReadRequest(reader)
+		pipelined := readErr == nil && second.URL.Path == "/b"
+		secondBeforeResponse <- pipelined
+		_ = conn.SetReadDeadline(time.Time{})
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+		if !pipelined {
+			second, readErr = http.ReadRequest(reader)
+		}
+		if readErr == nil {
+			_ = second.Body.Close()
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb")
+		}
+	}()
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	conn, reader := dialProxy(t, listener)
+	host := upstream.Addr().String()
+	if _, err := fmt.Fprintf(conn,
+		"GET http://%s/a HTTP/1.1\r\nHost: %s\r\n\r\nGET http://%s/b HTTP/1.1\r\nHost: %s\r\n\r\n",
+		host, host, host, host); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"a", "b"} {
+		_, body := readProxyResponse(t, reader, http.MethodGet)
+		if body != want {
+			t.Fatalf("response body = %q; want %q", body, want)
+		}
+	}
+	if pipelined := <-secondBeforeResponse; !pipelined {
+		t.Fatal("second request did not reach upstream before the first response")
+	}
+}
+
+func TestPlainProxyPipelinesAcrossTargetsAndOrdersResponses(t *testing.T) {
+	secondReceived := make(chan struct{})
+	first := startBlockingPipelineUpstream(t, secondReceived, "a")
+	second := startSignalingPipelineUpstream(t, secondReceived, "b")
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	conn, reader := dialProxy(t, listener)
+	if _, err := fmt.Fprintf(conn,
+		"GET http://%s/a HTTP/1.1\r\nHost: %s\r\n\r\nGET http://%s/b HTTP/1.1\r\nHost: %s\r\n\r\n",
+		first, first, second, second); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{"a", "b"} {
+		_, body := readProxyResponse(t, reader, http.MethodGet)
+		if body != want {
+			t.Fatalf("ordered response body = %q; want %q", body, want)
+		}
+	}
+}
+
+func TestPlainProxyPipelinesAfterRequestBody(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	requests := make(chan string, 2)
+	go func() {
+		conn, acceptErr := upstream.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for range 2 {
+			req, readErr := http.ReadRequest(reader)
+			if readErr != nil {
+				return
+			}
+			body, _ := io.ReadAll(req.Body)
+			_ = req.Body.Close()
+			requests <- req.URL.Path + ":" + string(body)
+		}
+		_, _ = io.WriteString(conn,
+			"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na"+
+				"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb")
+	}()
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	conn, reader := dialProxy(t, listener)
+	host := upstream.Addr().String()
+	if _, err := fmt.Fprintf(conn,
+		"POST http://%s/a HTTP/1.1\r\nHost: %s\r\nContent-Length: 4\r\n\r\ndata"+
+			"GET http://%s/b HTTP/1.1\r\nHost: %s\r\n\r\n",
+		host, host, host, host); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"/a:data", "/b:"} {
+		select {
+		case got := <-requests:
+			if got != want {
+				t.Fatalf("upstream request = %q; want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("upstream did not receive %q before responding", want)
+		}
+	}
+	for _, want := range []string{"a", "b"} {
+		_, body := readProxyResponse(t, reader, http.MethodPost)
+		if body != want {
+			t.Fatalf("response body = %q; want %q", body, want)
+		}
+	}
+}
+
+func TestHTTP1PipelineRunsInterceptorsConcurrently(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	go func() {
+		conn, acceptErr := upstream.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		for range 2 {
+			request, readErr := http.ReadRequest(reader)
+			if readErr != nil {
+				return
+			}
+			_ = request.Body.Close()
+		}
+		_, _ = io.WriteString(conn,
+			"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na"+
+				"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb")
+	}()
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	interceptor := func(ctx context.Context, req *http.Request, next HTTPDelegatedInvoker) (*http.Response, error) {
+		current := active.Add(1)
+		for {
+			old := maximum.Load()
+			if current <= old || maximum.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		return next.Invoke(req)
+	}
+	listener := startKeepAliveProxy(t, WithDisableHTTP2(), WithHTTPInterceptor(interceptor))
+	conn, reader := dialProxy(t, listener)
+	host := upstream.Addr().String()
+	if _, err := fmt.Fprintf(conn,
+		"GET http://%s/a HTTP/1.1\r\nHost: %s\r\n\r\nGET http://%s/b HTTP/1.1\r\nHost: %s\r\n\r\n",
+		host, host, host, host); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		_, _ = readProxyResponse(t, reader, http.MethodGet)
+	}
+	if got := maximum.Load(); got < 2 {
+		t.Fatalf("maximum concurrent interceptors = %d; want at least 2", got)
+	}
+}
+
+func TestHTTP1PipelineDepthOneIsSequential(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	pipelined := make(chan bool, 1)
+	go func() {
+		conn, acceptErr := upstream.Accept()
+		if acceptErr != nil {
+			pipelined <- false
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		first, readErr := http.ReadRequest(reader)
+		if readErr != nil {
+			pipelined <- false
+			return
+		}
+		_ = first.Body.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		second, secondErr := http.ReadRequest(reader)
+		pipelined <- secondErr == nil
+		_ = conn.SetReadDeadline(time.Time{})
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+		if secondErr != nil {
+			second, _ = http.ReadRequest(reader)
+		}
+		if second != nil {
+			_ = second.Body.Close()
+			_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nb")
+		}
+	}()
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2(), WithHTTP1PipelineDepth(1))
+	conn, reader := dialProxy(t, listener)
+	host := upstream.Addr().String()
+	_, _ = fmt.Fprintf(conn,
+		"GET http://%s/a HTTP/1.1\r\nHost: %s\r\n\r\nGET http://%s/b HTTP/1.1\r\nHost: %s\r\n\r\n",
+		host, host, host, host)
+	for range 2 {
+		_, _ = readProxyResponse(t, reader, http.MethodGet)
+	}
+	if <-pipelined {
+		t.Fatal("pipeline depth 1 forwarded the second request before the first response")
+	}
+}
+
+// Requests parsed after the initial http.Server request must retain the
+// downstream connection lifetime. Otherwise a disconnected client leaves a
+// later long poll running against the upstream server.
+func TestHTTP1KeepAliveDisconnectCancelsLaterRequest(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/warmup" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		close(started)
+		select {
+		case <-req.Context().Done():
+			close(canceled)
+		case <-release:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	conn, reader := dialProxy(t, listener)
+	host := strings.TrimPrefix(upstream.URL, "http://")
+
+	if _, err := fmt.Fprintf(conn, "GET %s/warmup HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.URL, host); err != nil {
+		t.Fatal(err)
+	}
+	if response, _ := readProxyResponse(t, reader, http.MethodGet); response.StatusCode != http.StatusNoContent {
+		t.Fatalf("warmup status = %d; want 204", response.StatusCode)
+	}
+	if _, err := fmt.Fprintf(conn, "GET %s/poll HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.URL, host); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("upstream long poll did not start")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("upstream long poll was not canceled after the downstream disconnected")
+	}
+}
+
+// Waiting for an upstream response is active work, not an idle client
+// connection. The idle timeout starts only after the outstanding response has
+// been written, so a long poll can still reuse the downstream connection.
+func TestHTTP1IdleTimeoutDoesNotCloseActiveLongPoll(t *testing.T) {
+	const idleTimeout = 150 * time.Millisecond
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSlow := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseSlow()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/slow" {
+			close(started)
+			<-release
+		}
+		_, _ = io.WriteString(w, strings.TrimPrefix(req.URL.Path, "/"))
+	}))
+	defer upstream.Close()
+
+	listener := startKeepAliveProxy(t,
+		WithDisableHTTP2(),
+		WithIdleConnTimeout(idleTimeout),
+	)
+	conn, reader := dialProxy(t, listener)
+	host := strings.TrimPrefix(upstream.URL, "http://")
+
+	if _, err := fmt.Fprintf(conn, "GET %s/slow HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.URL, host); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("upstream long poll did not start")
+	}
+	time.Sleep(2 * idleTimeout)
+	releaseSlow()
+	if response, body := readProxyResponse(t, reader, http.MethodGet); response.StatusCode != http.StatusOK || body != "slow" {
+		t.Fatalf("slow response = %d %q; want 200 slow", response.StatusCode, body)
+	}
+
+	if _, err := fmt.Fprintf(conn, "GET %s/next HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.URL, host); err != nil {
+		t.Fatal(err)
+	}
+	if response, body := readProxyResponse(t, reader, http.MethodGet); response.StatusCode != http.StatusOK || body != "next" {
+		t.Fatalf("next response = %d %q; want 200 next", response.StatusCode, body)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("downstream connection closed with an unexpected byte before its idle timeout")
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("downstream connection closed before its idle timeout: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("truly idle downstream connection remained open")
+	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatal("proxy did not re-arm the idle timeout after the active response completed")
+	}
+}
+
+type failingResponseBody struct{}
+
+func (failingResponseBody) Read([]byte) (int, error) {
+	return 0, errors.New("response body read failed")
+}
+
+func (failingResponseBody) Close() error { return nil }
+
+// A terminal writer error must wake the goroutine reading the next request,
+// including when idle timeouts are disabled.
+func TestHTTP1WriterErrorWakesRequestReader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {}))
+	defer upstream.Close()
+
+	interceptorStarted := make(chan struct{})
+	releaseInterceptor := make(chan struct{})
+	failed := make(chan error, 1)
+	listener := startKeepAliveProxy(t,
+		WithDisableHTTP2(),
+		WithIdleConnTimeout(0),
+		WithHTTPInterceptor(func(ctx context.Context, req *http.Request, next HTTPDelegatedInvoker) (*http.Response, error) {
+			close(interceptorStarted)
+			<-releaseInterceptor
+			return &http.Response{
+				Status:        "200 OK",
+				StatusCode:    http.StatusOK,
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        make(http.Header),
+				Body:          failingResponseBody{},
+				ContentLength: 1,
+				Request:       req,
+			}, nil
+		}),
+		WithErrorHandler(func(ec ErrorContext) {
+			select {
+			case failed <- ec.Error:
+			default:
+			}
+		}),
+	)
+	conn, _ := dialProxy(t, listener)
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	if _, err := fmt.Fprintf(conn, "GET %s/fail HTTP/1.1\r\nHost: %s\r\n\r\n", upstream.URL, host); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-interceptorStarted:
+	case <-time.After(time.Second):
+		t.Fatal("interceptor did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(releaseInterceptor)
+
+	select {
+	case err := <-failed:
+		if err == nil {
+			t.Fatal("proxy reported a nil writer error")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("terminal writer error did not wake the request reader")
+	}
+}
+
+func TestHTTP1PipelineExpectContinueWaitsForPriorResponse(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	go func() {
+		conn, acceptErr := upstream.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		first, readErr := http.ReadRequest(reader)
+		if readErr != nil {
+			return
+		}
+		_ = first.Body.Close()
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+		second, readErr := http.ReadRequest(reader)
+		if readErr != nil {
+			return
+		}
+		body, _ := io.ReadAll(second.Body)
+		_ = second.Body.Close()
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	}()
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	conn, reader := dialProxy(t, listener)
+	host := upstream.Addr().String()
+	if _, err := fmt.Fprintf(conn,
+		"GET http://%s/a HTTP/1.1\r\nHost: %s\r\n\r\n"+
+			"POST http://%s/b HTTP/1.1\r\nHost: %s\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n",
+		host, host, host, host); err != nil {
+		t.Fatal(err)
+	}
+	first, body := readProxyResponse(t, reader, http.MethodGet)
+	if first.StatusCode != http.StatusOK || body != "a" {
+		t.Fatalf("first response = %d %q; want 200 a", first.StatusCode, body)
+	}
+	continued, err := http.ReadResponse(reader, &http.Request{Method: http.MethodPost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = continued.Body.Close()
+	if continued.StatusCode != http.StatusContinue {
+		t.Fatalf("response after first final = %d; want 100", continued.StatusCode)
+	}
+	if _, err := io.WriteString(conn, "data"); err != nil {
+		t.Fatal(err)
+	}
+	final, body := readProxyResponse(t, reader, http.MethodPost)
+	if final.StatusCode != http.StatusOK || body != "data" {
+		t.Fatalf("second final response = %d %q; want 200 data", final.StatusCode, body)
+	}
+}
+
+func TestHTTP1PipelineDoesNotRetryUnansweredUnsafeRequest(t *testing.T) {
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	go func() {
+		conn, acceptErr := upstream.Accept()
+		if acceptErr != nil {
+			return
+		}
+		reader := bufio.NewReader(conn)
+		for range 2 {
+			request, readErr := http.ReadRequest(reader)
+			if readErr != nil {
+				_ = conn.Close()
+				return
+			}
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+		}
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\na")
+		_ = conn.Close()
+	}()
+
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	conn, reader := dialProxy(t, listener)
+	host := upstream.Addr().String()
+	if _, err := fmt.Fprintf(conn,
+		"GET http://%s/a HTTP/1.1\r\nHost: %s\r\n\r\n"+
+			"POST http://%s/b HTTP/1.1\r\nHost: %s\r\nContent-Length: 4\r\n\r\ndata",
+		host, host, host, host); err != nil {
+		t.Fatal(err)
+	}
+	first, body := readProxyResponse(t, reader, http.MethodGet)
+	if first.StatusCode != http.StatusOK || body != "a" {
+		t.Fatalf("first response = %d %q; want 200 a", first.StatusCode, body)
+	}
+	second, _ := readProxyResponse(t, reader, http.MethodPost)
+	if second.StatusCode != http.StatusBadGateway || !second.Close {
+		t.Fatalf("unsafe unanswered response = %d close=%t; want 502 close", second.StatusCode, second.Close)
+	}
+}
+
+func startBlockingPipelineUpstream(t *testing.T, release <-chan struct{}, body string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		request, readErr := http.ReadRequest(bufio.NewReader(conn))
+		if readErr != nil {
+			return
+		}
+		_ = request.Body.Close()
+		select {
+		case <-release:
+		case <-time.After(time.Second):
+			return
+		}
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	}()
+	return listener.Addr().String()
+}
+
+func startSignalingPipelineUpstream(t *testing.T, received chan<- struct{}, body string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		request, readErr := http.ReadRequest(bufio.NewReader(conn))
+		if readErr != nil {
+			return
+		}
+		_ = request.Body.Close()
+		close(received)
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	}()
+	return listener.Addr().String()
+}
+
 // The deadline that bounds reading a request header must not follow the
 // connection into a protocol that owns it for its whole lifetime.
 func TestH2CUpgradeOutlivesHandshakeTimeout(t *testing.T) {
@@ -158,6 +730,71 @@ func TestH2CUpgradeOutlivesHandshakeTimeout(t *testing.T) {
 		if _, err := io.ReadFull(reader, got); err != nil {
 			t.Fatalf("h2c tunnel died %v after the upgrade: %v", time.Duration(i+1)*100*time.Millisecond, err)
 		}
+	}
+}
+
+func TestConnectTunnelRelaysRawTCP(t *testing.T) {
+	echo := startEchoServer(t)
+	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+
+	for name, payload := range map[string][]byte{
+		"binary":        {0xef, 0x01, 0x02, 0x03, 0x00, 0xff, 0x7f, 0x10},
+		"text protocol": []byte("GET key\r\n"),
+		"rtsp":          []byte("OPTIONS rtsp://example.test/media RTSP/1.0\r\n\r\n"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn, reader := dialProxy(t, listener)
+			connect := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echo, echo)
+			if _, err := conn.Write(append([]byte(connect), payload...)); err != nil {
+				t.Fatal(err)
+			}
+			readConnectResponse(t, reader)
+
+			if err := conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(payload))
+			if _, err := io.ReadFull(reader, got); err != nil {
+				t.Fatalf("read raw CONNECT echo: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("raw CONNECT echo = %x; want %x", got, payload)
+			}
+		})
+	}
+}
+
+func TestConnectTunnelInterceptsExtensionHTTPMethod(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, _ = io.WriteString(w, req.Method)
+	}))
+	defer upstream.Close()
+
+	listener := startKeepAliveProxy(t,
+		WithDisableHTTP2(),
+		WithHTTPInterceptor(func(ctx context.Context, req *http.Request, next HTTPDelegatedInvoker) (*http.Response, error) {
+			response, err := next.Invoke(req)
+			if err == nil {
+				response.Header.Set("X-Intercepted", "yes")
+			}
+			return response, err
+		}),
+	)
+	conn, reader := dialProxy(t, listener)
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host); err != nil {
+		t.Fatal(err)
+	}
+	readConnectResponse(t, reader)
+	if _, err := fmt.Fprintf(conn, "REPORT /resource HTTP/1.1\r\nHost: %s\r\nContent-Length: 0\r\n\r\n", host); err != nil {
+		t.Fatal(err)
+	}
+	response, body := readProxyResponse(t, reader, "REPORT")
+	if response.StatusCode != http.StatusOK || body != "REPORT" {
+		t.Fatalf("extension response = %d %q; want 200 REPORT", response.StatusCode, body)
+	}
+	if got := response.Header.Get("X-Intercepted"); got != "yes" {
+		t.Fatalf("X-Intercepted = %q; want yes", got)
 	}
 }
 
@@ -406,7 +1043,7 @@ func TestMalformedTunnelRequestIsAnswered(t *testing.T) {
 		t.Fatal(err)
 	}
 	readConnectResponse(t, reader)
-	if _, err := io.WriteString(conn, "NOT A REQUEST LINE\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(conn, "GET / HTTP/not-a-version\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
 	response, _ := readProxyResponse(t, reader, http.MethodGet)

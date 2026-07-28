@@ -16,16 +16,19 @@ import (
 )
 
 type singleConnTransport struct {
-	hostport     string
-	dialFn       func(ctx context.Context, network, addr string) (net.Conn, error)
-	idleTimeout  time.Duration
-	disableHTTP2 bool
+	hostport      string
+	dialFn        func(ctx context.Context, network, addr string) (net.Conn, error)
+	idleTimeout   time.Duration
+	disableHTTP2  bool
+	pipelineDepth int
 
-	mu         sync.Mutex
-	clientConn *http.ClientConn
-	retired    []*http.ClientConn
-	upstream   string
-	closed     bool
+	mu            sync.Mutex
+	clientConn    *http.ClientConn
+	http1Conn     *http1PipelineConn
+	http1Degraded bool
+	retired       []*http.ClientConn
+	upstream      string
+	closed        bool
 }
 
 func newTransport(
@@ -33,16 +36,25 @@ func newTransport(
 	dialFn func(ctx context.Context, network, addr string) (net.Conn, error),
 	idleConnTimeout time.Duration,
 	disableHTTP2 bool,
+	pipelineDepth ...int,
 ) *singleConnTransport {
+	depth := 0
+	if len(pipelineDepth) > 0 && pipelineDepth[0] > 0 {
+		depth = pipelineDepth[0]
+	}
 	return &singleConnTransport{
-		hostport:     hostport,
-		dialFn:       dialFn,
-		idleTimeout:  idleConnTimeout,
-		disableHTTP2: disableHTTP2,
+		hostport:      hostport,
+		dialFn:        dialFn,
+		idleTimeout:   idleConnTimeout,
+		disableHTTP2:  disableHTTP2,
+		pipelineDepth: depth,
 	}
 }
 
 func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.shouldUseHTTP1Pipeline(req) {
+		return t.roundTripHTTP1(req)
+	}
 	logger := loggerFromContext(req.Context())
 	for attempt := 0; ; attempt++ {
 		start := time.Now()
@@ -101,6 +113,97 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 		return nil, err
 	}
+}
+
+func (t *singleConnTransport) shouldUseHTTP1Pipeline(req *http.Request) bool {
+	if t.pipelineDepth < 1 || req == nil || req.URL == nil || req.ProtoMajor != 1 {
+		return false
+	}
+	t.mu.Lock()
+	upstream := t.upstream
+	t.mu.Unlock()
+	return req.URL.Scheme == "http" || upstream == "http/1.1"
+}
+
+func (t *singleConnTransport) roundTripHTTP1(req *http.Request) (*http.Response, error) {
+	logger := loggerFromContext(req.Context())
+	for attempt := 0; ; attempt++ {
+		conn, err := t.getHTTP1PipelineConn(req.Context())
+		if err != nil {
+			closeRequestBody(req)
+			return nil, err
+		}
+		response, err := conn.RoundTrip(req)
+		if err == nil {
+			return response, nil
+		}
+
+		nextReq, retry := replayableRequest(req)
+		retry = attempt == 0 && retry
+		degraded := t.discardHTTP1PipelineConn(conn)
+		info := http1RequestInfo(req)
+		logAttrs(req.Context(), logger, slog.LevelWarn, "http1 upstream round trip failed",
+			slog.Uint64("pipeline_sequence", info.sequence),
+			slog.String("target", info.target),
+			slog.String("hostport", t.hostport),
+			slog.String("method", requestMethod(req)),
+			slog.String("url", requestURL(req)),
+			slog.Int("attempt", attempt),
+			slog.Bool("retry", retry),
+			slog.Bool("degraded", degraded),
+			errorAttr(err),
+		)
+		if retry {
+			req = nextReq
+			continue
+		}
+		return nil, err
+	}
+}
+
+func (t *singleConnTransport) getHTTP1PipelineConn(ctx context.Context) (*http1PipelineConn, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.http1Conn != nil && t.http1Conn.Err() == nil {
+		return t.http1Conn, nil
+	}
+	if t.http1Conn != nil {
+		_ = t.http1Conn.Close()
+		t.http1Conn = nil
+	}
+
+	conn, err := t.dialFn(ctx, "tcp", t.hostport)
+	if err != nil {
+		return nil, err
+	}
+	depth := t.pipelineDepth
+	if t.http1Degraded {
+		depth = 1
+	}
+	t.http1Conn = newHTTP1PipelineConn(conn, depth, t.idleTimeout)
+	logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "http1 upstream connection created",
+		slog.String("hostport", t.hostport),
+		slog.Int("pipeline_depth", depth),
+		slog.Bool("degraded", t.http1Degraded),
+	)
+	return t.http1Conn, nil
+}
+
+func (t *singleConnTransport) discardHTTP1PipelineConn(conn *http1PipelineConn) bool {
+	t.mu.Lock()
+	if t.http1Conn != conn {
+		degraded := t.http1Degraded
+		t.mu.Unlock()
+		return degraded
+	}
+	t.http1Conn = nil
+	t.http1Degraded = true
+	t.mu.Unlock()
+	_ = conn.Close()
+	return true
 }
 
 func closeRequestBody(req *http.Request) {
@@ -223,12 +326,17 @@ func (t *singleConnTransport) Close() error {
 	t.closed = true
 	clientConn := t.clientConn
 	t.clientConn = nil
+	http1Conn := t.http1Conn
+	t.http1Conn = nil
 	retired := t.retired
 	t.retired = nil
 	t.mu.Unlock()
 
 	if clientConn != nil {
 		_ = clientConn.Close()
+	}
+	if http1Conn != nil {
+		_ = http1Conn.Close()
 	}
 	for _, conn := range retired {
 		_ = conn.Close()

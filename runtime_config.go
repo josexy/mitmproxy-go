@@ -20,6 +20,7 @@ var (
 	ErrInvalidWebsocketBufferedBytes   = errors.New("websocket buffered bytes must be at least the maximum message size")
 	ErrInvalidHTTPHeaderSize           = errors.New("HTTP header size must be greater than 0")
 	ErrInvalidHandshakeTimeout         = errors.New("handshake timeout must be greater than 0")
+	ErrInvalidHTTP1PipelineDepth       = errors.New("HTTP/1 pipeline depth must be greater than 0")
 )
 
 type RuntimeConfigManager interface {
@@ -46,6 +47,7 @@ type RuntimeConfigManager interface {
 type RuntimeResourceLimitManager interface {
 	SetHandshakeTimeout(timeout time.Duration) error
 	SetMaxHTTPHeaderBytes(maxBytes int) error
+	SetHTTP1PipelineDepth(depth int) error
 	SetMaxWebsocketMessageBytes(maxBytes int64) error
 	SetMaxWebsocketBufferedBytes(maxBytes int64) error
 }
@@ -76,6 +78,7 @@ type runtimeConfigState struct {
 	idleConnTimeout       time.Duration
 	handshakeTimeout      time.Duration
 	maxHTTPHeaderBytes    int
+	http1PipelineDepth    int
 	wsMaxFramesPerForward int
 	wsMaxMessageBytes     int64
 	wsMaxBufferedBytes    int64
@@ -116,6 +119,7 @@ func newRuntimeConfigStateFromOptions(opts *options) runtimeConfigState {
 		idleConnTimeout:       opts.idleConnTimeout,
 		handshakeTimeout:      opts.handshakeTimeout,
 		maxHTTPHeaderBytes:    opts.maxHTTPHeaderBytes,
+		http1PipelineDepth:    opts.http1PipelineDepth,
 		wsMaxFramesPerForward: opts.wsMaxFramesPerForward,
 		wsMaxMessageBytes:     opts.wsMaxMessageBytes,
 		wsMaxBufferedBytes:    opts.wsMaxBufferedBytes,
@@ -156,6 +160,9 @@ func buildRuntimeConfig(state runtimeConfigState) (*runtimeConfig, error) {
 	}
 	if state.maxHTTPHeaderBytes <= 0 {
 		return nil, ErrInvalidHTTPHeaderSize
+	}
+	if state.http1PipelineDepth <= 0 {
+		return nil, ErrInvalidHTTP1PipelineDepth
 	}
 	if state.handshakeTimeout <= 0 {
 		return nil, ErrInvalidHandshakeTimeout

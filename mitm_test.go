@@ -1,6 +1,7 @@
 package mitmproxy_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509/pkix"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -281,6 +283,165 @@ func TestMitmProxyHandler(t *testing.T) {
 	}
 
 	closeFunc()
+}
+
+func TestTLSRawTCPThroughMitm(t *testing.T) {
+	initCertPath()
+	genCACertAndKey()
+	genServerCertAndKey()
+	defer os.RemoveAll(certdir)
+
+	certificate, err := tls.LoadX509KeyPair(serverCertPath, serverKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte{0x00, 0x01, 0x02, 'r', 'a', 'w'}
+	origin := listenLocalhost(t)
+	defer origin.Close()
+	originErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := origin.Accept()
+		if acceptErr != nil {
+			originErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		tlsConn := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
+		request := make([]byte, len(payload))
+		if _, readErr := io.ReadFull(tlsConn, request); readErr != nil {
+			originErr <- readErr
+			return
+		}
+		_, writeErr := tlsConn.Write(request)
+		originErr <- writeErr
+	}()
+
+	var intercepted atomic.Int32
+	handler := buildMitmHandler(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+		intercepted.Add(1)
+		return hi.Invoke(req)
+	})
+	proxyLn := listenLocalhost(t)
+	proxyServer := &http.Server{Handler: handler}
+	go func() {
+		if serveErr := proxyServer.Serve(proxyLn); serveErr != nil && serveErr != http.ErrServerClosed {
+			t.Errorf("proxy server failed: %v", serveErr)
+		}
+	}()
+	defer proxyServer.Close()
+
+	proxyURL := &url.URL{Scheme: "http", Host: proxyLn.Addr().String()}
+	tunnel, err := mitmproxy.NewProxyDialer(proxyURL, nil).Dial("tcp", origin.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := tls.Client(tunnel, &tls.Config{InsecureSkipVerify: true, ServerName: "localhost"})
+	defer client.Close()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, len(payload))
+	if _, err := io.ReadFull(client, response); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(response, payload) {
+		t.Fatalf("response = %x; want %x", response, payload)
+	}
+	if err := <-originErr; err != nil {
+		t.Fatal(err)
+	}
+	if intercepted.Load() != 0 {
+		t.Fatalf("HTTP interceptor called %d times for TLS raw TCP", intercepted.Load())
+	}
+}
+
+func TestTLSRawTCPWithCustomALPNThroughMitm(t *testing.T) {
+	initCertPath()
+	genCACertAndKey()
+	genServerCertAndKey()
+	defer os.RemoveAll(certdir)
+
+	certificate, err := tls.LoadX509KeyPair(serverCertPath, serverKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rawALPN = "raw.test"
+	greeting := []byte{0x00, 'r', 'e', 'a', 'd', 'y'}
+	origin := listenLocalhost(t)
+	defer origin.Close()
+	originErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := origin.Accept()
+		if acceptErr != nil {
+			originErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		tlsConn := tls.Server(conn, &tls.Config{
+			Certificates: []tls.Certificate{certificate},
+			NextProtos:   []string{rawALPN},
+		})
+		if handshakeErr := tlsConn.Handshake(); handshakeErr != nil {
+			originErr <- handshakeErr
+			return
+		}
+		_, writeErr := tlsConn.Write(greeting)
+		originErr <- writeErr
+	}()
+
+	var intercepted atomic.Int32
+	handler := buildMitmHandler(t, func(ctx context.Context, req *http.Request, hi mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+		intercepted.Add(1)
+		return hi.Invoke(req)
+	})
+	proxyLn := listenLocalhost(t)
+	proxyServer := &http.Server{Handler: handler}
+	go func() {
+		if serveErr := proxyServer.Serve(proxyLn); serveErr != nil && serveErr != http.ErrServerClosed {
+			t.Errorf("proxy server failed: %v", serveErr)
+		}
+	}()
+	defer proxyServer.Close()
+
+	proxyURL := &url.URL{Scheme: "http", Host: proxyLn.Addr().String()}
+	tunnel, err := mitmproxy.NewProxyDialer(proxyURL, nil).Dial("tcp", origin.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := tls.Client(tunnel, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "localhost",
+		NextProtos:         []string{rawALPN},
+	})
+	defer client.Close()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.ConnectionState().NegotiatedProtocol; got != rawALPN {
+		t.Fatalf("negotiated ALPN = %q; want %q", got, rawALPN)
+	}
+	response := make([]byte, len(greeting))
+	if _, err := io.ReadFull(client, response); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(response, greeting) {
+		t.Fatalf("response = %x; want %x", response, greeting)
+	}
+	if err := <-originErr; err != nil {
+		t.Fatal(err)
+	}
+	if intercepted.Load() != 0 {
+		t.Fatalf("HTTP interceptor called %d times for custom-ALPN TLS raw TCP", intercepted.Load())
+	}
 }
 
 func TestHTTPSConnectionTimestamps(t *testing.T) {

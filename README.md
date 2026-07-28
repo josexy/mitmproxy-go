@@ -4,7 +4,7 @@ An easy-to-use and flexible MITM proxy library for Go. It can intercept and insp
 
 ## Features
 
-- HTTP/1.1, HTTP/2 over TLS, and h2c support
+- HTTP/1.1 keep-alive and end-to-end pipelining, HTTP/2 over TLS, and h2c support
 - HTTPS interception with custom CA certificates
 - WebSocket and secure WebSocket interception
 - HTTP proxy mode and SOCKS5 proxy mode
@@ -211,6 +211,8 @@ mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {})
 
 Internal proxy logging is disabled by default. Pass `WithLogger(logger)` to enable structured `slog` output; pass `WithLogger(nil)` to disable it. Log messages are prefixed with `[mitmproxy-go]`. Core logs include connection, routing, TLS, HTTP, HTTP/2, WebSocket, transport retry, and runtime config metadata, but do not log URL credentials/query strings, headers, bodies, WebSocket payloads, or raw certificates.
 
+HTTP/1 pipeline diagnostics are emitted at `Debug` with messages beginning `http1 pipeline` or `http1 upstream`. Correlate a request with `pipeline_sequence` and `target`; `in_flight`, `pipeline_depth`, `status_code`, and duration fields show where it is waiting. Upstream failures, downstream write failures, and automatic serial downgrade are emitted at `Warn` with error and retry/degrade fields.
+
 ### Upstream and Transport
 
 ```go
@@ -221,11 +223,14 @@ mitmproxy.WithDialer(&net.Dialer{Timeout: 30 * time.Second})
 mitmproxy.WithIdleConnTimeout(60 * time.Second)
 mitmproxy.WithHandshakeTimeout(10 * time.Second)
 mitmproxy.WithMaxHTTPHeaderBytes(1 << 20)
+mitmproxy.WithHTTP1PipelineDepth(8)
 mitmproxy.WithDisableHTTP2()
 mitmproxy.WithSkipVerifySSLFromServer()
 ```
 
 `WithIdleConnTimeout` defaults to 90 seconds and bounds how long an idle HTTP keep-alive connection, together with the upstream connection pinned to it, is kept around. Pass `0` to disable it.
+
+`WithHTTP1PipelineDepth` defaults to 8 and bounds the number of HTTP/1 requests on one client connection that have not completed writing back. Requests for the same origin are pipelined on one upstream HTTP/1.1 connection; requests for different origins use separate upstream connections and may run concurrently. Responses are always returned in the client's original request order. Set the depth to 1 to retain keep-alive while disabling pipelining. `Expect: 100-continue`, protocol upgrades, and connection-closing requests remain ordering barriers.
 
 If `WithProxy` is not set, `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables are considered. HTTP, HTTPS CONNECT, SOCKS5, and SOCKS5H upstream proxy URLs are supported. Destination hostnames are resolved locally before the resolved IP address is sent to an upstream proxy. `WithDisableProxy` disables both explicit and environment proxy settings.
 
@@ -258,6 +263,8 @@ mitmproxy.WithMaxWebsocketBufferedBytes(64 << 20)
 ```
 
 When both `WithHTTPInterceptor` and `WithChainHTTPInterceptor` are configured, the single interceptor runs first and then the chain runs in the order provided.
+
+HTTP interceptors may be called concurrently for pipelined requests from the same HTTP/1.1 client connection, just as they may be for HTTP/2 streams and independent clients. Interceptors that share mutable state must synchronize it.
 
 For WebSocket frames received from `WebsocketFramesWatcher`, call either `frame.Invoke()` to forward the frame or `frame.Release()` to drop it and release the backing buffer. `frame.Invoke()` releases the backing buffer after forwarding.
 
@@ -310,6 +317,7 @@ handler.SetClientCerts(map[string]mitmproxy.ClientCert{
 handler.SetIdleConnTimeout(60 * time.Second)
 err := handler.SetHandshakeTimeout(10 * time.Second)
 err = handler.SetMaxHTTPHeaderBytes(1 << 20)
+err = handler.SetHTTP1PipelineDepth(8)
 handler.SetSkipVerifySSLFromServer(true)
 handler.SetHTTP2Disabled(true)
 handler.SetStreamBaseContext(ctx)

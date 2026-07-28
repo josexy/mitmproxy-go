@@ -673,7 +673,7 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 func newTransportForTarget(connCtx *biConnContext, hostport string) *singleConnTransport {
 	return newTransport(hostport, func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return connCtx.dialRemote(ctx, network, addr)
-	}, connCtx.config.state.idleConnTimeout, connCtx.config.state.disableHTTP2)
+	}, connCtx.config.state.idleConnTimeout, connCtx.config.state.disableHTTP2, connCtx.config.state.http1PipelineDepth)
 }
 
 // retargetTunnel points a plain proxy connection at a new upstream. Such a
@@ -1080,6 +1080,195 @@ func isTLS(data []byte) bool {
 	return data[0] == 0x16 && data[1] == 0x03 && data[2] <= 0x03
 }
 
+type tunnelProtocol uint8
+
+const (
+	tunnelProtocolHTTP tunnelProtocol = iota
+	tunnelProtocolTLS
+	tunnelProtocolRaw
+)
+
+func detectTunnelProtocol(conn *bufConn) (tunnelProtocol, error) {
+	data, err := conn.Peek(3)
+	if err != nil {
+		return tunnelProtocolRaw, err
+	}
+	if isTLS(data) {
+		return tunnelProtocolTLS, nil
+	}
+	return detectHTTPProtocol(conn)
+}
+
+func detectHTTPProtocol(conn *bufConn) (tunnelProtocol, error) {
+	const (
+		requestLineMethod = iota
+		requestLineTarget
+		requestLineVersion
+	)
+	state := requestLineMethod
+	methodEnd, targetEnd, targetBytes := 0, 0, 0
+	versionStart := 0
+	var data []byte
+	for width := 1; width <= conn.r.Size(); width++ {
+		var err error
+		data, err = conn.Peek(width)
+		if err != nil {
+			return tunnelProtocolRaw, err
+		}
+		value := data[width-1]
+		switch state {
+		case requestLineMethod:
+			if value == ' ' {
+				if width == 1 {
+					return tunnelProtocolRaw, nil
+				}
+				methodEnd = width - 1
+				state = requestLineTarget
+				continue
+			}
+			if !isHTTPMethodByte(value) {
+				return tunnelProtocolRaw, nil
+			}
+		case requestLineTarget:
+			if value == ' ' {
+				if targetBytes == 0 {
+					return tunnelProtocolRaw, nil
+				}
+				targetEnd = width - 1
+				versionStart = width
+				state = requestLineVersion
+				continue
+			}
+			if value <= ' ' || value >= 0x7f {
+				return tunnelProtocolRaw, nil
+			}
+			targetBytes++
+		case requestLineVersion:
+			if value == '\n' {
+				versionEnd := width - 1
+				if versionEnd > versionStart && data[versionEnd-1] == '\r' {
+					versionEnd--
+				}
+				method := string(data[:methodEnd])
+				target := string(data[methodEnd+1 : targetEnd])
+				version := string(data[versionStart:versionEnd])
+				major, _, ok := http.ParseHTTPVersion(version)
+				if ok && (major == 1 || (method == "PRI" && target == "*" && version == "HTTP/2.0")) {
+					return tunnelProtocolHTTP, nil
+				}
+				return tunnelProtocolRaw, nil
+			}
+			if !isPotentialHTTPVersion(data[versionStart:width]) {
+				return tunnelProtocolRaw, nil
+			}
+		}
+	}
+
+	// A request line longer than the sniff buffer is still HTTP-like once it
+	// has a method and target. Let the bounded HTTP parser apply the configured
+	// header limit instead of silently bypassing interception.
+	if state == requestLineTarget && targetBytes > 0 {
+		return tunnelProtocolHTTP, nil
+	}
+	if state == requestLineVersion && isPotentialHTTPVersion(data[versionStart:]) {
+		return tunnelProtocolHTTP, nil
+	}
+	return tunnelProtocolRaw, nil
+}
+
+// detectTLSApplicationProtocol determines whether the plaintext inside an
+// established TLS tunnel is HTTP. An HTTP client speaks first, so upstream
+// application data arriving before a request identifies a raw, server-first
+// protocol. Both buffered connections preserve every byte observed here.
+func detectTLSApplicationProtocol(ctx context.Context, downstreamConn, upstreamConn net.Conn, timeout time.Duration) (tunnelProtocol, *bufConn, *bufConn, error) {
+	downstream := newBufConn(downstreamConn)
+	upstream := newBufConn(upstreamConn)
+	detectionCtx, cancelDetection := context.WithTimeout(ctx, timeout)
+	defer cancelDetection()
+	clearDownstreamDeadline := setDeadlineFromContext(detectionCtx, downstream)
+	clearUpstreamDeadline := setDeadlineFromContext(detectionCtx, upstream)
+
+	type detectionResult struct {
+		upstream bool
+		protocol tunnelProtocol
+		err      error
+	}
+	results := make(chan detectionResult, 2)
+	go func() {
+		protocol, err := detectHTTPProtocol(downstream)
+		results <- detectionResult{protocol: protocol, err: err}
+	}()
+	go func() {
+		_, err := upstream.Peek(1)
+		results <- detectionResult{upstream: true, protocol: tunnelProtocolRaw, err: err}
+	}()
+
+	first := <-results
+	// Cancel the other pending read before handing either connection to its
+	// long-lived protocol owner. net.Conn permits deadlines to interrupt Read.
+	_ = downstream.SetReadDeadline(time.Now())
+	_ = upstream.SetReadDeadline(time.Now())
+	second := <-results
+	clearDownstreamDeadline()
+	clearUpstreamDeadline()
+	if err := context.Cause(detectionCtx); err != nil {
+		return tunnelProtocolRaw, downstream, upstream, err
+	}
+
+	ordered := [2]detectionResult{first, second}
+	for _, result := range ordered {
+		if result.upstream && result.err == nil {
+			return tunnelProtocolRaw, downstream, upstream, nil
+		}
+	}
+	for _, result := range ordered {
+		if !result.upstream && result.err == nil {
+			return result.protocol, downstream, upstream, nil
+		}
+	}
+	return tunnelProtocolRaw, downstream, upstream, first.err
+}
+
+func isHTTPMethodByte(value byte) bool {
+	if value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' {
+		return true
+	}
+	switch value {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func isPotentialHTTPVersion(data []byte) bool {
+	const prefix = "HTTP/"
+	if len(data) <= len(prefix) {
+		return string(data) == prefix[:len(data)]
+	}
+
+	majorDigits, minorDigits := 0, 0
+	dot := false
+	version := data[len(prefix):]
+	for index, value := range version {
+		switch {
+		case value >= '0' && value <= '9':
+			if dot {
+				minorDigits++
+			} else {
+				majorDigits++
+			}
+		case value == '.' && !dot && majorDigits > 0:
+			dot = true
+		case value == '\r' && dot && minorDigits > 0 && index == len(version)-1:
+			return true
+		default:
+			return false
+		}
+	}
+	return majorDigits > 0
+}
+
 func setReadDeadlineForTimeout(conn net.Conn, timeout time.Duration) func() {
 	if timeout <= 0 {
 		return func() {}
@@ -1105,24 +1294,31 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	var srcConn net.Conn = connCtx.local
 	var dstConn net.Conn = connCtx.remote
 
-	var data []byte
+	protocol := tunnelProtocolHTTP
 
 	if !consumedRequest {
 		bufConn := newBufConn(srcConn)
 		clearDeadline := setReadDeadlineForTimeout(srcConn, connCtx.config.state.handshakeTimeout)
-		data, err = bufConn.Peek(3)
+		protocol, err = detectTunnelProtocol(bufConn)
 		clearDeadline()
 		if err != nil {
 			return fmt.Errorf("short buffer to peek: %s", err)
 		}
 		srcConn = bufConn
+		if protocol == tunnelProtocolRaw {
+			connCtx.closeTransport()
+			logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "raw tunnel passthrough",
+				slog.String("hostport", reqCtx.Hostport),
+			)
+			return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+		}
 	}
 
 	fakerw := newFakeHttpResponseWriter(srcConn)
 
 	var tlsRequest bool
 	// Check if the common http/websocket request with tls
-	if len(data) >= 3 && isTLS(data) {
+	if protocol == tunnelProtocolTLS {
 		tlsRequest = true
 		clientHelloInfoCh := make(chan capturedClientHello, 1)
 		tlsConnCh := make(chan upstreamTLSHandshakeResult, 1)
@@ -1226,6 +1422,48 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 			})
 			return
 		}
+
+		passthroughTLSRaw := func(reason string) error {
+			connCtx.closeTransport()
+			logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "tls raw tunnel passthrough",
+				slog.String("hostport", reqCtx.Hostport),
+				slog.String("selected_alpn", state.NegotiatedProtocol),
+				slog.String("reason", reason),
+			)
+			return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+		}
+
+		// A negotiated non-HTTP ALPN identifies the decrypted application stream
+		// as raw without waiting for client data. This also supports server-first
+		// TLS protocols.
+		if state.NegotiatedProtocol != "" && state.NegotiatedProtocol != "http/1.1" {
+			return passthroughTLSRaw("non_http_alpn")
+		}
+
+		// Without ALPN, inspect the decrypted client stream. Peeked bytes remain in
+		// bufConn so either the HTTP parser or raw relay receives the full payload.
+		// Upstream application data wins the race because HTTP/1 servers do not
+		// speak before receiving a request.
+		if state.NegotiatedProtocol == "" {
+			applicationProtocol, bufferedSrc, bufferedDst, detectErr := detectTLSApplicationProtocol(
+				ctx,
+				srcConn,
+				dstConn,
+				connCtx.config.state.handshakeTimeout,
+			)
+			if detectErr != nil {
+				if isExpectedIdleReadClose(detectErr) {
+					return nil
+				}
+				return fmt.Errorf("detect protocol inside tls tunnel: %w", detectErr)
+			}
+			srcConn = bufferedSrc
+			dstConn = bufferedDst
+			fakerw = newFakeHttpResponseWriter(srcConn)
+			if applicationProtocol == tunnelProtocolRaw {
+				return passthroughTLSRaw("non_http_payload")
+			}
+		}
 	}
 
 	request := reqCtx.Request
@@ -1236,6 +1474,9 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	// selected out of band, so for those a changing authority is a request
 	// smuggling attempt rather than ordinary connection reuse.
 	canRetarget := consumedRequest && !reqCtx.HttpConnectMethod && !reqCtx.Socks5Connect
+	if connCtx.config.state.http1PipelineDepth > 1 {
+		return r.serveHTTP1Pipeline(ctx, fakerw, request, tlsRequest, firstRead, canRetarget, srcConn)
+	}
 	for {
 		reqCtx, _ := FromRequestContext(ctx)
 		nextCtx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest, firstRead)
@@ -1533,8 +1774,14 @@ func isExpectedIdleReadClose(err error) bool {
 
 func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw http.ResponseWriter, req *http.Request) (bool, error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	waitForPriorResponses := func() {
+		if done, _ := ctx.Value(http1PriorResponsesDoneKey{}).(<-chan struct{}); done != nil {
+			<-done
+		}
+	}
 	// Handle h2c with prior knowledge (RFC 7540 Section 3.4)
 	if req.Method == "PRI" && len(req.Header) == 0 && req.URL.Path == "*" && req.Proto == "HTTP/2.0" {
+		waitForPriorResponses()
 		conn, err := initH2CWithPriorKnowledge(rw, connCtx.config.state.handshakeTimeout)
 		if err != nil {
 			return false, err
@@ -1564,6 +1811,10 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 	// Keep this path transparent: forward the upgrade request and then tunnel
 	// the upgraded connection without MITM-parsing the HTTP/2 streams.
 	if isH2CUpgrade(req.Header) {
+		waitForPriorResponses()
+		if closePool, _ := ctx.Value(http1H2CUpgradeClosePoolKey{}).(func()); closePool != nil {
+			closePool()
+		}
 		reqCtx, _ := FromRequestContext(ctx)
 		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "h2c upgrade passthrough",
 			slog.String("hostport", reqCtx.Hostport),
@@ -1660,15 +1911,20 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 
 	// Need to read the request
 	if request == nil {
-		readTimeout := connCtx.config.state.idleConnTimeout
-		if firstRead {
-			readTimeout = connCtx.config.state.handshakeTimeout
+		var clearDeadline func()
+		if readState, _ := ctx.Value(http1SessionReadStateKey{}).(*http1SessionReadState); readState != nil {
+			clearDeadline = readState.beginRead(firstRead)
+		} else {
+			readTimeout := connCtx.config.state.idleConnTimeout
+			if firstRead {
+				readTimeout = connCtx.config.state.handshakeTimeout
+			}
+			clearDeadline = setReadDeadlineForTimeout(fakerw.conn, readTimeout)
 		}
 		// The deadline must be cleared before anything that takes over the
 		// connection for its whole lifetime (an h2c session, an upgrade
 		// passthrough), otherwise that connection inherits it and dies once it
 		// expires no matter how much traffic is flowing.
-		clearDeadline := setReadDeadlineForTimeout(fakerw.conn, readTimeout)
 		var err error
 		request, err = fakerw.ReadRequest(connCtx.config.state.maxHTTPHeaderBytes)
 		clearDeadline()
@@ -1676,6 +1932,11 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 			retErr = &requestParseError{err: err}
 			return
 		}
+		// http.ReadRequest does not attach the connection-scoped server
+		// context that net/http gives the initial request. Bind every manually
+		// parsed keep-alive request to this session before adding request-body
+		// state, otherwise downstream cancellation is lost after request one.
+		request = request.WithContext(ctx)
 	}
 	request = prepareHijackedRequestBody(request, request, fakerw.conn)
 
@@ -2054,12 +2315,17 @@ func (r *mitmProxyHandler) roundTripWithContext(ctx context.Context, req *http.R
 
 func (r *mitmProxyHandler) roundTripWithContextMode(ctx context.Context, req *http.Request, intercept bool) (response *http.Response, err error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
-	reqCtx, _ := FromRequestContext(ctx)
-	md, _ := metadata.FromContext(ctx)
 	transport := connCtx.currentTransport()
 	if transport == nil {
 		return nil, errors.New("transport missing in connection context")
 	}
+	return r.roundTripWithInvoker(ctx, req, intercept, HTTPDelegatedInvokerFunc(transport.RoundTrip))
+}
+
+func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.Request, intercept bool, invoker HTTPDelegatedInvoker) (response *http.Response, err error) {
+	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	reqCtx, _ := FromRequestContext(ctx)
+	md, _ := metadata.FromContext(ctx)
 
 	reqCtx.Request = req
 	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
@@ -2073,9 +2339,9 @@ func (r *mitmProxyHandler) roundTripWithContextMode(ctx context.Context, req *ht
 	)
 	// Only one http interceptor will be invoked
 	if intercept && connCtx.config.httpInt != nil {
-		response, err = connCtx.config.httpInt(ctx, req, HTTPDelegatedInvokerFunc(transport.RoundTrip))
+		response, err = connCtx.config.httpInt(ctx, req, invoker)
 	} else {
-		response, err = transport.RoundTrip(req)
+		response, err = invoker.Invoke(req)
 	}
 	if err != nil {
 		err = fmt.Errorf("transport RoundTrip %s failed: %w", reqCtx.Hostport, err)

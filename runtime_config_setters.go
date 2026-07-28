@@ -79,6 +79,16 @@ func (r *mitmProxyHandler) SetMaxHTTPHeaderBytes(maxBytes int) error {
 	})
 }
 
+func (r *mitmProxyHandler) SetHTTP1PipelineDepth(depth int) error {
+	if depth <= 0 {
+		return ErrInvalidHTTP1PipelineDepth
+	}
+	return r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+		state.http1PipelineDepth = depth
+		return state, runtimeConfigParts{http1Pipeline: true}, nil
+	})
+}
+
 func (r *mitmProxyHandler) SetSkipVerifySSLFromServer(skip bool) {
 	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.skipVerifySSL = skip
@@ -191,6 +201,7 @@ type runtimeConfigParts struct {
 	idleConnTimeout      bool
 	handshakeTimeout     bool
 	httpHeader           bool
+	http1Pipeline        bool
 	skipVerifySSL        bool
 	http2                bool
 	streamBaseContext    bool
@@ -227,6 +238,9 @@ func (p runtimeConfigParts) names() []string {
 	}
 	if p.httpHeader {
 		names = append(names, "max_http_header_bytes")
+	}
+	if p.http1Pipeline {
+		names = append(names, "http1_pipeline_depth")
 	}
 	if p.skipVerifySSL {
 		names = append(names, "skip_verify_ssl")
