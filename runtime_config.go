@@ -41,6 +41,9 @@ type RuntimeConfigManager interface {
 	SetHTTPInterceptor(interceptor HTTPInterceptor)
 	SetChainHTTPInterceptors(interceptors ...HTTPInterceptor)
 	SetWebsocketInterceptor(interceptor WebsocketInterceptor)
+	// SetRawTCPInterceptor replaces the raw TCP tunnel observer used by new
+	// connections. Passing nil disables observation for new connections.
+	SetRawTCPInterceptor(interceptor RawTCPInterceptor)
 	SetMaxWebsocketFramesPerForward(maxFrames int) error
 }
 
@@ -88,6 +91,7 @@ type runtimeConfigState struct {
 	errHandler    ErrorHandler
 	httpInt       HTTPInterceptor
 	wsInt         WebsocketInterceptor
+	rawTCPInt     RawTCPInterceptor
 	chainHttpInts []HTTPInterceptor
 }
 
@@ -127,6 +131,7 @@ func newRuntimeConfigStateFromOptions(opts *options) runtimeConfigState {
 		errHandler:            opts.errHandler,
 		httpInt:               opts.httpInt,
 		wsInt:                 opts.wsInt,
+		rawTCPInt:             opts.rawTCPInt,
 		chainHttpInts:         slices.Clone(opts.chainHttpInts),
 	}
 }

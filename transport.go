@@ -22,13 +22,13 @@ type singleConnTransport struct {
 	disableHTTP2  bool
 	pipelineDepth int
 
-	mu            sync.Mutex
-	clientConn    *http.ClientConn
-	http1Conn     *http1PipelineConn
-	http1Degraded bool
-	retired       []*http.ClientConn
-	upstream      string
-	closed        bool
+	mu             sync.Mutex
+	clientConn     *http.ClientConn
+	http1Conn      *http1PipelineConn
+	http1Degraded  bool
+	retired        []*http.ClientConn
+	negotiatedALPN string
+	closed         bool
 }
 
 func newTransport(
@@ -119,10 +119,16 @@ func (t *singleConnTransport) shouldUseHTTP1Pipeline(req *http.Request) bool {
 	if t.pipelineDepth < 1 || req == nil || req.URL == nil || req.ProtoMajor != 1 {
 		return false
 	}
+	if req.URL.Scheme == "http" {
+		return true
+	}
+	if req.URL.Scheme != "https" {
+		return false
+	}
 	t.mu.Lock()
-	upstream := t.upstream
+	negotiatedALPN := t.negotiatedALPN
 	t.mu.Unlock()
-	return req.URL.Scheme == "http" || upstream == "http/1.1"
+	return negotiatedALPN == "" || negotiatedALPN == "http/1.1"
 }
 
 func (t *singleConnTransport) roundTripHTTP1(req *http.Request) (*http.Response, error) {
@@ -344,9 +350,9 @@ func (t *singleConnTransport) Close() error {
 	return nil
 }
 
-func (t *singleConnTransport) setNegotiatedProtocol(proto string) {
+func (t *singleConnTransport) setNegotiatedALPN(protocol string) {
 	t.mu.Lock()
-	t.upstream = proto
+	t.negotiatedALPN = protocol
 	t.mu.Unlock()
 }
 
@@ -493,7 +499,7 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 		return nil, fmt.Errorf("unsupported request URL scheme %q", scheme)
 	}
 
-	connScheme, protos := clientConnSchemeAndProtocols(scheme, req.ProtoMajor, t.disableHTTP2, t.upstream)
+	connScheme, protos := clientConnSchemeAndProtocols(scheme, req.ProtoMajor, t.disableHTTP2, t.negotiatedALPN)
 	baseTransport := &http.Transport{
 		DialContext:        t.dialFn,
 		DialTLSContext:     t.dialFn,
@@ -514,15 +520,26 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 	return clientConn, nil
 }
 
-func clientConnSchemeAndProtocols(scheme string, protoMajor int, disableHTTP2 bool, negotiatedProtocol string) (string, *http.Protocols) {
+func clientConnSchemeAndProtocols(scheme string, protoMajor int, disableHTTP2 bool, negotiatedALPN string) (string, *http.Protocols) {
 	if scheme == "https" {
-		switch negotiatedProtocol {
+		switch negotiatedALPN {
 		case http2.NextProtoTLS:
 			if !disableHTTP2 {
 				return "http", protocolsForExistingHTTP2Conn()
 			}
 		case "http/1.1":
 			return "http", protocolsForHTTP1()
+		case "":
+			// No ALPN is inferred here. Protocol detection has already parsed the
+			// downstream HTTP stream, so use that request's wire version.
+			switch protoMajor {
+			case 2:
+				if !disableHTTP2 {
+					return "http", protocolsForExistingHTTP2Conn()
+				}
+			case 1:
+				return "http", protocolsForHTTP1()
+			}
 		}
 	}
 	return scheme, protocolsForRequest(scheme, protoMajor, disableHTTP2)

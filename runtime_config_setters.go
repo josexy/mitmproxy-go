@@ -150,6 +150,13 @@ func (r *mitmProxyHandler) SetWebsocketInterceptor(interceptor WebsocketIntercep
 	})
 }
 
+func (r *mitmProxyHandler) SetRawTCPInterceptor(interceptor RawTCPInterceptor) {
+	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+		state.rawTCPInt = interceptor
+		return state, runtimeConfigParts{rawTCPInterceptor: true}, nil
+	})
+}
+
 func (r *mitmProxyHandler) SetMaxWebsocketFramesPerForward(maxFrames int) error {
 	if maxFrames <= 0 {
 		logConfigAttrs(context.Background(), r.config.Load(), slog.LevelWarn, "runtime config update failed",
@@ -207,6 +214,7 @@ type runtimeConfigParts struct {
 	streamBaseContext    bool
 	errorHandler         bool
 	websocketInterceptor bool
+	rawTCPInterceptor    bool
 	websocket            bool
 }
 
@@ -256,6 +264,9 @@ func (p runtimeConfigParts) names() []string {
 	}
 	if p.websocketInterceptor {
 		names = append(names, "websocket_interceptor")
+	}
+	if p.rawTCPInterceptor {
+		names = append(names, "raw_tcp_interceptor")
 	}
 	if p.websocket {
 		names = append(names, "websocket")

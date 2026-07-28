@@ -71,6 +71,7 @@ type options struct {
 	errHandler    ErrorHandler
 	httpInt       HTTPInterceptor
 	wsInt         WebsocketInterceptor
+	rawTCPInt     RawTCPInterceptor
 	chainHttpInts []HTTPInterceptor
 }
 
@@ -520,6 +521,17 @@ func WithErrorHandler(handler ErrorHandler) Option {
 func WithHTTPInterceptor(interceptor HTTPInterceptor) Option {
 	return OptionFunc(func(o *options) {
 		o.httpInt = interceptor
+	})
+}
+
+// WithRawTCPInterceptor observes tunnels that protocol detection has classified
+// as non-HTTP raw TCP. The interceptor is called synchronously once immediately
+// before relay, cannot control relay, and never receives the relayed connections
+// or payload. Different tunnels may invoke it concurrently. A nil interceptor
+// disables observation.
+func WithRawTCPInterceptor(interceptor RawTCPInterceptor) Option {
+	return OptionFunc(func(o *options) {
+		o.rawTCPInt = interceptor
 	})
 }
 

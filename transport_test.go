@@ -50,6 +50,71 @@ func TestProtocolsForRequest(t *testing.T) {
 	}
 }
 
+func TestClientConnSchemeAndProtocolsRespectsNegotiatedALPNAndRequestProtocol(t *testing.T) {
+	tests := []struct {
+		name           string
+		scheme         string
+		protoMajor     int
+		disableHTTP2   bool
+		negotiatedALPN string
+		wantScheme     string
+		wantHTTP1      bool
+		wantHTTP2      bool
+		wantUnencHTTP2 bool
+	}{
+		{"http1", "http", 1, false, "", "http", true, false, false},
+		{"h2c", "http", 2, false, "", "http", false, false, true},
+		{"https no alpn http1", "https", 1, false, "", "http", true, false, false},
+		{"https no alpn http2", "https", 2, false, "", "http", false, false, true},
+		{"https negotiated http1 overrides request", "https", 2, false, "http/1.1", "http", true, false, false},
+		{"https negotiated http2 overrides request", "https", 1, false, http2.NextProtoTLS, "http", false, false, true},
+		{"https no alpn http2 disabled", "https", 2, true, "", "https", true, false, false},
+		{"https unknown request protocol", "https", 0, false, "", "https", true, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotScheme, gotProtocols := clientConnSchemeAndProtocols(tt.scheme, tt.protoMajor, tt.disableHTTP2, tt.negotiatedALPN)
+			if gotScheme != tt.wantScheme ||
+				gotProtocols.HTTP1() != tt.wantHTTP1 ||
+				gotProtocols.HTTP2() != tt.wantHTTP2 ||
+				gotProtocols.UnencryptedHTTP2() != tt.wantUnencHTTP2 {
+				t.Fatalf("scheme/protocols = %q http1:%v http2:%v h2c:%v; want %q %v %v %v",
+					gotScheme, gotProtocols.HTTP1(), gotProtocols.HTTP2(), gotProtocols.UnencryptedHTTP2(),
+					tt.wantScheme, tt.wantHTTP1, tt.wantHTTP2, tt.wantUnencHTTP2)
+			}
+		})
+	}
+}
+
+func TestSingleConnTransportHTTP1PipelineSelectionUsesALPNAndRequestProtocol(t *testing.T) {
+	tests := []struct {
+		name       string
+		scheme     string
+		protoMajor int
+		alpn       string
+		want       bool
+	}{
+		{"plain http1", "http", 1, http2.NextProtoTLS, true},
+		{"tls http1 without alpn", "https", 1, "", true},
+		{"tls negotiated http1", "https", 1, "http/1.1", true},
+		{"tls negotiated http2 overrides request", "https", 1, http2.NextProtoTLS, false},
+		{"tls http2 without alpn", "https", 2, "", false},
+		{"unsupported scheme", "ftp", 1, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := newTransport("example.com:443", nil, 0, false, 8)
+			transport.setNegotiatedALPN(tt.alpn)
+			req := &http.Request{URL: &url.URL{Scheme: tt.scheme}, ProtoMajor: tt.protoMajor}
+			if got := transport.shouldUseHTTP1Pipeline(req); got != tt.want {
+				t.Fatalf("shouldUseHTTP1Pipeline = %t; want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSingleConnTransportGetClientConnValidationAndClose(t *testing.T) {
 	tr := newTransport("example.com:80", nil, 0, false)
 	req, _ := http.NewRequest(http.MethodGet, "/path", nil)
@@ -841,13 +906,10 @@ func TestSingleConnTransportUsesNegotiatedHTTP2ForWrappedTLSConn(t *testing.T) {
 		time.Second,
 		false,
 	)
-	tr.setNegotiatedProtocol(http2.NextProtoTLS)
+	tr.setNegotiatedALPN(http2.NextProtoTLS)
 	defer tr.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
-	req.Proto = "HTTP/2.0"
-	req.ProtoMajor = 2
-	req.ProtoMinor = 0
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)

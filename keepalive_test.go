@@ -10,11 +10,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/josexy/websocket"
 )
 
 // startKeepAliveProxy runs the handler behind a real http.Server so tests go
@@ -81,6 +84,26 @@ func readConnectResponse(t *testing.T, reader *bufio.Reader) {
 	_ = response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status = %d; want 200", response.StatusCode)
+	}
+}
+
+func assertRawTCPTunnelEvent(t *testing.T, events <-chan RawTCPTunnelEvent, hostport string, source RawTCPTunnelSource, tls bool) RawTCPTunnelEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event.Hostport != hostport || event.Source != source || event.TLS != tls {
+			t.Fatalf("raw TCP event = %#v; want host=%q source=%v tls=%t", event, hostport, source, tls)
+		}
+		if source == RawTCPTunnelSourceHTTPConnect && event.Request == nil {
+			t.Fatal("HTTP CONNECT raw TCP event has nil Request")
+		}
+		if source != RawTCPTunnelSourceHTTPConnect && event.Request != nil {
+			t.Fatalf("non-CONNECT raw TCP event Request = %#v; want nil", event.Request)
+		}
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for raw TCP event")
+		return RawTCPTunnelEvent{}
 	}
 }
 
@@ -700,7 +723,11 @@ func startSignalingPipelineUpstream(t *testing.T, received chan<- struct{}, body
 // connection into a protocol that owns it for its whole lifetime.
 func TestH2CUpgradeOutlivesHandshakeTimeout(t *testing.T) {
 	echo := startEchoServer(t)
-	listener := startKeepAliveProxy(t, WithHandshakeTimeout(150*time.Millisecond))
+	var rawEvents atomic.Int32
+	listener := startKeepAliveProxy(t,
+		WithHandshakeTimeout(150*time.Millisecond),
+		WithRawTCPInterceptor(func(context.Context, RawTCPTunnelEvent) { rawEvents.Add(1) }),
+	)
 	conn, reader := dialProxy(t, listener)
 
 	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echo, echo); err != nil {
@@ -731,11 +758,18 @@ func TestH2CUpgradeOutlivesHandshakeTimeout(t *testing.T) {
 			t.Fatalf("h2c tunnel died %v after the upgrade: %v", time.Duration(i+1)*100*time.Millisecond, err)
 		}
 	}
+	if got := rawEvents.Load(); got != 0 {
+		t.Fatalf("raw TCP interceptor called %d times for h2c upgrade", got)
+	}
 }
 
 func TestConnectTunnelRelaysRawTCP(t *testing.T) {
 	echo := startEchoServer(t)
-	listener := startKeepAliveProxy(t, WithDisableHTTP2())
+	events := make(chan RawTCPTunnelEvent, 6)
+	listener := startKeepAliveProxy(t,
+		WithDisableHTTP2(),
+		WithRawTCPInterceptor(func(_ context.Context, event RawTCPTunnelEvent) { events <- event }),
+	)
 
 	for name, payload := range map[string][]byte{
 		"binary":        {0xef, 0x01, 0x02, 0x03, 0x00, 0xff, 0x7f, 0x10},
@@ -744,7 +778,7 @@ func TestConnectTunnelRelaysRawTCP(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			conn, reader := dialProxy(t, listener)
-			connect := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echo, echo)
+			connect := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nX-Raw-Tunnel-Test: %s\r\n\r\n", echo, echo, name)
 			if _, err := conn.Write(append([]byte(connect), payload...)); err != nil {
 				t.Fatal(err)
 			}
@@ -760,7 +794,72 @@ func TestConnectTunnelRelaysRawTCP(t *testing.T) {
 			if !bytes.Equal(got, payload) {
 				t.Fatalf("raw CONNECT echo = %x; want %x", got, payload)
 			}
+			_ = conn.Close()
+			event := assertRawTCPTunnelEvent(t, events, echo, RawTCPTunnelSourceHTTPConnect, false)
+			if event.Request.Method != http.MethodConnect || event.Request.RequestURI != echo ||
+				event.Request.Host != echo || event.Request.Header.Get("X-Raw-Tunnel-Test") != name ||
+				event.Request.Body != http.NoBody {
+				t.Fatalf("CONNECT request snapshot = %#v", event.Request)
+			}
 		})
+	}
+}
+
+func TestWebsocketDoesNotReportRawTCP(t *testing.T) {
+	originErr := make(chan error, 1)
+	upgrader := websocket.Upgrader{}
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			originErr <- err
+			return
+		}
+		defer conn.Close()
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			originErr <- err
+			return
+		}
+		originErr <- conn.WriteMessage(messageType, payload)
+	}))
+	defer origin.Close()
+
+	var rawEvents atomic.Int32
+	listener := startKeepAliveProxy(t,
+		WithRawTCPInterceptor(func(context.Context, RawTCPTunnelEvent) { rawEvents.Add(1) }),
+	)
+	proxyURL, err := url.Parse("http://" + listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyURL(proxyURL),
+		HandshakeTimeout: time.Second,
+	}
+	client, response, err := dialer.Dial("ws"+strings.TrimPrefix(origin.URL, "http"), nil)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	payload := []byte("websocket message")
+	if err := client.WriteMessage(websocket.TextMessage, payload); err != nil {
+		t.Fatal(err)
+	}
+	messageType, echoed, err := client.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != websocket.TextMessage || !bytes.Equal(echoed, payload) {
+		t.Fatalf("websocket echo = type %d, %q; want text %q", messageType, echoed, payload)
+	}
+	if err := <-originErr; err != nil {
+		t.Fatal(err)
+	}
+	if got := rawEvents.Load(); got != 0 {
+		t.Fatalf("raw TCP interceptor called %d times for WebSocket", got)
 	}
 }
 

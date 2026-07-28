@@ -34,6 +34,29 @@ func (d WSDirection) String() string {
 	}
 }
 
+// RawTCPTunnelSource identifies how the downstream tunnel entered the proxy.
+type RawTCPTunnelSource byte
+
+const (
+	// RawTCPTunnelSourceDirect identifies a low-level or transparent Serve connection.
+	RawTCPTunnelSourceDirect RawTCPTunnelSource = iota
+	// RawTCPTunnelSourceHTTPConnect identifies an HTTP CONNECT tunnel.
+	RawTCPTunnelSourceHTTPConnect
+	// RawTCPTunnelSourceSOCKS5 identifies a SOCKS5 CONNECT tunnel.
+	RawTCPTunnelSourceSOCKS5
+)
+
+// RawTCPTunnelEvent describes a classified raw TCP tunnel immediately before relay.
+// Request is a bodyless snapshot of the outer CONNECT request when Source is
+// RawTCPTunnelSourceHTTPConnect and the tunnel entered through ServeHTTP; otherwise
+// Request is nil. The event never exposes a relayed connection or payload.
+type RawTCPTunnelEvent struct {
+	Source   RawTCPTunnelSource // Downstream tunnel entry point.
+	Hostport string             // Requested target in host:port form.
+	TLS      bool               // Whether this is a decrypted raw stream inside a MITM TLS tunnel.
+	Request  *http.Request      // Bodyless outer CONNECT snapshot for ServeHTTP tunnels; otherwise nil.
+}
+
 type WsFrame interface {
 	Direction() WSDirection
 	MessageType() int
@@ -64,6 +87,13 @@ type (
 
 	HTTPInterceptor      func(context.Context, *http.Request, HTTPDelegatedInvoker) (*http.Response, error)
 	WebsocketInterceptor func(context.Context, *http.Request, *http.Response, WebsocketFramesWatcher)
+	// RawTCPInterceptor observes classified raw TCP tunnels. It is called synchronously
+	// once per tunnel immediately before relay, so a slow callback delays relay.
+	// Callbacks for different tunnels may run concurrently.
+	//
+	// RawTCPInterceptor is observation-only. It receives no relayed connection or
+	// payload and cannot allow, reject, or modify relay.
+	RawTCPInterceptor func(context.Context, RawTCPTunnelEvent)
 )
 
 func (f HTTPDelegatedInvokerFunc) Invoke(r *http.Request) (*http.Response, error) { return f(r) }
