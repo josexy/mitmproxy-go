@@ -1096,7 +1096,10 @@ func detectTunnelProtocol(conn *bufConn) (tunnelProtocol, error) {
 	if isTLS(data) {
 		return tunnelProtocolTLS, nil
 	}
+	return detectHTTPProtocol(conn)
+}
 
+func detectHTTPProtocol(conn *bufConn) (tunnelProtocol, error) {
 	const (
 		requestLineMethod = iota
 		requestLineTarget
@@ -1105,7 +1108,9 @@ func detectTunnelProtocol(conn *bufConn) (tunnelProtocol, error) {
 	state := requestLineMethod
 	methodEnd, targetEnd, targetBytes := 0, 0, 0
 	versionStart := 0
+	var data []byte
 	for width := 1; width <= conn.r.Size(); width++ {
+		var err error
 		data, err = conn.Peek(width)
 		if err != nil {
 			return tunnelProtocolRaw, err
@@ -1169,6 +1174,59 @@ func detectTunnelProtocol(conn *bufConn) (tunnelProtocol, error) {
 		return tunnelProtocolHTTP, nil
 	}
 	return tunnelProtocolRaw, nil
+}
+
+// detectTLSApplicationProtocol determines whether the plaintext inside an
+// established TLS tunnel is HTTP. An HTTP client speaks first, so upstream
+// application data arriving before a request identifies a raw, server-first
+// protocol. Both buffered connections preserve every byte observed here.
+func detectTLSApplicationProtocol(ctx context.Context, downstreamConn, upstreamConn net.Conn, timeout time.Duration) (tunnelProtocol, *bufConn, *bufConn, error) {
+	downstream := newBufConn(downstreamConn)
+	upstream := newBufConn(upstreamConn)
+	detectionCtx, cancelDetection := context.WithTimeout(ctx, timeout)
+	defer cancelDetection()
+	clearDownstreamDeadline := setDeadlineFromContext(detectionCtx, downstream)
+	clearUpstreamDeadline := setDeadlineFromContext(detectionCtx, upstream)
+
+	type detectionResult struct {
+		upstream bool
+		protocol tunnelProtocol
+		err      error
+	}
+	results := make(chan detectionResult, 2)
+	go func() {
+		protocol, err := detectHTTPProtocol(downstream)
+		results <- detectionResult{protocol: protocol, err: err}
+	}()
+	go func() {
+		_, err := upstream.Peek(1)
+		results <- detectionResult{upstream: true, protocol: tunnelProtocolRaw, err: err}
+	}()
+
+	first := <-results
+	// Cancel the other pending read before handing either connection to its
+	// long-lived protocol owner. net.Conn permits deadlines to interrupt Read.
+	_ = downstream.SetReadDeadline(time.Now())
+	_ = upstream.SetReadDeadline(time.Now())
+	second := <-results
+	clearDownstreamDeadline()
+	clearUpstreamDeadline()
+	if err := context.Cause(detectionCtx); err != nil {
+		return tunnelProtocolRaw, downstream, upstream, err
+	}
+
+	ordered := [2]detectionResult{first, second}
+	for _, result := range ordered {
+		if result.upstream && result.err == nil {
+			return tunnelProtocolRaw, downstream, upstream, nil
+		}
+	}
+	for _, result := range ordered {
+		if !result.upstream && result.err == nil {
+			return result.protocol, downstream, upstream, nil
+		}
+	}
+	return tunnelProtocolRaw, downstream, upstream, first.err
 }
 
 func isHTTPMethodByte(value byte) bool {
@@ -1363,6 +1421,48 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				Handler: r.serveHTTP2Handler(ctx),
 			})
 			return
+		}
+
+		passthroughTLSRaw := func(reason string) error {
+			connCtx.closeTransport()
+			logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "tls raw tunnel passthrough",
+				slog.String("hostport", reqCtx.Hostport),
+				slog.String("selected_alpn", state.NegotiatedProtocol),
+				slog.String("reason", reason),
+			)
+			return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+		}
+
+		// A negotiated non-HTTP ALPN identifies the decrypted application stream
+		// as raw without waiting for client data. This also supports server-first
+		// TLS protocols.
+		if state.NegotiatedProtocol != "" && state.NegotiatedProtocol != "http/1.1" {
+			return passthroughTLSRaw("non_http_alpn")
+		}
+
+		// Without ALPN, inspect the decrypted client stream. Peeked bytes remain in
+		// bufConn so either the HTTP parser or raw relay receives the full payload.
+		// Upstream application data wins the race because HTTP/1 servers do not
+		// speak before receiving a request.
+		if state.NegotiatedProtocol == "" {
+			applicationProtocol, bufferedSrc, bufferedDst, detectErr := detectTLSApplicationProtocol(
+				ctx,
+				srcConn,
+				dstConn,
+				connCtx.config.state.handshakeTimeout,
+			)
+			if detectErr != nil {
+				if isExpectedIdleReadClose(detectErr) {
+					return nil
+				}
+				return fmt.Errorf("detect protocol inside tls tunnel: %w", detectErr)
+			}
+			srcConn = bufferedSrc
+			dstConn = bufferedDst
+			fakerw = newFakeHttpResponseWriter(srcConn)
+			if applicationProtocol == tunnelProtocolRaw {
+				return passthroughTLSRaw("non_http_payload")
+			}
 		}
 	}
 

@@ -132,6 +132,116 @@ func TestPassthroughTunnelRequiresInitialActivity(t *testing.T) {
 	}
 }
 
+func TestDetectHTTPProtocolRejectsBinaryFirstByte(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	result := make(chan tunnelProtocol, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		protocol, err := detectHTTPProtocol(newBufConn(server))
+		result <- protocol
+		errCh <- err
+	}()
+	go func() { _, _ = client.Write([]byte{0}) }()
+
+	select {
+	case protocol := <-result:
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+		if protocol != tunnelProtocolRaw {
+			t.Fatalf("protocol = %v; want raw", protocol)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("binary application detection waited for additional bytes")
+	}
+}
+
+func TestDetectTLSApplicationProtocolUsesServerFirstData(t *testing.T) {
+	client, downstream := net.Pipe()
+	upstream, server := net.Pipe()
+	defer client.Close()
+	defer downstream.Close()
+	defer upstream.Close()
+	defer server.Close()
+
+	greeting := []byte{0x00, 'r', 'e', 'a', 'd', 'y'}
+	go func() { _, _ = server.Write(greeting) }()
+
+	protocol, _, bufferedUpstream, err := detectTLSApplicationProtocol(context.Background(), downstream, upstream, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protocol != tunnelProtocolRaw {
+		t.Fatalf("protocol = %v; want raw", protocol)
+	}
+	replayed := make([]byte, len(greeting))
+	if _, err := io.ReadFull(bufferedUpstream, replayed); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(replayed, greeting) {
+		t.Fatalf("replayed greeting = %x; want %x", replayed, greeting)
+	}
+}
+
+func TestDetectTLSApplicationProtocolPreservesClientHTTPRequest(t *testing.T) {
+	client, downstream := net.Pipe()
+	upstream, server := net.Pipe()
+	defer client.Close()
+	defer downstream.Close()
+	defer upstream.Close()
+	defer server.Close()
+
+	request := []byte("GET /raw-check HTTP/1.1\r\nHost: example.test\r\n\r\n")
+	go func() { _, _ = client.Write(request) }()
+
+	protocol, bufferedDownstream, _, err := detectTLSApplicationProtocol(context.Background(), downstream, upstream, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protocol != tunnelProtocolHTTP {
+		t.Fatalf("protocol = %v; want HTTP", protocol)
+	}
+	replayed := make([]byte, len(request))
+	if _, err := io.ReadFull(bufferedDownstream, replayed); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(replayed, request) {
+		t.Fatalf("replayed request = %q; want %q", replayed, request)
+	}
+}
+
+func TestDetectTLSApplicationProtocolStopsOnContextCancel(t *testing.T) {
+	client, downstream := net.Pipe()
+	upstream, server := net.Pipe()
+	defer client.Close()
+	defer downstream.Close()
+	defer upstream.Close()
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type detectionResult struct {
+		err error
+	}
+	resultCh := make(chan detectionResult, 1)
+	go func() {
+		_, _, _, err := detectTLSApplicationProtocol(ctx, downstream, upstream, time.Hour)
+		resultCh <- detectionResult{err: err}
+	}()
+	cancel()
+
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("detection error = %v; want context canceled", result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TLS application detection did not stop after context cancellation")
+	}
+}
+
 func TestWebsocketInterceptorReturnCancelsRelayContext(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	returned := make(chan struct{})
