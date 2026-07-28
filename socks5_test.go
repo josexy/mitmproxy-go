@@ -6,10 +6,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/josexy/mitmproxy-go/buf"
+	"github.com/josexy/mitmproxy-go/metadata"
 )
 
 func TestParseAddressForSocks5(t *testing.T) {
@@ -209,11 +211,13 @@ func TestWriteSocks5Reply(t *testing.T) {
 
 func TestServeSOCKS5ReportsDialFailureBeforeClosing(t *testing.T) {
 	certPath, keyPath := writeTestCA(t)
+	events := make(chan RawTCPTunnelEvent, 2)
 	handler, err := NewMitmProxyHandler(
 		WithCACertPath(certPath),
 		WithCAKeyPath(keyPath),
 		WithDisableProxy(),
 		WithDialer(&net.Dialer{Timeout: 100 * time.Millisecond}),
+		WithRawTCPInterceptor(func(_ context.Context, event RawTCPTunnelEvent) { events <- event }),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -252,6 +256,124 @@ func TestServeSOCKS5ReportsDialFailureBeforeClosing(t *testing.T) {
 	if err := <-errCh; err == nil {
 		t.Fatal("ServeSOCKS5 unexpectedly succeeded")
 	}
+	select {
+	case event := <-events:
+		t.Fatalf("raw TCP interceptor observed dial failure event %#v", event)
+	default:
+	}
+}
+
+func TestServeSOCKS5RelaysRawTCPAndRetainsEntryConfigSnapshot(t *testing.T) {
+	echo := startEchoServer(t)
+	target, err := net.ResolveTCPAddr("tcp", echo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip := target.IP.To4()
+	if ip == nil {
+		t.Fatalf("echo address %q is not IPv4", echo)
+	}
+	certPath, keyPath := writeTestCA(t)
+	events := make(chan RawTCPTunnelEvent, 2)
+	updatedEvents := make(chan RawTCPTunnelEvent, 2)
+	startedMetadata := make(chan metadata.MD, 1)
+	handler, err := NewDynamicMitmProxyHandler(
+		WithCACertPath(certPath),
+		WithCAKeyPath(keyPath),
+		WithDisableProxy(),
+		WithRawTCPInterceptor(func(ctx context.Context, event RawTCPTunnelEvent) {
+			if event.Type == RawTCPTunnelStarted {
+				if md, ok := metadata.FromContext(ctx); ok {
+					startedMetadata <- md.MD()
+				} else {
+					startedMetadata <- metadata.MD{}
+				}
+			}
+			events <- event
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Cleanup()
+
+	client, server := net.Pipe()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	handshakeReadStarted := make(chan struct{})
+	serverWithReadSignal := &firstReadSignalConn{Conn: server, started: handshakeReadStarted}
+	errCh := make(chan error, 1)
+	go func() { errCh <- handler.ServeSOCKS5(context.Background(), serverWithReadSignal) }()
+
+	select {
+	case <-handshakeReadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeSOCKS5 did not begin reading the handshake")
+	}
+	handler.SetRawTCPInterceptor(func(_ context.Context, event RawTCPTunnelEvent) {
+		updatedEvents <- event
+	})
+
+	if _, err := client.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	methodReply := make([]byte, 2)
+	if _, err := io.ReadFull(client, methodReply); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(methodReply, []byte{5, 0}) {
+		t.Fatalf("method reply = %v; want [5 0]", methodReply)
+	}
+	request := []byte{5, 1, 0, 1, ip[0], ip[1], ip[2], ip[3], byte(target.Port >> 8), byte(target.Port)}
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	connectReply := make([]byte, 10)
+	if _, err := io.ReadFull(client, connectReply); err != nil {
+		t.Fatal(err)
+	}
+	if connectReply[1] != socks5ReplySucceeded {
+		t.Fatalf("connect reply = %v; want success", connectReply)
+	}
+
+	payload := []byte{0, 1, 2, 'r', 'a', 'w'}
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	echoed := make([]byte, len(payload))
+	if _, err := io.ReadFull(client, echoed); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(echoed, payload) {
+		t.Fatalf("SOCKS5 raw echo = %x; want %x", echoed, payload)
+	}
+	_ = client.Close()
+
+	_, ended := assertRawTCPTunnelLifecycle(t, events, echo, RawTCPTunnelSourceSOCKS5, false)
+	md := <-startedMetadata
+	if md.RequestHostport != echo || md.RemoteAddrInfo.DestinationAddr.String() != echo {
+		t.Fatalf("Started metadata = %#v; want target %q", md, echo)
+	}
+	if serveErr := <-errCh; serveErr != ended.Error {
+		t.Fatalf("ServeSOCKS5 error = %v; Ended error = %v", serveErr, ended.Error)
+	}
+	select {
+	case event := <-updatedEvents:
+		t.Fatalf("updated interceptor observed existing SOCKS5 connection event %#v", event)
+	default:
+	}
+}
+
+type firstReadSignalConn struct {
+	net.Conn
+	once    sync.Once
+	started chan struct{}
+}
+
+func (c *firstReadSignalConn) Read(p []byte) (int, error) {
+	c.once.Do(func() { close(c.started) })
+	return c.Conn.Read(p)
 }
 
 type bytesConn struct {

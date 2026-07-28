@@ -140,6 +140,7 @@ func main() {
 		mitmproxy.WithLogger(logger),
 		mitmproxy.WithHTTPInterceptor(httpInterceptor),
 		mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
+		mitmproxy.WithRawTCPInterceptor(rawTCPInterceptor),
 		mitmproxy.WithErrorHandler(errHandler),
 		mitmproxy.WithStreamBaseContext(ctx),
 		mitmproxy.WithIdleConnTimeout(time.Second*30),
@@ -154,7 +155,7 @@ func main() {
 		// mitmproxy.WithProxy("http://127.0.0.1:7900"),
 		// mitmproxy.WithDisableProxy(),
 		// mitmproxy.WithDisableHTTP2(),
-		// mitmproxy.WithSkipVerifySSLFromServer(),
+		mitmproxy.WithSkipVerifySSLFromServer(),
 		// mitmproxy.WithMaxWebsocketFramesPerForward(4096),
 	)
 	if err != nil {
@@ -285,6 +286,58 @@ func durationBetween(start, end time.Time) time.Duration {
 		return 0
 	}
 	return end.Sub(start)
+}
+
+func rawTCPInterceptor(ctx context.Context, event mitmproxy.RawTCPTunnelEvent) {
+	attrs := []slog.Attr{
+		slog.Uint64("tunnel_id", event.TunnelID),
+		slog.String("event", rawTCPEventName(event.Type)),
+		slog.String("source", rawTCPSourceName(event.Source)),
+		slog.String("hostport", event.Hostport),
+		slog.Bool("tls", event.TLS),
+	}
+	if event.Error != nil {
+		attrs = append(attrs, slog.String("error", event.Error.Error()))
+	}
+	if mdCtx, ok := metadata.FromContext(ctx); ok {
+		md := mdCtx.MD()
+		attrs = append(attrs,
+			slog.String("local_source", md.LocalAddrInfo.SourceAddr.String()),
+			slog.String("local_destination", md.LocalAddrInfo.DestinationAddr.String()),
+			slog.String("remote_source", md.RemoteAddrInfo.SourceAddr.String()),
+			slog.String("remote_destination", md.RemoteAddrInfo.DestinationAddr.String()),
+			slog.Time("local_connection_establishment", md.LocalConnectionEstablishedTs),
+			slog.Time("remote_connection_establishment", md.RemoteConnectionEstablishedTs),
+		)
+		if md.TLSState != nil {
+			attrs = append(attrs, slog.String("selected_alpn", md.TLSState.SelectedALPN))
+		}
+	}
+	slog.LogAttrs(ctx, slog.LevelInfo, "raw TCP tunnel", attrs...)
+}
+
+func rawTCPEventName(eventType mitmproxy.RawTCPTunnelEventType) string {
+	switch eventType {
+	case mitmproxy.RawTCPTunnelStarted:
+		return "started"
+	case mitmproxy.RawTCPTunnelEnded:
+		return "ended"
+	default:
+		return "unknown"
+	}
+}
+
+func rawTCPSourceName(source mitmproxy.RawTCPTunnelSource) string {
+	switch source {
+	case mitmproxy.RawTCPTunnelSourceDirect:
+		return "direct"
+	case mitmproxy.RawTCPTunnelSourceHTTPConnect:
+		return "http_connect"
+	case mitmproxy.RawTCPTunnelSourceSOCKS5:
+		return "socks5"
+	default:
+		return "unknown"
+	}
 }
 
 func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {

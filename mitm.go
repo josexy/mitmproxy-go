@@ -315,6 +315,7 @@ type mitmProxyHandler struct {
 	configMu       sync.Mutex
 	config         atomic.Pointer[runtimeConfig]
 	runtimeState   runtimeConfigState
+	rawTCPTunnelID atomic.Uint64
 	priKeyPool     *priKeyPool
 	serverCertPool *certPool
 	activeMu       sync.Mutex
@@ -448,11 +449,12 @@ func (r *mitmProxyHandler) CACertPath() string {
 }
 
 func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	cfg := r.config.Load()
 	var err error
 	remoteAddr, hostport := req.RemoteAddr, ""
 	defer func() {
 		if err != nil {
-			r.handleError(ErrorContext{
+			handleErrorWithConfig(cfg, ErrorContext{
 				RemoteAddr: remoteAddr,
 				Hostport:   hostport,
 				Error:      err,
@@ -491,26 +493,26 @@ func (r *mitmProxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	_ = r.Serve(AppendToRequestContext(req.Context(), ReqContext{
+	_ = r.serveWithConfig(AppendToRequestContext(req.Context(), ReqContext{
 		Hostport:          hostport,
 		Request:           request,
 		HttpConnectMethod: req.Method == http.MethodConnect,
-	}), conn)
+	}), conn, cfg)
 }
 
 func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error {
+	cfg := r.config.Load()
 	var hostport string
 	var err error
 	defer func() {
 		if err != nil {
-			r.handleError(ErrorContext{
+			handleErrorWithConfig(cfg, ErrorContext{
 				RemoteAddr: remoteAddrOrDefault(conn.RemoteAddr()),
 				Hostport:   hostport,
 				Error:      err,
 			})
 		}
 	}()
-	cfg := r.config.Load()
 	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, cfg.state.handshakeTimeout)
 	clearDeadline := setDeadlineFromContext(handshakeCtx, conn)
 	defer cancelHandshake()
@@ -525,16 +527,20 @@ func (r *mitmProxyHandler) ServeSOCKS5(ctx context.Context, conn net.Conn) error
 	}
 	clearDeadline()
 	cancelHandshake()
-	retErr := r.Serve(AppendToRequestContext(ctx, ReqContext{
+	retErr := r.serveWithConfig(AppendToRequestContext(ctx, ReqContext{
 		Hostport:          hostport,
 		Request:           nil,
 		HttpConnectMethod: false,
 		Socks5Connect:     true,
-	}), conn)
+	}), conn, cfg)
 	return retErr
 }
 
 func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error) {
+	return r.serveWithConfig(ctx, conn, r.config.Load())
+}
+
+func (r *mitmProxyHandler) serveWithConfig(ctx context.Context, conn net.Conn, cfg *runtimeConfig) (err error) {
 	reqCtx, ok := FromRequestContext(ctx)
 	if !ok {
 		conn.Close()
@@ -544,7 +550,6 @@ func (r *mitmProxyHandler) Serve(ctx context.Context, conn net.Conn) (err error)
 		conn.Close()
 		return net.ErrClosed
 	}
-	cfg := r.config.Load()
 	logConfigAttrs(ctx, cfg, slog.LevelDebug, "serve connection",
 		slog.String("source_addr", remoteAddrOrDefault(conn.RemoteAddr())),
 		slog.String("hostport", reqCtx.Hostport),
@@ -711,6 +716,39 @@ func shouldPassthroughRequest(cfg *runtimeConfig, hostport string) (bool, string
 	}
 
 	return false, "intercept"
+}
+
+func rawTCPTunnelSourceForRequest(reqCtx ReqContext) RawTCPTunnelSource {
+	switch {
+	case reqCtx.HttpConnectMethod:
+		return RawTCPTunnelSourceHTTPConnect
+	case reqCtx.Socks5Connect:
+		return RawTCPTunnelSourceSOCKS5
+	default:
+		return RawTCPTunnelSourceDirect
+	}
+}
+
+func (r *mitmProxyHandler) relayRawTCPTunnel(ctx context.Context, srcConn, dstConn net.Conn, tls bool) (err error) {
+	connCtx := ctx.Value(connContextKey).(*biConnContext)
+	interceptor := connCtx.config.state.rawTCPInt
+	if interceptor == nil {
+		return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+	}
+	reqCtx, _ := FromRequestContext(ctx)
+	event := RawTCPTunnelEvent{
+		TunnelID: r.rawTCPTunnelID.Add(1),
+		Type:     RawTCPTunnelStarted,
+		Source:   rawTCPTunnelSourceForRequest(reqCtx),
+		Hostport: reqCtx.Hostport,
+		TLS:      tls,
+	}
+	interceptor(ctx, event)
+	err = r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+	event.Type = RawTCPTunnelEnded
+	event.Error = err
+	interceptor(ctx, event)
+	return err
 }
 
 func (r *mitmProxyHandler) passthroughTunnel(ctx context.Context, srcConn, dstConn net.Conn, initialActivityTimeout time.Duration) error {
@@ -886,9 +924,9 @@ type capturedClientHello struct {
 }
 
 type upstreamTLSHandshakeResult struct {
-	conn               net.Conn
-	hello              capturedClientHello
-	negotiatedProtocol string
+	conn           net.Conn
+	hello          capturedClientHello
+	negotiatedALPN string
 }
 
 func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Context, hello capturedClientHello, conn net.Conn) (net.Conn, *tls.Config, error) {
@@ -947,9 +985,11 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	}
 	tlsConnEstTs := time.Now()
 	cs := tlsClientConn.ConnectionState()
-	if cs.NegotiatedProtocol == "" {
-		// fallback to http/1.1 if the server doesn't support ALPN or doesn't return the negotiated protocol
-		cs.NegotiatedProtocol = "http/1.1"
+	var downstreamNextProtos []string
+	if cs.NegotiatedProtocol != "" {
+		// Mirror only the protocol actually selected upstream. An empty list
+		// preserves a no-ALPN handshake for downstream protocol detection.
+		downstreamNextProtos = []string{cs.NegotiatedProtocol}
 	}
 	var foundCert *x509.Certificate
 	for _, cert := range cs.PeerCertificates {
@@ -998,9 +1038,8 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		)
 		return tlsClientConn, &tls.Config{
 			SessionTicketsDisabled: true,
-			// Server selected negotiated protocol
-			NextProtos:   []string{cs.NegotiatedProtocol},
-			Certificates: []tls.Certificate{serverCert},
+			NextProtos:             downstreamNextProtos,
+			Certificates:           []tls.Certificate{serverCert},
 		}, nil
 	}
 	// Get private key from local cache pool
@@ -1027,9 +1066,8 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 	)
 	return tlsClientConn, &tls.Config{
 		SessionTicketsDisabled: true,
-		// Server selected negotiated protocol
-		NextProtos:   []string{cs.NegotiatedProtocol},
-		Certificates: []tls.Certificate{certificate},
+		NextProtos:             downstreamNextProtos,
+		Certificates:           []tls.Certificate{certificate},
 	}, nil
 }
 
@@ -1310,7 +1348,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 			logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "raw tunnel passthrough",
 				slog.String("hostport", reqCtx.Hostport),
 			)
-			return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+			return r.relayRawTCPTunnel(ctx, srcConn, dstConn, false)
 		}
 	}
 
@@ -1356,14 +1394,14 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				errCh <- err
 			} else {
 				tlsConfigCh <- tlsConfig
-				negotiatedProtocol := ""
+				negotiatedALPN := ""
 				if len(tlsConfig.NextProtos) > 0 {
-					negotiatedProtocol = tlsConfig.NextProtos[0]
+					negotiatedALPN = tlsConfig.NextProtos[0]
 				}
 				tlsConnCh <- upstreamTLSHandshakeResult{
-					conn:               conn,
-					hello:              chi,
-					negotiatedProtocol: negotiatedProtocol,
+					conn:           conn,
+					hello:          chi,
+					negotiatedALPN: negotiatedALPN,
 				}
 			}
 		}(dstConn)
@@ -1391,14 +1429,14 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		dstConn = result.conn
 		connCtx.remote.innerConn = dstConn
 		if transport := connCtx.currentTransport(); transport != nil {
-			transport.setNegotiatedProtocol(result.negotiatedProtocol)
+			transport.setNegotiatedALPN(result.negotiatedALPN)
 		}
 		r.setTLSRemoteDialer(connCtx, reqCtx.Hostport, dstConn, result.hello)
 		srcConn = tlsConn
 		fakerw = newFakeHttpResponseWriter(srcConn)
 		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "tls tunnel negotiated",
 			slog.String("hostport", reqCtx.Hostport),
-			slog.String("selected_alpn", result.negotiatedProtocol),
+			slog.String("selected_alpn", result.negotiatedALPN),
 		)
 
 		state := tlsConn.ConnectionState()
@@ -1430,7 +1468,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				slog.String("selected_alpn", state.NegotiatedProtocol),
 				slog.String("reason", reason),
 			)
-			return r.passthroughTunnel(ctx, srcConn, dstConn, connCtx.config.state.handshakeTimeout)
+			return r.relayRawTCPTunnel(ctx, srcConn, dstConn, true)
 		}
 
 		// A negotiated non-HTTP ALPN identifies the decrypted application stream

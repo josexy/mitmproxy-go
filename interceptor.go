@@ -34,6 +34,43 @@ func (d WSDirection) String() string {
 	}
 }
 
+// RawTCPTunnelEventType identifies a lifecycle event for a classified raw TCP tunnel.
+type RawTCPTunnelEventType byte
+
+const (
+	// RawTCPTunnelStarted is emitted immediately before bidirectional relay begins.
+	RawTCPTunnelStarted RawTCPTunnelEventType = iota
+	// RawTCPTunnelEnded is emitted after bidirectional relay returns.
+	RawTCPTunnelEnded
+)
+
+// RawTCPTunnelSource identifies how the downstream tunnel entered the proxy.
+type RawTCPTunnelSource byte
+
+const (
+	// RawTCPTunnelSourceDirect identifies a low-level or transparent Serve connection.
+	RawTCPTunnelSourceDirect RawTCPTunnelSource = iota
+	// RawTCPTunnelSourceHTTPConnect identifies an HTTP CONNECT tunnel.
+	RawTCPTunnelSourceHTTPConnect
+	// RawTCPTunnelSourceSOCKS5 identifies a SOCKS5 CONNECT tunnel.
+	RawTCPTunnelSourceSOCKS5
+)
+
+// RawTCPTunnelEvent describes one lifecycle transition for a classified raw TCP tunnel.
+// It contains metadata only and never exposes the relayed connection or payload.
+// TunnelID is unique within one proxy handler lifetime, but its numeric value does not
+// define callback or relay ordering. Error is always nil for RawTCPTunnelStarted. For
+// RawTCPTunnelEnded, Error is the passthrough relay return value: the copy result from
+// the first direction to finish, which may be nil.
+type RawTCPTunnelEvent struct {
+	TunnelID uint64                // Identifier unique within one proxy handler lifetime.
+	Type     RawTCPTunnelEventType // Started or Ended.
+	Source   RawTCPTunnelSource    // Downstream tunnel entry point.
+	Hostport string                // Requested target in host:port form.
+	TLS      bool                  // Whether this is a decrypted raw stream inside a MITM TLS tunnel.
+	Error    error                 // Passthrough relay return value for Ended; nil for Started.
+}
+
 type WsFrame interface {
 	Direction() WSDirection
 	MessageType() int
@@ -64,6 +101,15 @@ type (
 
 	HTTPInterceptor      func(context.Context, *http.Request, HTTPDelegatedInvoker) (*http.Response, error)
 	WebsocketInterceptor func(context.Context, *http.Request, *http.Response, WebsocketFramesWatcher)
+	// RawTCPInterceptor observes classified raw TCP tunnel lifecycle events.
+	// For each tunnel, RawTCPTunnelStarted is called synchronously before relay and
+	// RawTCPTunnelEnded is called synchronously after relay. Callbacks for that tunnel
+	// are ordered, while callbacks for different tunnels may run concurrently. A
+	// callback blocks its caller: Started delays relay and Ended delays handler return.
+	//
+	// RawTCPInterceptor is observation-only. It receives no relayed connection or
+	// payload and cannot allow, reject, or modify relay.
+	RawTCPInterceptor func(context.Context, RawTCPTunnelEvent)
 )
 
 func (f HTTPDelegatedInvokerFunc) Invoke(r *http.Request) (*http.Response, error) { return f(r) }

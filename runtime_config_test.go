@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,6 +33,53 @@ func TestNewDynamicMitmProxyHandler(t *testing.T) {
 
 	if _, ok := handler.(RuntimeConfigManager); !ok {
 		t.Fatalf("dynamic handler does not implement RuntimeConfigManager")
+	}
+}
+
+func TestRawTCPInterceptorRuntimeConfiguration(t *testing.T) {
+	managerType := reflect.TypeOf((*RuntimeConfigManager)(nil)).Elem()
+	if _, found := managerType.MethodByName("SetRawTCPInterceptor"); !found {
+		t.Fatal("RuntimeConfigManager does not expose SetRawTCPInterceptor")
+	}
+	certPath, keyPath := writeRuntimeTestCA(t, "raw tcp interceptor ca")
+	var calls []string
+	initial := RawTCPInterceptor(func(context.Context, RawTCPTunnelEvent) {
+		calls = append(calls, "initial")
+	})
+	updated := RawTCPInterceptor(func(context.Context, RawTCPTunnelEvent) {
+		calls = append(calls, "updated")
+	})
+	handler, err := NewDynamicMitmProxyHandler(
+		WithCACertPath(certPath),
+		WithCAKeyPath(keyPath),
+		WithRawTCPInterceptor(initial),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handler.Cleanup()
+
+	h := handler.(*mitmProxyHandler)
+	initialCfg := h.config.Load()
+	if initialCfg.state.rawTCPInt == nil {
+		t.Fatal("WithRawTCPInterceptor did not configure the runtime snapshot")
+	}
+	initialCfg.state.rawTCPInt(context.Background(), RawTCPTunnelEvent{})
+
+	handler.SetRawTCPInterceptor(updated)
+	updatedCfg := h.config.Load()
+	if updatedCfg == initialCfg {
+		t.Fatal("SetRawTCPInterceptor did not publish a new runtime snapshot")
+	}
+	initialCfg.state.rawTCPInt(context.Background(), RawTCPTunnelEvent{})
+	updatedCfg.state.rawTCPInt(context.Background(), RawTCPTunnelEvent{})
+	if want := []string{"initial", "initial", "updated"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("interceptor calls = %#v; want %#v", calls, want)
+	}
+
+	handler.SetRawTCPInterceptor(nil)
+	if got := h.config.Load().state.rawTCPInt; got != nil {
+		t.Fatal("SetRawTCPInterceptor(nil) did not disable the interceptor")
 	}
 }
 
@@ -189,10 +237,12 @@ func TestRuntimeConfigHTTPInterceptorAppliesToNewConnectionsOnly(t *testing.T) {
 
 func TestRuntimeConfigHostFiltersApplyToNewConnections(t *testing.T) {
 	certPath, keyPath := writeRuntimeTestCA(t, "dynamic ca")
+	var rawEvents atomic.Int32
 	handler, err := NewDynamicMitmProxyHandler(
 		WithCACertPath(certPath),
 		WithCAKeyPath(keyPath),
 		WithHTTPInterceptor(headerInterceptor("intercepted")),
+		WithRawTCPInterceptor(func(context.Context, RawTCPTunnelEvent) { rawEvents.Add(1) }),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -224,6 +274,9 @@ func TestRuntimeConfigHostFiltersApplyToNewConnections(t *testing.T) {
 	defer closeResponseBody(t, resp)
 	if got := resp.Header.Get("X-Runtime-Config"); got != "" {
 		t.Fatalf("excluded host header = %q; want empty passthrough response", got)
+	}
+	if got := rawEvents.Load(); got != 0 {
+		t.Fatalf("raw TCP interceptor called %d times for HTTP and host-filter passthrough", got)
 	}
 }
 
