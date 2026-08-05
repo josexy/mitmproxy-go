@@ -289,6 +289,16 @@ mitmproxy.WithExcludeHosts("*.cdn.com", "static.example.com")
 
 `WithExcludeHosts` takes precedence over `WithIncludeHosts`.
 
+`*` matches one or more non-empty DNS labels. For example, `*.example.com`
+matches `api.example.com` and `v1.api.example.com`, but not `example.com`.
+Names are matched case-insensitively and normalized with IDNA; IPv4 and IPv6
+literals are also supported. One trailing root dot is accepted. Empty labels,
+partial-label wildcards such as `api*.example.com`, ports, and malformed names
+are rejected with `ErrInvalidHostFilter` when the handler is built.
+
+Host filters select interception versus passthrough; they are not access-control
+rules and never block unmatched traffic.
+
 ## Dynamic Runtime Config
 
 Use `NewDynamicMitmProxyHandler` for runtime updates, including `SetRawTCPInterceptor`. Use `NewResourceLimitedDynamicMitmProxyHandler` when runtime resource-limit setters are also needed; it is a superset of the dynamic interface:
@@ -306,7 +316,9 @@ if err != nil {
 
 handler.SetHTTPInterceptor(updatedInterceptor)
 handler.SetRawTCPInterceptor(updatedRawTCPInterceptor)
-handler.SetHostFilters(nil, []string{"*.cdn.example.com"})
+if err := handler.SetHostFilters(nil, []string{"*.cdn.example.com"}); err != nil {
+	log.Fatal(err)
+}
 handler.SetLogger(slog.Default())
 handler.SetHTTP2Disabled(true)
 ```
@@ -319,7 +331,9 @@ Available runtime setters:
 handler.SetProxy("http://127.0.0.1:8080")
 handler.SetProxyDisabled(true)
 handler.SetDialer(&net.Dialer{Timeout: 30 * time.Second})
-handler.SetHostFilters(includeHosts, excludeHosts)
+if err := handler.SetHostFilters(includeHosts, excludeHosts); err != nil {
+	log.Fatal(err)
+}
 handler.SetRootCAs("certs/internal-ca.crt")
 handler.SetClientCerts(map[string]mitmproxy.ClientCert{
 	"example.com": {

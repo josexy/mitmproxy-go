@@ -414,8 +414,14 @@ func WithMaxWebsocketBufferedBytes(maxBytes int64) Option {
 //
 // Supports wildcard patterns:
 //   - "example.com" - exact match
-//   - "*.example.com" - matches any subdomain of example.com
-//   - "api.*.example.com" - matches api.staging.example.com, api.prod.example.com, etc.
+//   - "*.example.com" - matches one or more non-empty labels, such as
+//     api.example.com and v1.api.example.com; it does not match example.com
+//   - "api.*.example.com" - matches api.staging.example.com and
+//     api.eu.staging.example.com, but not api.example.com
+//
+// DNS names are matched case-insensitively and normalized with IDNA. IPv4 and
+// IPv6 literals are supported, including bracketed IPv6 patterns. Invalid
+// patterns cause handler construction to return ErrInvalidHostFilter.
 //
 // If this option is not used, all hosts are intercepted by default
 // (unless excluded with WithExcludeHosts).
@@ -440,8 +446,14 @@ func WithIncludeHosts(hosts ...string) Option {
 //
 // Supports wildcard patterns:
 //   - "cdn.example.com" - exact match
-//   - "*.cdn.com" - matches any subdomain of cdn.com
-//   - "static.*.example.com" - matches static.prod.example.com, static.dev.example.com, etc.
+//   - "*.cdn.com" - matches one or more non-empty labels, such as images.cdn.com
+//     and v2.images.cdn.com; it does not match cdn.com
+//   - "static.*.example.com" - matches static.prod.example.com and
+//     static.eu.prod.example.com, but not static.example.com
+//
+// DNS names are matched case-insensitively and normalized with IDNA. IPv4 and
+// IPv6 literals are supported, including bracketed IPv6 patterns. Invalid
+// patterns cause handler construction to return ErrInvalidHostFilter.
 //
 // This is useful for excluding CDN domains, static content servers, or domains
 // that don't need inspection to improve performance.

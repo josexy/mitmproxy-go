@@ -27,7 +27,7 @@ type RuntimeConfigManager interface {
 	SetProxy(proxy string) error
 	SetProxyDisabled(disabled bool) error
 	SetDialer(dialer *net.Dialer) error
-	SetHostFilters(includeHosts, excludeHosts []string)
+	SetHostFilters(includeHosts, excludeHosts []string) error
 	SetRootCAs(rootCAPaths ...string) error
 	SetClientCerts(clientCerts map[string]ClientCert) error
 
@@ -186,12 +186,13 @@ func buildRuntimeConfig(state runtimeConfigState) (*runtimeConfig, error) {
 		return nil, err
 	}
 
-	includeMatcher, excludeMatcher := newTrieNode(), newTrieNode()
-	for _, host := range state.includeHosts {
-		includeMatcher.insert(host)
+	includeMatcher, err := buildDomainMatcher(state.includeHosts)
+	if err != nil {
+		return nil, fmt.Errorf("invalid include host filters: %w", err)
 	}
-	for _, host := range state.excludeHosts {
-		excludeMatcher.insert(host)
+	excludeMatcher, err := buildDomainMatcher(state.excludeHosts)
+	if err != nil {
+		return nil, fmt.Errorf("invalid exclude host filters: %w", err)
 	}
 
 	cfg := &runtimeConfig{

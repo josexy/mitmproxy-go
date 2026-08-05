@@ -2,6 +2,7 @@ package mitmproxy
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"slices"
@@ -30,8 +31,8 @@ func (r *mitmProxyHandler) SetDialer(dialer *net.Dialer) error {
 	})
 }
 
-func (r *mitmProxyHandler) SetHostFilters(includeHosts, excludeHosts []string) {
-	_ = r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
+func (r *mitmProxyHandler) SetHostFilters(includeHosts, excludeHosts []string) error {
+	return r.updateRuntimeConfig(func(state runtimeConfigState) (runtimeConfigState, runtimeConfigParts, error) {
 		state.includeHosts = slices.Clone(includeHosts)
 		state.excludeHosts = slices.Clone(excludeHosts)
 		return state, runtimeConfigParts{domainMatcher: true}, nil
@@ -344,12 +345,13 @@ func rebuildRuntimeConfig(oldCfg *runtimeConfig, state runtimeConfigState, parts
 		cfg.clientCertPool = clientCertPool
 	}
 	if parts.domainMatcher {
-		includeMatcher, excludeMatcher := newTrieNode(), newTrieNode()
-		for _, host := range state.includeHosts {
-			includeMatcher.insert(host)
+		includeMatcher, err := buildDomainMatcher(state.includeHosts)
+		if err != nil {
+			return nil, fmt.Errorf("invalid include host filters: %w", err)
 		}
-		for _, host := range state.excludeHosts {
-			excludeMatcher.insert(host)
+		excludeMatcher, err := buildDomainMatcher(state.excludeHosts)
+		if err != nil {
+			return nil, fmt.Errorf("invalid exclude host filters: %w", err)
 		}
 		cfg.domainMatcher.include = includeMatcher
 		cfg.domainMatcher.exclude = excludeMatcher

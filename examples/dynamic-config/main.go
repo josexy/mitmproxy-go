@@ -99,7 +99,10 @@ func runDynamicConfigDemo(ctx context.Context, handler mitmproxy.DynamicMitmProx
 	newClient.CloseIdleConnections()
 
 	slog.Info("update config: exclude 127.0.0.1 from interception")
-	handler.SetHostFilters(nil, []string{"127.0.0.1"})
+	if err := handler.SetHostFilters(nil, []string{"127.0.0.1"}); err != nil {
+		slog.Error("host filter update failed", "error", err)
+		return
+	}
 
 	requestOnce(ctx, "old connection after host filter update", oldClient, targetURL)
 	requestOnce(ctx, "new connection after host filter update", newClient, targetURL)
