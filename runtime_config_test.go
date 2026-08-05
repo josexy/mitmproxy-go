@@ -263,7 +263,9 @@ func TestRuntimeConfigHostFiltersApplyToNewConnections(t *testing.T) {
 	}
 	client.CloseIdleConnections()
 
-	handler.SetHostFilters(nil, []string{"127.0.0.1"})
+	if err := handler.SetHostFilters(nil, []string{"127.0.0.1"}); err != nil {
+		t.Fatal(err)
+	}
 
 	client = newRuntimeProxyClient(t, proxy)
 	defer client.CloseIdleConnections()
