@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"io"
 	"net"
-	"net/http"
 
 	"github.com/josexy/mitmproxy-go/buf"
 	"github.com/josexy/websocket"

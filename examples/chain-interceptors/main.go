@@ -4,8 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"log/slog"
-	"net/http"
 	"os"
 
 	"github.com/josexy/mitmproxy-go"

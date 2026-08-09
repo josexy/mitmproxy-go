@@ -12,16 +12,17 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/josexy/mitmproxy-go"
 	"github.com/josexy/mitmproxy-go/metadata"
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httputil"
 )
 
 const CHUNK_SIZE = 512
@@ -31,13 +32,151 @@ const (
 	CHUNK_TYPE_RSP
 )
 
+type headerBlockDump struct {
+	Kind       string             `json:"kind"`
+	ProtoMajor int                `json:"proto_major,omitempty"`
+	StatusCode int                `json:"status_code,omitempty"`
+	Truncated  bool               `json:"truncated,omitempty"`
+	Fields     []http.HeaderField `json:"fields"`
+}
+
+type http2FingerprintDump struct {
+	Canonical         string                          `json:"canonical"`
+	Hash              string                          `json:"hash"`
+	Settings          []http.Setting                  `json:"settings"`
+	WindowUpdate      uint32                          `json:"window_update"`
+	Priorities        []http.FingerprintPriority      `json:"priorities"`
+	HeaderPriority    *http.FingerprintHeaderPriority `json:"header_priority,omitempty"`
+	PseudoHeaderOrder []string                        `json:"pseudo_header_order"`
+}
+
+type wireProfileDump struct {
+	HeaderOrder      []string
+	TrailerOrder     []string
+	HeaderBlocks     []headerBlockDump
+	HTTP2Fingerprint *http2FingerprintDump
+}
+
+func requestWireProfileDump(req *http.Request) wireProfileDump {
+	order := mitmproxy.RequestWireHeaderOrder(req)
+	dump := wireProfileDump{
+		HeaderOrder:  append([]string(nil), order.Headers...),
+		TrailerOrder: append([]string(nil), order.Trailers...),
+		HeaderBlocks: headerBlocksDump(mitmproxy.RequestWireHeaderBlocks(req)),
+	}
+	if fingerprint, ok := mitmproxy.RequestHTTP2Fingerprint(req); ok {
+		var headerPriority *http.FingerprintHeaderPriority
+		if fingerprint.HeaderPriority != nil {
+			cloned := *fingerprint.HeaderPriority
+			headerPriority = &cloned
+		}
+		dump.HTTP2Fingerprint = &http2FingerprintDump{
+			Canonical:         fingerprint.String(),
+			Hash:              fingerprint.Hash(),
+			Settings:          append([]http.Setting(nil), fingerprint.Settings...),
+			WindowUpdate:      fingerprint.WindowUpdate,
+			Priorities:        append([]http.FingerprintPriority(nil), fingerprint.Priorities...),
+			HeaderPriority:    headerPriority,
+			PseudoHeaderOrder: append([]string(nil), fingerprint.PseudoHeaderOrder...),
+		}
+	}
+	return dump
+}
+
+func responseWireProfileDump(response *http.Response) wireProfileDump {
+	order := mitmproxy.ResponseWireHeaderOrder(response)
+	return wireProfileDump{
+		HeaderOrder:  append([]string(nil), order.Headers...),
+		TrailerOrder: append([]string(nil), order.Trailers...),
+		HeaderBlocks: headerBlocksDump(mitmproxy.ResponseWireHeaderBlocks(response)),
+	}
+}
+
+func headerBlocksDump(blocks []http.HeaderBlock) []headerBlockDump {
+	if len(blocks) == 0 {
+		return nil
+	}
+	dump := make([]headerBlockDump, len(blocks))
+	for i, block := range blocks {
+		dump[i] = headerBlockDump{
+			Kind:       headerBlockKindName(block.Kind),
+			ProtoMajor: block.ProtoMajor,
+			StatusCode: block.StatusCode,
+			Truncated:  block.Truncated,
+			Fields:     append([]http.HeaderField(nil), block.Fields...),
+		}
+	}
+	return dump
+}
+
+func headerBlockKindName(kind http.HeaderBlockKind) string {
+	switch kind {
+	case http.HeaderBlockInitial:
+		return "initial"
+	case http.HeaderBlockInformational:
+		return "informational"
+	case http.HeaderBlockTrailer:
+		return "trailer"
+	default:
+		return fmt.Sprintf("unknown(%d)", kind)
+	}
+}
+
+func logWireProfile(ctx context.Context, message, phase string, dump wireProfileDump) {
+	attrs := []slog.Attr{
+		slog.String("phase", phase),
+		slog.Any("header_order", dump.HeaderOrder),
+		slog.Any("trailer_order", dump.TrailerOrder),
+		slog.Any("header_blocks", dump.HeaderBlocks),
+	}
+	if fingerprint := dump.HTTP2Fingerprint; fingerprint != nil {
+		attrs = append(attrs, slog.Group("http2_fingerprint",
+			slog.String("canonical", fingerprint.Canonical),
+			slog.String("hash", fingerprint.Hash),
+			slog.Any("settings", fingerprint.Settings),
+			slog.Uint64("window_update", uint64(fingerprint.WindowUpdate)),
+			slog.Any("priorities", fingerprint.Priorities),
+			slog.Any("header_priority", fingerprint.HeaderPriority),
+			slog.Any("pseudo_header_order", fingerprint.PseudoHeaderOrder),
+		))
+	}
+	slog.LogAttrs(ctx, slog.LevelDebug, message, attrs...)
+}
+
+type observedReadCloser struct {
+	io.ReadCloser
+	once   sync.Once
+	onDone func()
+}
+
+func (r *observedReadCloser) complete() {
+	r.once.Do(func() {
+		if r.onDone != nil {
+			r.onDone()
+		}
+	})
+}
+
+func (r *observedReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil {
+		r.complete()
+	}
+	return n, err
+}
+
+func (r *observedReadCloser) Close() error {
+	r.complete()
+	return r.ReadCloser.Close()
+}
+
 type bodyDecoder struct {
 	reader io.ReadCloser
 	pw     *io.PipeWriter
 }
 
 func newBodyDecoder(r io.ReadCloser, encoding string, chunkType int) (io.ReadCloser, error) {
-	if r == http.NoBody { // no body and no need to replace it
+	if r == nil || r == http.NoBody { // no body and no need to replace it
 		return r, nil
 	}
 	if encoding == "" {
@@ -251,7 +390,22 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 		)
 	}
 
-	req.Body, _ = newBodyDecoder(req.Body, req.Header.Get("Content-Encoding"), CHUNK_TYPE_REQ)
+	var err error
+	req.Body, err = newBodyDecoder(req.Body, req.Header.Get("Content-Encoding"), CHUNK_TYPE_REQ)
+	if err != nil {
+		return nil, err
+	}
+	logWireProfile(ctx, "request wire profile", "initial", requestWireProfileDump(req))
+	if req.Body == nil || req.Body == http.NoBody {
+		logWireProfile(ctx, "request wire profile", "complete", requestWireProfileDump(req))
+	} else {
+		req.Body = &observedReadCloser{
+			ReadCloser: req.Body,
+			onDone: func() {
+				logWireProfile(ctx, "request wire profile", "complete", requestWireProfileDump(req))
+			},
+		}
+	}
 
 	rsp, err := invoker.Invoke(req)
 	if err != nil {
@@ -277,8 +431,22 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	)
 
 	rsp.Body, err = newBodyDecoder(rsp.Body, rsp.Header.Get("Content-Encoding"), CHUNK_TYPE_RSP)
+	if err != nil {
+		return rsp, err
+	}
+	logWireProfile(ctx, "response wire profile", "initial", responseWireProfileDump(rsp))
+	if rsp.Body == nil || rsp.Body == http.NoBody {
+		logWireProfile(ctx, "response wire profile", "complete", responseWireProfileDump(rsp))
+	} else {
+		rsp.Body = &observedReadCloser{
+			ReadCloser: rsp.Body,
+			onDone: func() {
+				logWireProfile(ctx, "response wire profile", "complete", responseWireProfileDump(rsp))
+			},
+		}
+	}
 
-	return rsp, err
+	return rsp, nil
 }
 
 func durationBetween(start, end time.Time) time.Duration {

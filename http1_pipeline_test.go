@@ -3,9 +3,9 @@ package mitmproxy
 import (
 	"bufio"
 	"context"
+	"github.com/josexy/xhttp"
 	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"testing"
 	"time"

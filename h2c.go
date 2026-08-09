@@ -2,14 +2,17 @@ package mitmproxy
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
-	"net/http"
 	"net/textproto"
 	"time"
 
-	"golang.org/x/net/http/httpguts"
+	"github.com/josexy/net/http/httpguts"
+	"github.com/josexy/net/http2"
+	http "github.com/josexy/xhttp"
 )
 
 func isH2CUpgrade(h http.Header) bool {
@@ -42,7 +45,11 @@ func initH2CWithPriorKnowledge(w http.ResponseWriter, prefaceTimeout time.Durati
 	clearDeadline()
 
 	if string(buf[:]) == expectedBody {
-		return newBufConnExt(conn, rw), nil
+		conn = newBufConnExt(conn, rw)
+		return &bufConnExt{
+			Conn:   conn,
+			Reader: bufio.NewReader(io.MultiReader(bytes.NewBufferString(http2.ClientPreface), conn)),
+		}, nil
 	}
 
 	conn.Close()

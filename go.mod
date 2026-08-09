@@ -3,9 +3,10 @@ module github.com/josexy/mitmproxy-go
 go 1.26.5
 
 require (
-	github.com/josexy/websocket v0.0.0-20260219083038-11b2ba10886b
+	github.com/josexy/net v0.0.0-20260809092324-c0d6b15b8e7b
+	github.com/josexy/websocket v0.0.0-20260809103806-4bb5473da1cf
+	github.com/josexy/xhttp v0.0.0-20260809094234-b930f9aa588a
 	github.com/refraction-networking/utls v1.8.2
-	golang.org/x/net v0.57.0
 )
 
 require (

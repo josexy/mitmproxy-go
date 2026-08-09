@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"github.com/josexy/xhttp"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"sync"
 	"time"
 )

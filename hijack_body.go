@@ -5,16 +5,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"io"
 	"net"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/http/httpguts"
+	"github.com/josexy/net/http/httpguts"
 )
 
 type hijackedRequestBodyContextKey struct{}
@@ -47,7 +47,7 @@ type hijackedRequestBody struct {
 }
 
 // rebindRequestBodyAfterHijack replaces the server-owned request body with one
-// that reads from the bufio.Reader returned by Hijack. The net/http contract
+// that reads from the bufio.Reader returned by Hijack. The xhttp contract
 // forbids using the original Request.Body after Hijack. This requires the proxy
 // handler to receive the request before middleware consumes or replaces Body.
 func rebindRequestBodyAfterHijack(req *http.Request, conn net.Conn, rw *bufio.ReadWriter) (*http.Request, net.Conn, error) {

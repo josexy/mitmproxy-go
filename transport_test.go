@@ -6,17 +6,20 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
+	"reflect"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"golang.org/x/net/http2"
+	"github.com/josexy/net/http2"
 )
 
 func TestProtocolsForRequest(t *testing.T) {
@@ -496,7 +499,7 @@ func TestSingleConnTransportRetriesReplayableRequestAfterBadClientConn(t *testin
 	<-done
 }
 
-func TestSingleConnTransportRetriesHTTP2RequestAfterBadClientConn(t *testing.T) {
+func TestSingleConnTransportDoesNotRetryHTTP2RequestAfterHeadersMayHaveBeenProcessed(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -552,17 +555,11 @@ func TestSingleConnTransportRetriesHTTP2RequestAfterBadClientConn(t *testing.T) 
 	req.Proto = "HTTP/2.0"
 	req.ProtoMajor = 2
 	req.ProtoMinor = 0
-	resp, err := tr.RoundTrip(req)
-	if err != nil {
-		t.Fatalf("RoundTrip: %v", err)
+	if _, err := tr.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip succeeded; want the first connection error without replaying the request")
 	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || string(body) != "ok" {
-		t.Fatalf("response = proto %s status %d body %q, want HTTP/2 200 ok", resp.Proto, resp.StatusCode, body)
-	}
-	if dialCount != 2 {
-		t.Fatalf("dialCount = %d, want HTTP/2 retry on a new connection", dialCount)
+	if dialCount != 1 {
+		t.Fatalf("dialCount = %d, want no retry after the request headers may have reached the origin", dialCount)
 	}
 	select {
 	case err := <-errCh:
@@ -571,6 +568,286 @@ func TestSingleConnTransportRetriesHTTP2RequestAfterBadClientConn(t *testing.T) 
 	}
 	_ = server.Close()
 	<-firstDone
+}
+
+func TestSingleConnTransportDoesNotOverrideHTTP2TransportRetryDecision(t *testing.T) {
+	permanentErr := errors.New("permanent HTTP/2 dial failure")
+	var dialCount atomic.Int32
+	tr := newTransport(
+		"example.test:80",
+		func(context.Context, string, string) (net.Conn, error) {
+			dialCount.Add(1)
+			return nil, permanentErr
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	req, err := http.NewRequest(http.MethodGet, "http://example.test/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	if _, err = tr.RoundTrip(req); !errors.Is(err, permanentErr) {
+		t.Fatalf("RoundTrip error = %v; want %v", err, permanentErr)
+	}
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("HTTP/2 dial count = %d; want the underlying transport decision to be returned without an outer retry", got)
+	}
+}
+
+func TestSingleConnTransportReplaysHTTP2FingerprintAndHeaderOrder(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type capture struct {
+		fingerprint http.Fingerprint
+		fields      []string
+		err         error
+	}
+	captured := make(chan capture, 1)
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			fingerprint, ok := http.RequestFingerprint(req)
+			if !ok {
+				captured <- capture{err: errors.New("server did not capture HTTP/2 fingerprint")}
+				return
+			}
+			var fields []string
+			for _, block := range http.RequestHeaderBlocks(req) {
+				if block.Kind != http.HeaderBlockInitial {
+					continue
+				}
+				for _, field := range block.Fields {
+					fields = append(fields, field.Name)
+				}
+				break
+			}
+			captured <- capture{fingerprint: fingerprint, fields: fields}
+			w.Header().Set("X-Zeta", "one")
+			w.Header().Set("X-Alpha", "two")
+			w.Header().Set("Trailer", "X-Trailer-B, X-Trailer-A")
+			if err := http.SetResponseHeaderOrder(w, http.HeaderOrder{
+				Headers:  []string{":status", "x-zeta", "x-alpha", "trailer"},
+				Trailers: []string{"x-trailer-b", "x-trailer-a"},
+			}); err != nil {
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+			w.Header().Set("X-Trailer-B", "b")
+			w.Header().Set("X-Trailer-A", "a")
+		})
+		serverDone <- serveHTTP2Conn(context.Background(), conn, handler, nil, false)
+	}()
+
+	const canonicalFingerprint = "1:65536;3:1000;4:6291456;6:262144|15663105|3:0:0:201,5:1:3:101|m,a,s,p"
+	fingerprint, parseFingerprintErr := http.ParseFingerprint(canonicalFingerprint)
+	if parseFingerprintErr != nil {
+		t.Fatal(parseFingerprintErr)
+	}
+	fingerprint.HeaderPriority = &http.FingerprintHeaderPriority{
+		StreamDep: 0,
+		Exclusive: true,
+		Weight:    101,
+	}
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/fingerprint", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	req.Header.Set("X-Zeta", "one")
+	req.Header.Set("X-Alpha", "two")
+	req = withRequestWireProfile(req, &requestWireProfile{
+		headerOrder: []string{":method", ":authority", ":scheme", ":path", "x-zeta", "x-alpha"},
+		fingerprint: func() *http.Fingerprint {
+			clone := cloneHTTP2Fingerprint(fingerprint)
+			return &clone
+		}(),
+	})
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		_ = tr.Close()
+		t.Fatal(err)
+	}
+	if got, want := responseHeaderOrder(resp).Headers, []string{":status", "x-zeta", "x-alpha", "trailer"}; len(got) < len(want) || !slices.Equal(got[:len(want)], want) {
+		_ = tr.Close()
+		t.Fatalf("captured response header order = %v; want %v", got, want)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "ok" {
+		_ = resp.Body.Close()
+		_ = tr.Close()
+		t.Fatalf("response body = %q, %v; want ok", body, err)
+	}
+	if got, want := responseHeaderOrder(resp).Trailers, []string{"x-trailer-b", "x-trailer-a"}; !slices.Equal(got, want) {
+		_ = resp.Body.Close()
+		_ = tr.Close()
+		t.Fatalf("captured response trailer order = %v; want %v", got, want)
+	}
+	_ = resp.Body.Close()
+
+	got := <-captured
+	if got.err != nil {
+		_ = tr.Close()
+		t.Fatal(got.err)
+	}
+	if !reflect.DeepEqual(got.fingerprint, fingerprint) {
+		_ = tr.Close()
+		t.Fatalf("captured fingerprint = %#v; want %#v", got.fingerprint, fingerprint)
+	}
+	indexOf := func(name string) int {
+		for i, field := range got.fields {
+			if field == name {
+				return i
+			}
+		}
+		return -1
+	}
+	method, authority := indexOf(":method"), indexOf(":authority")
+	scheme, path := indexOf(":scheme"), indexOf(":path")
+	zeta, alpha := indexOf("x-zeta"), indexOf("x-alpha")
+	if method < 0 || authority < 0 || scheme < 0 || path < 0 || zeta < 0 || alpha < 0 ||
+		!(method < authority && authority < scheme && scheme < path && path < zeta && zeta < alpha) {
+		_ = tr.Close()
+		t.Fatalf("captured header order = %v", got.fields)
+	}
+
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP/2 server did not stop")
+	}
+}
+
+func TestSingleConnTransportIsolatesHTTP2ConnectionsByFingerprint(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	captured := make(chan string, 2)
+	serverDone := make(chan error, 2)
+	go func() {
+		for range 2 {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				serverDone <- acceptErr
+				return
+			}
+			go func() {
+				handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					fingerprint, ok := http.RequestFingerprint(req)
+					if !ok {
+						captured <- "missing"
+					} else {
+						captured <- fingerprint.String()
+					}
+					_, _ = w.Write([]byte("ok"))
+				})
+				serverDone <- serveHTTP2Conn(context.Background(), conn, handler, nil, false)
+			}()
+		}
+	}()
+
+	var dialCount atomic.Int32
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount.Add(1)
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	fingerprints := []http.Fingerprint{
+		{
+			Settings:          []http.Setting{{ID: http.SettingHeaderTableSize, Val: 4096}},
+			PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+		},
+		{
+			Settings:          []http.Setting{{ID: http.SettingHeaderTableSize, Val: 65536}},
+			PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+		},
+	}
+	for _, fingerprint := range fingerprints {
+		req, requestErr := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/isolation", nil)
+		if requestErr != nil {
+			_ = tr.Close()
+			t.Fatal(requestErr)
+		}
+		req.Proto = "HTTP/2.0"
+		req.ProtoMajor = 2
+		req.ProtoMinor = 0
+		clone := cloneHTTP2Fingerprint(fingerprint)
+		req = withRequestWireProfile(req, &requestWireProfile{fingerprint: &clone})
+		resp, roundTripErr := tr.RoundTrip(req)
+		if roundTripErr != nil {
+			_ = tr.Close()
+			t.Fatal(roundTripErr)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	for index, fingerprint := range fingerprints {
+		select {
+		case got := <-captured:
+			if got != fingerprint.String() {
+				_ = tr.Close()
+				t.Fatalf("fingerprint %d = %q; want %q", index, got, fingerprint.String())
+			}
+		case <-time.After(2 * time.Second):
+			_ = tr.Close()
+			t.Fatal("timed out waiting for fingerprint capture")
+		}
+	}
+	if got := dialCount.Load(); got != 2 {
+		_ = tr.Close()
+		t.Fatalf("HTTP/2 dial count = %d; want two fingerprint-isolated connections", got)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("HTTP/2 server did not stop")
+		}
+	}
 }
 
 func TestSingleConnTransportDoesNotRetryNonIdempotentRequestAfterBadClientConn(t *testing.T) {

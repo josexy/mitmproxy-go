@@ -5,6 +5,8 @@ An easy-to-use and flexible MITM proxy library for Go. It can intercept and insp
 ## Features
 
 - HTTP/1.1 keep-alive and end-to-end pipelining, HTTP/2 over TLS, and h2c support
+- Wire-order preservation for HTTP/1 and HTTP/2 request/response headers and trailers
+- HTTP/2 SETTINGS, connection WINDOW_UPDATE, standalone PRIORITY, HEADERS priority, and pseudo-header fingerprint mirroring
 - HTTPS interception with custom CA certificates
 - WebSocket and secure WebSocket interception
 - Pre-relay observation for classified raw TCP tunnels without exposing payloads
@@ -55,7 +57,7 @@ package main
 import (
 	"fmt"
 	"log"
-	"net/http"
+	"github.com/josexy/xhttp"
 
 	mitmproxy "github.com/josexy/mitmproxy-go"
 )
@@ -83,7 +85,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"github.com/josexy/xhttp"
 
 	mitmproxy "github.com/josexy/mitmproxy-go"
 )
@@ -117,7 +119,7 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
+	"github.com/josexy/xhttp"
 
 	mitmproxy "github.com/josexy/mitmproxy-go"
 )
@@ -249,6 +251,8 @@ mitmproxy.WithCertCachePool(2048, 30, 15)
 ```
 
 HTTPS and WSS interception automatically captures the client's TLS ClientHello, fingerprints it with uTLS (`github.com/refraction-networking/utls`), patches SNI/ALPN for the target server, and uses that spec for the upstream TLS handshake. `WithDisableHTTP2` also removes `h2` from mirrored ALPN protocols.
+
+For HTTP/2, the proxy also captures and replays the client's ordered SETTINGS values, initial connection WINDOW_UPDATE, pre-request standalone PRIORITY frames, priority carried by each request's initial HEADERS frame, and per-request pseudo-header order. The canonical four-part fingerprint string/hash contains only standalone PRIORITY frames; HEADERS priority is retained separately as structured request metadata. Connections with different connection-level fingerprints use separate upstream HTTP/2 pool entries; initial headers and trailers preserve their observed wire order for both HTTP/1 and HTTP/2.
 
 `WithCertCachePool(capacity, intervalSecond, expireSecond)` configures the generated certificate cache. `capacity` must be a multiple of 256 when it is set; the interval and expiration values are seconds.
 
@@ -386,7 +390,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"net/http"
+	"github.com/josexy/xhttp"
 	"time"
 
 	mitmproxy "github.com/josexy/mitmproxy-go"
@@ -469,6 +473,8 @@ go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode 
 # SOCKS5 proxy mode
 go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode socks5 -port 10086
 ```
+
+The dumper logs ordered HTTP/1 and HTTP/2 header blocks, late trailer blocks, canonical four-part HTTP/2 fingerprints and hashes, separate standalone and HEADERS priority metadata, TLS negotiation/certificate metadata, bodies, WebSocket frames, and raw TCP tunnel metadata.
 
 ### Modify Content
 

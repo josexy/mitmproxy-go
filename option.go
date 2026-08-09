@@ -2,9 +2,9 @@ package mitmproxy
 
 import (
 	"context"
+	"github.com/josexy/xhttp"
 	"log/slog"
 	"net"
-	"net/http"
 	"time"
 
 	"github.com/josexy/mitmproxy-go/internal/cert"

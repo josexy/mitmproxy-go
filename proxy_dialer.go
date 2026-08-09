@@ -7,8 +7,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/http/httpproxy"
-	"golang.org/x/net/proxy"
+	"github.com/josexy/net/http/httpproxy"
+	"github.com/josexy/net/proxy"
 )
 
 const dialTimeout = 15 * time.Second

@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"log/slog"
 	"net"
-	"net/http"
 	"sync"
 	"time"
 

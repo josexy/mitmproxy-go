@@ -1,11 +1,11 @@
 package mitmproxy
 
 import (
-	"net/http"
+	"github.com/josexy/xhttp"
 	"net/textproto"
 	"strings"
 
-	"golang.org/x/net/http/httpguts"
+	"github.com/josexy/net/http/httpguts"
 )
 
 const (

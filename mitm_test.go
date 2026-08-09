@@ -7,9 +7,9 @@ import (
 	"crypto/tls"
 	"crypto/x509/pkix"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,7 +20,6 @@ import (
 	"github.com/josexy/mitmproxy-go"
 	"github.com/josexy/mitmproxy-go/internal/cert"
 	"github.com/josexy/mitmproxy-go/metadata"
-	"golang.org/x/net/http2"
 )
 
 var (
@@ -204,9 +203,11 @@ func testHTTPRequest(typ, proxyAddr, targetAddr string) (statusCode int, proto s
 		}
 	}
 	if typ == "h2c" {
-		transport = &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		protocols := &http.Protocols{}
+		protocols.SetUnencryptedHTTP2(true)
+		transport = &http.Transport{
+			Protocols: protocols,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return conn, nil
 			},
 		}

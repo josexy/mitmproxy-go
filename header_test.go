@@ -1,7 +1,7 @@
 package mitmproxy
 
 import (
-	"net/http"
+	"github.com/josexy/xhttp"
 	"testing"
 )
 

@@ -3,7 +3,7 @@ package mitmproxy
 import (
 	"context"
 	"errors"
-	"net/http"
+	"github.com/josexy/xhttp"
 
 	"github.com/josexy/mitmproxy-go/buf"
 )

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/josexy/net/http2"
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
 )
 
 const tlsRecordHeaderLen = 5

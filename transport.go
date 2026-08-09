@@ -2,17 +2,18 @@ package mitmproxy
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/textproto"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/net/http2"
+	"github.com/josexy/net/http2"
 )
 
 type singleConnTransport struct {
@@ -24,11 +25,25 @@ type singleConnTransport struct {
 
 	mu             sync.Mutex
 	clientConn     *http.ClientConn
+	http2Transport *http2.Transport
+	http2Conns     map[*trackedHTTP2Conn]struct{}
 	http1Conn      *http1PipelineConn
 	http1Degraded  bool
 	retired        []*http.ClientConn
 	negotiatedALPN string
 	closed         bool
+}
+
+type trackedHTTP2Conn struct {
+	net.Conn
+	once    sync.Once
+	onClose func()
+}
+
+func (c *trackedHTTP2Conn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.onClose)
+	return err
 }
 
 func newTransport(
@@ -52,6 +67,16 @@ func newTransport(
 }
 
 func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = ensureRequestWireProfile(req)
+	if t.shouldUseHTTP2(req) {
+		return t.roundTripHTTP2(req)
+	}
+	var err error
+	req, err = withRequestHeaderOrder(req)
+	if err != nil {
+		closeRequestBody(req)
+		return nil, fmt.Errorf("apply request header order: %w", err)
+	}
 	if t.shouldUseHTTP1Pipeline(req) {
 		return t.roundTripHTTP1(req)
 	}
@@ -113,6 +138,74 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 		return nil, err
 	}
+}
+
+func (t *singleConnTransport) shouldUseHTTP2(req *http.Request) bool {
+	if req == nil || req.URL == nil || t.disableHTTP2 {
+		return false
+	}
+	t.mu.Lock()
+	negotiatedALPN := t.negotiatedALPN
+	t.mu.Unlock()
+	_, protocols := clientConnSchemeAndProtocols(req.URL.Scheme, req.ProtoMajor, false, negotiatedALPN)
+	return protocols.UnencryptedHTTP2() && !protocols.HTTP1()
+}
+
+func (t *singleConnTransport) roundTripHTTP2(req *http.Request) (*http.Response, error) {
+	transport, err := t.getHTTP2Transport()
+	if err != nil {
+		closeRequestBody(req)
+		return nil, err
+	}
+	preparedReq, err := prepareHTTP2Request(req)
+	if err != nil {
+		closeRequestBody(req)
+		return nil, err
+	}
+	resp, err := transport.RoundTrip(preparedReq)
+	if err != nil {
+		return nil, err
+	}
+	return prepareHTTP2Response(resp, req), nil
+}
+
+func (t *singleConnTransport) getHTTP2Transport() (*http2.Transport, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, net.ErrClosed
+	}
+	if t.http2Transport != nil {
+		return t.http2Transport, nil
+	}
+	t.http2Conns = make(map[*trackedHTTP2Conn]struct{})
+	t.http2Transport = &http2.Transport{
+		AllowHTTP:          true,
+		DisableCompression: true,
+		IdleConnTimeout:    t.idleTimeout,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			conn, err := t.dialFn(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			tracked := &trackedHTTP2Conn{Conn: conn}
+			tracked.onClose = func() {
+				t.mu.Lock()
+				delete(t.http2Conns, tracked)
+				t.mu.Unlock()
+			}
+			t.mu.Lock()
+			if t.closed {
+				t.mu.Unlock()
+				_ = conn.Close()
+				return nil, net.ErrClosed
+			}
+			t.http2Conns[tracked] = struct{}{}
+			t.mu.Unlock()
+			return tracked, nil
+		},
+	}
+	return t.http2Transport, nil
 }
 
 func (t *singleConnTransport) shouldUseHTTP1Pipeline(req *http.Request) bool {
@@ -334,6 +427,13 @@ func (t *singleConnTransport) Close() error {
 	t.clientConn = nil
 	http1Conn := t.http1Conn
 	t.http1Conn = nil
+	http2Transport := t.http2Transport
+	t.http2Transport = nil
+	http2Conns := make([]*trackedHTTP2Conn, 0, len(t.http2Conns))
+	for conn := range t.http2Conns {
+		http2Conns = append(http2Conns, conn)
+	}
+	t.http2Conns = nil
 	retired := t.retired
 	t.retired = nil
 	t.mu.Unlock()
@@ -343,6 +443,12 @@ func (t *singleConnTransport) Close() error {
 	}
 	if http1Conn != nil {
 		_ = http1Conn.Close()
+	}
+	if http2Transport != nil {
+		http2Transport.CloseIdleConnections()
+	}
+	for _, conn := range http2Conns {
+		_ = conn.Close()
 	}
 	for _, conn := range retired {
 		_ = conn.Close()

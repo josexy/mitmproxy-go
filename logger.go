@@ -2,8 +2,8 @@ package mitmproxy
 
 import (
 	"context"
+	"github.com/josexy/xhttp"
 	"log/slog"
-	"net/http"
 )
 
 const logMessagePrefix = "[mitmproxy-go] "
