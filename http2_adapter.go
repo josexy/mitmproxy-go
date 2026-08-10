@@ -75,7 +75,10 @@ func convertHTTP2Fingerprint(source http.Fingerprint) nethttp2.Fingerprint {
 			Weight:    priority.Weight,
 		}
 	}
-	if source.HeaderPriority != nil {
+	// Stream IDs are scoped to one HTTP/2 connection. Without a mapping from
+	// downstream streams to independently allocated upstream streams, only a
+	// dependency on the connection root can be replayed safely.
+	if source.HeaderPriority != nil && source.HeaderPriority.StreamDep == 0 {
 		converted.HeaderPriority = &nethttp2.FingerprintHeaderPriority{
 			StreamDep: source.HeaderPriority.StreamDep,
 			Exclusive: source.HeaderPriority.Exclusive,

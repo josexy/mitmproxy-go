@@ -60,6 +60,87 @@ func TestHTTP2WireProfileThroughProxyEndToEnd(t *testing.T) {
 	assertNoHTTP2E2EError(t, proxyErrors)
 }
 
+func TestHTTP2NonRootHeaderPriorityDoesNotCollideAcrossProxy(t *testing.T) {
+	dir := t.TempDir()
+	caCertPath, caKeyPath, serverCertPath, _ := writeTestCertificates(t, dir)
+
+	originObserved := make(chan http2E2EObservation, 1)
+	originAddr := startH2CWireOrigin(t, orderedHTTP2OriginHandler(originObserved, "forwarded"))
+	interceptorObserved := make(chan http2E2EObservation, 1)
+	observeForwarded := observingHTTP2Interceptor(interceptorObserved)
+	interceptor := func(ctx context.Context, req *http.Request, next HTTPDelegatedInvoker) (*http.Response, error) {
+		if req.URL.Path == "/local" {
+			return &http.Response{
+				Status:        "204 No Content",
+				StatusCode:    http.StatusNoContent,
+				Proto:         "HTTP/2.0",
+				ProtoMajor:    2,
+				Header:        make(http.Header),
+				Body:          http.NoBody,
+				ContentLength: 0,
+				Request:       req,
+			}, nil
+		}
+		return observeForwarded(ctx, req, next)
+	}
+	proxyAddr, proxyErrors := startHTTP2E2EProxy(
+		t,
+		caCertPath,
+		caKeyPath,
+		serverCertPath,
+		interceptor,
+	)
+
+	tunnel := connectProxyTunnel(t, proxyAddr, originAddr)
+	transport := newSingleUseHTTP2Transport(t, tunnel, true)
+	localFingerprint := testHTTP2E2EFingerprint(t)
+	localRequest := newOrderedHTTP2Request(t, "http://"+originAddr+"/local", localFingerprint)
+	localResponse, err := transport.RoundTrip(localRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localResponse.StatusCode != http.StatusNoContent {
+		localResponse.Body.Close()
+		t.Fatalf("local response status = %d; want 204", localResponse.StatusCode)
+	}
+	if err := localResponse.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	forwardedFingerprint := testHTTP2E2EFingerprint(t)
+	forwardedFingerprint.HeaderPriority = &nethttp2.FingerprintHeaderPriority{
+		StreamDep: 1,
+		Exclusive: true,
+		Weight:    101,
+	}
+	forwardedRequest := newOrderedHTTP2Request(
+		t,
+		"http://"+originAddr+"/forwarded",
+		forwardedFingerprint,
+	)
+	forwardedResponse, err := transport.RoundTrip(forwardedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forwardedResponse.StatusCode != http.StatusOK {
+		forwardedResponse.Body.Close()
+		select {
+		case proxyErr := <-proxyErrors:
+			t.Fatalf("forwarded response status = %d; proxy error: %v", forwardedResponse.StatusCode, proxyErr)
+		default:
+			t.Fatalf("forwarded response status = %d; want 200", forwardedResponse.StatusCode)
+		}
+	}
+	assertOrderedHTTP2Response(t, forwardedResponse, "forwarded")
+
+	wantDownstream := xhttpFingerprintFromNetHTTP2(t, forwardedFingerprint)
+	wantUpstream := wantDownstream
+	wantUpstream.HeaderPriority = nil
+	assertHTTP2E2EObservation(t, receiveHTTP2Observation(t, interceptorObserved), wantDownstream, false)
+	assertHTTP2E2EObservation(t, receiveHTTP2Observation(t, originObserved), wantUpstream, true)
+	assertNoHTTP2E2EError(t, proxyErrors)
+}
+
 func TestTLSHTTP2FingerprintThroughUTLSMitmEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	caCertPath, caKeyPath, serverCertPath, serverKeyPath := writeTestCertificates(t, dir)

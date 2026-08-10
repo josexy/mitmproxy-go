@@ -126,6 +126,24 @@ func TestConvertHTTP2FingerprintPreservesNonCanonicalHeaderPriority(t *testing.T
 	}
 }
 
+func TestConvertHTTP2FingerprintDropsConnectionRelativeHeaderPriority(t *testing.T) {
+	source := http.Fingerprint{
+		HeaderPriority: &http.FingerprintHeaderPriority{
+			StreamDep: 3,
+			Exclusive: true,
+			Weight:    101,
+		},
+		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+	}
+	converted := convertHTTP2Fingerprint(source)
+	if converted.HeaderPriority != nil {
+		t.Fatalf("converted HEADERS priority = %#v; want nil", converted.HeaderPriority)
+	}
+	if source.HeaderPriority == nil || source.HeaderPriority.StreamDep != 3 {
+		t.Fatal("conversion mutated captured fingerprint metadata")
+	}
+}
+
 func TestWireHeaderOrderAccessorsReturnDefensiveSnapshots(t *testing.T) {
 	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(
 		"GET / HTTP/1.1\r\nX-Zeta: one\r\nHost: example.test\r\nX-Alpha: two\r\nTrailer: X-Trailer-B, X-Trailer-A\r\n\r\n",
