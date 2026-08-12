@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	http "github.com/josexy/xhttp"
@@ -255,11 +256,10 @@ func (a *httpTraceAttempt) wroteHeaders() {
 }
 
 type httpTimingResponseBody struct {
-	mu      sync.Mutex
 	source  io.ReadCloser
 	timing  *httpExchangeTiming
 	attempt int
-	done    bool
+	done    atomic.Bool
 }
 
 func (b *httpTimingResponseBody) Read(buffer []byte) (int, error) {
@@ -277,13 +277,9 @@ func (b *httpTimingResponseBody) Close() error {
 }
 
 func (b *httpTimingResponseBody) finish(complete bool, err error) {
-	b.mu.Lock()
-	if b.done {
-		b.mu.Unlock()
+	if !b.done.CompareAndSwap(false, true) {
 		return
 	}
-	b.done = true
-	b.mu.Unlock()
 	b.timing.responseFinished(b.attempt, complete, err)
 }
 

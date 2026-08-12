@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -188,6 +189,36 @@ func TestHTTPExchangeTimingPropagatesResponseReadError(t *testing.T) {
 	last := events[len(events)-1]
 	if last.Phase != HTTPExchangeResponseEnded || last.Complete || !errors.Is(last.Error, readErr) {
 		t.Fatalf("response error event = %#v", last)
+	}
+}
+
+func TestHTTPTimingResponseBodyFinishesOnceConcurrently(t *testing.T) {
+	timing := newHTTPExchangeTiming(systemTimingClock{})
+	attempt := timing.startAttempt()
+	events := make(chan HTTPExchangeTimingEvent, 64)
+	ObserveHTTPExchangeTiming(withHTTPExchangeTiming(context.Background(), timing), func(event HTTPExchangeTimingEvent) {
+		events <- event
+	})
+	body := &httpTimingResponseBody{timing: timing, attempt: attempt}
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for index := range 64 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			body.finish(index%2 == 0, errors.New("terminal response"))
+		}()
+	}
+	close(start)
+	wait.Wait()
+
+	if !body.done.Load() {
+		t.Fatal("response body was not marked finished")
+	}
+	if got := len(events); got != 1 {
+		t.Fatalf("response terminal events = %d, want 1", got)
 	}
 }
 
