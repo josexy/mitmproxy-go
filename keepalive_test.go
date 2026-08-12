@@ -879,6 +879,7 @@ func TestWebsocketInterceptorReceivesUpstreamHandshakeTiming(t *testing.T) {
 	}
 	timingCh := make(chan timingResult, 1)
 	listener := startKeepAliveProxy(t,
+		WithUpstreamHTTPTrace(),
 		WithWebsocketInterceptor(func(ctx context.Context, _ *http.Request, _ *http.Response, _ WebsocketFramesWatcher) {
 			timing, ok := WebsocketHandshakeTimingFromContext(ctx)
 			timingCh <- timingResult{timing: timing, ok: ok}
@@ -925,6 +926,126 @@ func TestWebsocketInterceptorReceivesUpstreamHandshakeTiming(t *testing.T) {
 		timing.ResponseStartedAt.Before(timing.RequestEndedAt) ||
 		timing.ResponseEndedAt.Before(timing.ResponseStartedAt) {
 		t.Fatalf("handshake timestamps are out of order: %+v", timing)
+	}
+	if !timing.RequestEndedAt.After(timing.RequestStartedAt) {
+		t.Fatalf("request handshake duration was not observable: %+v", timing)
+	}
+	if !timing.ResponseEndedAt.After(timing.ResponseStartedAt) {
+		t.Fatalf("response handshake duration was not observable: %+v", timing)
+	}
+}
+
+func TestHTTPInterceptorReceivesUpstreamExchangeTiming(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, "timed response")
+	}))
+	defer origin.Close()
+
+	events := make(chan HTTPExchangeTimingEvent, 4)
+	observerAvailable := make(chan bool, 1)
+	listener := startKeepAliveProxy(t,
+		WithUpstreamHTTPTrace(),
+		WithDisableHTTP2(),
+		WithHTTPInterceptor(func(ctx context.Context, request *http.Request, next HTTPDelegatedInvoker) (*http.Response, error) {
+			observerAvailable <- ObserveHTTPExchangeTiming(ctx, func(event HTTPExchangeTimingEvent) {
+				events <- event
+			})
+			return next.Invoke(request)
+		}),
+	)
+
+	conn, reader := dialProxy(t, listener)
+	host := strings.TrimPrefix(origin.URL, "http://")
+	if _, err := fmt.Fprintf(conn, "GET %s/timing HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", origin.URL, host); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+
+	select {
+	case available := <-observerAvailable:
+		if !available {
+			t.Fatal("HTTP exchange timing observer was unavailable")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP interceptor was not called")
+	}
+
+	got := make([]HTTPExchangeTimingEvent, 0, 4)
+	for len(got) < 4 {
+		select {
+		case event := <-events:
+			got = append(got, event)
+		case <-time.After(time.Second):
+			t.Fatalf("received %d timing events, want 4: %#v", len(got), got)
+		}
+	}
+	wantPhases := []HTTPExchangeTimingPhase{
+		HTTPExchangeRequestStarted,
+		HTTPExchangeRequestEnded,
+		HTTPExchangeResponseStarted,
+		HTTPExchangeResponseEnded,
+	}
+	for index, event := range got {
+		if event.Phase != wantPhases[index] || event.Attempt != 1 || event.Timestamp.IsZero() {
+			t.Fatalf("event %d = %#v, want phase %s attempt 1", index, event, wantPhases[index])
+		}
+		if index > 0 && event.Timestamp.Before(got[index-1].Timestamp) {
+			t.Fatalf("timing events are out of order: %#v", got)
+		}
+	}
+	if !got[1].Complete || !got[3].Complete || got[1].Error != nil || got[3].Error != nil {
+		t.Fatalf("terminal timing events are incomplete: %#v", got)
+	}
+}
+
+func TestWebsocketInterceptorHasNoHandshakeTimingByDefault(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer origin.Close()
+
+	timingPresent := make(chan bool, 1)
+	listener := startKeepAliveProxy(t,
+		WithWebsocketInterceptor(func(ctx context.Context, _ *http.Request, _ *http.Response, _ WebsocketFramesWatcher) {
+			_, ok := WebsocketHandshakeTimingFromContext(ctx)
+			timingPresent <- ok
+		}),
+	)
+	proxyURL, err := url.Parse("http://" + listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyURL(proxyURL),
+		HandshakeTimeout: time.Second,
+	}
+	client, response, err := dialer.Dial("ws"+strings.TrimPrefix(origin.URL, "http"), nil)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	select {
+	case present := <-timingPresent:
+		if present {
+			t.Fatal("WebSocket handshake timing was attached without WithUpstreamHTTPTrace")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket interceptor was not called")
 	}
 }
 

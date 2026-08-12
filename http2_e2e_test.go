@@ -29,6 +29,69 @@ type http2E2EObservation struct {
 
 type http2E2EInterceptorContextKey struct{}
 
+func TestHTTP2UpstreamExchangeTimingThroughProxy(t *testing.T) {
+	dir := t.TempDir()
+	caCertPath, caKeyPath, serverCertPath, _ := writeTestCertificates(t, dir)
+	originAddr := startH2CWireOrigin(t, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(writer, "timed h2 response")
+	}))
+
+	events := make(chan HTTPExchangeTimingEvent, 4)
+	observerAvailable := make(chan bool, 1)
+	interceptor := func(ctx context.Context, request *http.Request, next HTTPDelegatedInvoker) (*http.Response, error) {
+		observerAvailable <- ObserveHTTPExchangeTiming(ctx, func(event HTTPExchangeTimingEvent) {
+			events <- event
+		})
+		return next.Invoke(request)
+	}
+	proxyAddr, proxyErrors := startHTTP2E2EProxy(
+		t,
+		caCertPath,
+		caKeyPath,
+		serverCertPath,
+		interceptor,
+		WithUpstreamHTTPTrace(),
+	)
+
+	tunnel := connectProxyTunnel(t, proxyAddr, originAddr)
+	transport := newSingleUseHTTP2Transport(t, tunnel, true)
+	request := newOrderedHTTP2Request(t, "http://"+originAddr+"/timing", testHTTP2E2EFingerprint(t))
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+
+	select {
+	case available := <-observerAvailable:
+		if !available {
+			t.Fatal("HTTP/2 timing observer was unavailable")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP/2 interceptor was not called")
+	}
+	want := []HTTPExchangeTimingPhase{
+		HTTPExchangeRequestStarted,
+		HTTPExchangeRequestEnded,
+		HTTPExchangeResponseStarted,
+		HTTPExchangeResponseEnded,
+	}
+	for index, phase := range want {
+		select {
+		case event := <-events:
+			if event.Phase != phase || event.Attempt != 1 || event.Timestamp.IsZero() {
+				t.Fatalf("event %d = %#v, want phase %s attempt 1", index, event, phase)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for event %s", phase)
+		}
+	}
+	assertNoHTTP2E2EError(t, proxyErrors)
+}
+
 func TestHTTP2WireProfileThroughProxyEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	caCertPath, caKeyPath, serverCertPath, _ := writeTestCertificates(t, dir)
@@ -246,10 +309,11 @@ func startHTTP2E2EProxy(
 	t *testing.T,
 	caCertPath, caKeyPath, rootCertPath string,
 	interceptor HTTPInterceptor,
+	extraOptions ...Option,
 ) (string, <-chan error) {
 	t.Helper()
 	proxyErrors := make(chan error, 16)
-	handler, err := NewMitmProxyHandler(
+	options := []Option{
 		WithCACertPath(caCertPath),
 		WithCAKeyPath(caKeyPath),
 		WithRootCAs(rootCertPath),
@@ -260,7 +324,9 @@ func startHTTP2E2EProxy(
 			default:
 			}
 		}),
-	)
+	}
+	options = append(options, extraOptions...)
+	handler, err := NewMitmProxyHandler(options...)
 	if err != nil {
 		t.Fatal(err)
 	}

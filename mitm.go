@@ -391,6 +391,7 @@ func newMitmProxyHandler(opt ...Option) (*mitmProxyHandler, error) {
 	logConfigAttrs(context.Background(), runtimeConfig, slog.LevelInfo, "mitm handler initialized",
 		slog.Bool("proxy_configured", runtimeConfig.proxyDialer != nil && runtimeConfig.proxyDialer.proxyURL != nil),
 		slog.Bool("disable_http2", runtimeConfig.state.disableHTTP2),
+		slog.Bool("upstream_http_trace", runtimeConfig.state.upstreamHTTPTrace),
 		slog.Bool("include_hosts_configured", len(runtimeConfig.state.includeHosts) > 0),
 		slog.Bool("exclude_hosts_configured", len(runtimeConfig.state.excludeHosts) > 0),
 		slog.Int("cert_cache_capacity", certCacheCapacity),
@@ -2435,21 +2436,28 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	}
 
 	boundedDstConn := newBoundedHTTPHeaderConn(dstConn, cfg.state.maxHTTPHeaderBytes)
-	handshakeTiming := WebsocketHandshakeTiming{RequestStartedAt: time.Now()}
-	trace := &httptrace.ClientTrace{
-		WroteRequest: func(httptrace.WroteRequestInfo) {
-			handshakeTiming.RequestEndedAt = time.Now()
-		},
-		GotFirstResponseByte: func() {
-			handshakeTiming.ResponseStartedAt = time.Now()
-		},
+	var handshakeClock timingClock
+	var handshakeTiming WebsocketHandshakeTiming
+	if cfg.state.upstreamHTTPTrace {
+		handshakeClock = newTimingClock()
+		handshakeTiming.RequestStartedAt = handshakeClock.Now()
+		trace := &httptrace.ClientTrace{
+			WroteRequest: func(httptrace.WroteRequestInfo) {
+				handshakeTiming.RequestEndedAt = handshakeClock.Now()
+			},
+			GotFirstResponseByte: func() {
+				handshakeTiming.ResponseStartedAt = handshakeClock.Now()
+			},
+		}
+		reqClone = reqClone.WithContext(httptrace.WithClientTrace(reqClone.Context(), trace))
 	}
-	reqClone = reqClone.WithContext(httptrace.WithClientTrace(reqClone.Context(), trace))
 	wsDstConn, resp, err := websocket.DialWithPreparedRequestAndNetConn(reqClone, boundedDstConn)
 	if err != nil {
 		return err
 	}
-	handshakeTiming.ResponseEndedAt = time.Now()
+	if handshakeClock != nil {
+		handshakeTiming.ResponseEndedAt = handshakeClock.Now()
+	}
 	resp.Request = reqCtx.Request
 	sanitizeWebsocketUpgradeHeaders(resp.Header)
 	wsSrcConn, err := websocket.UpgradeWithPreparedResponseAndNetConn(resp, srcConn)
@@ -2468,7 +2476,9 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 		slog.Int("status_code", resp.StatusCode),
 	)
 
-	ctx = context.WithValue(ctx, websocketHandshakeTimingContextKey{}, handshakeTiming)
+	if cfg.state.upstreamHTTPTrace {
+		ctx = context.WithValue(ctx, websocketHandshakeTimingContextKey{}, handshakeTiming)
+	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(err)
 	go func() {
@@ -2657,6 +2667,11 @@ func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.R
 
 	reqCtx.Request = req
 	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
+	var exchangeTiming *httpExchangeTiming
+	if connCtx.config.state.upstreamHTTPTrace {
+		exchangeTiming = newHTTPExchangeTiming(newTimingClock())
+		ctx = withHTTPExchangeTiming(ctx, exchangeTiming)
+	}
 	req = req.WithContext(context.WithValue(ctx, connContextKey, connCtx))
 	start := time.Now()
 	profile := requestWireProfileFromRequest(req)
@@ -2664,7 +2679,13 @@ func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.R
 		if nextReq != nil && requestWireProfileFromRequest(nextReq) == nil {
 			nextReq = withRequestWireProfile(nextReq, profile)
 		}
-		return invoker.Invoke(nextReq)
+		if exchangeTiming == nil || nextReq == nil {
+			return invoker.Invoke(nextReq)
+		}
+		tracedRequest, attempt := exchangeTiming.traceRequest(nextReq)
+		response, invokeErr := invoker.Invoke(tracedRequest)
+		exchangeTiming.observeResult(tracedRequest, response, invokeErr, attempt)
+		return response, invokeErr
 	})
 	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http request",
 		slog.String("hostport", reqCtx.Hostport),

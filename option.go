@@ -36,17 +36,20 @@ func (f OptionFunc) apply(o *options) { f(o) }
 type options struct {
 	streamBaseCtx context.Context // Stream Base Context for h2 connection
 
-	proxy         string      // Upstream proxy URL (e.g., "http://127.0.0.1:8080")
-	caCertPath    string      // Path to the CA certificate file for TLS interception
-	caKeyPath     string      // Path to the CA private key file for TLS interception
-	skipVerifySSL bool        // Skip SSL certificate verification when connecting to servers
-	disableHTTP2  bool        // Disable HTTP/2 support, use HTTP/1.1 only
-	disableProxy  bool        // Disable upstream proxy usage
-	includeHosts  []string    // Whitelist of hosts to intercept (supports wildcards)
-	excludeHosts  []string    // Blacklist of hosts to exclude from interception (supports wildcards)
-	rootCAs       []string    // Paths to additional root CA certificate files
-	dialer        *net.Dialer // Custom dialer for outbound connections
-	logger        *slog.Logger
+	proxy         string // Upstream proxy URL (e.g., "http://127.0.0.1:8080")
+	caCertPath    string // Path to the CA certificate file for TLS interception
+	caKeyPath     string // Path to the CA private key file for TLS interception
+	skipVerifySSL bool   // Skip SSL certificate verification when connecting to servers
+	disableHTTP2  bool   // Disable HTTP/2 support, use HTTP/1.1 only
+	disableProxy  bool   // Disable upstream proxy usage
+	// upstreamHTTPTrace enables origin-facing HTTP lifecycle timing for ordinary
+	// HTTP exchanges and WebSocket upgrade handshakes.
+	upstreamHTTPTrace bool
+	includeHosts      []string    // Whitelist of hosts to intercept (supports wildcards)
+	excludeHosts      []string    // Blacklist of hosts to exclude from interception (supports wildcards)
+	rootCAs           []string    // Paths to additional root CA certificate files
+	dialer            *net.Dialer // Custom dialer for outbound connections
+	logger            *slog.Logger
 
 	idleConnTimeout    time.Duration // Idle timeout for connections
 	handshakeTimeout   time.Duration
@@ -330,6 +333,19 @@ func WithSkipVerifySSLFromServer() Option {
 func WithDisableHTTP2() Option {
 	return OptionFunc(func(o *options) {
 		o.disableHTTP2 = true
+	})
+}
+
+// WithUpstreamHTTPTrace enables origin-facing HTTP lifecycle timing. When
+// enabled, the proxy composes an httptrace.ClientTrace immediately before the
+// upstream transport invocation for ordinary HTTP requests and WebSocket
+// upgrade handshakes. HTTP interceptors can subscribe with
+// [ObserveHTTPExchangeTiming], and WebSocket interceptors can read the completed
+// handshake with [WebsocketHandshakeTimingFromContext]. The option is disabled
+// by default.
+func WithUpstreamHTTPTrace() Option {
+	return OptionFunc(func(o *options) {
+		o.upstreamHTTPTrace = true
 	})
 }
 

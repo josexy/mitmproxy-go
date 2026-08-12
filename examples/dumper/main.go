@@ -303,6 +303,7 @@ func main() {
 		mitmproxy.WithCACertPath(caCertPath),
 		mitmproxy.WithCAKeyPath(caKeyPath),
 		mitmproxy.WithLogger(logger),
+		mitmproxy.WithUpstreamHTTPTrace(),
 		mitmproxy.WithHTTPInterceptor(httpInterceptor),
 		mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
 		mitmproxy.WithRawTCPInterceptor(rawTCPInterceptor),

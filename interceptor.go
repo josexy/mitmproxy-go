@@ -25,8 +25,9 @@ type WebsocketHandshakeTiming struct {
 }
 
 // WebsocketHandshakeTimingFromContext returns the upstream opening-handshake
-// timing attached to a WebsocketInterceptor context. A successful WebSocket
-// upgrade supplies all four timestamps.
+// timing attached to a WebsocketInterceptor context when
+// [WithUpstreamHTTPTrace] is enabled. A successful WebSocket upgrade supplies
+// all four timestamps.
 func WebsocketHandshakeTimingFromContext(ctx context.Context) (WebsocketHandshakeTiming, bool) {
 	if ctx == nil {
 		return WebsocketHandshakeTiming{}, false
