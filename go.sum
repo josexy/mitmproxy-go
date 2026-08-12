@@ -2,8 +2,8 @@ github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtn
 github.com/andybalholm/brotli v1.2.2/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/josexy/net v0.0.0-20260809092324-c0d6b15b8e7b h1:Wvj0rSQ+WISVjpMnx2Wci0nrRb9yAL444HaMbAWs5xk=
 github.com/josexy/net v0.0.0-20260809092324-c0d6b15b8e7b/go.mod h1:U2/ek4YggQo15z4uwJcTmV/8S7EPplb9K4KQlAA0j2I=
-github.com/josexy/websocket v0.0.0-20260809103806-4bb5473da1cf h1:8u1JbqscuDUvp/HDt2WVHkoHWvbHHdaGBYXjUecTmJ4=
-github.com/josexy/websocket v0.0.0-20260809103806-4bb5473da1cf/go.mod h1:VqFW1+LXDzh717s0H3J/AoS4G4ns297H7QldoYe0qao=
+github.com/josexy/websocket v0.0.0-20260812113300-35d6b49c97d0 h1:sbZ6fki5puFMnjNKiiHLw1+khrT4HezaNdAganaRs2s=
+github.com/josexy/websocket v0.0.0-20260812113300-35d6b49c97d0/go.mod h1:VqFW1+LXDzh717s0H3J/AoS4G4ns297H7QldoYe0qao=
 github.com/josexy/xhttp v0.0.0-20260809094234-b930f9aa588a h1:fyRdc/V1gPf0bXQx34Vdz08Zu8wk6MjHcpSsSmCVoQU=
 github.com/josexy/xhttp v0.0.0-20260809094234-b930f9aa588a/go.mod h1:IJG/ZONLw42obBvUwJM45WkY/bQsj7rscaHZrqLLINs=
 github.com/klauspost/compress v1.19.0 h1:sXLILfc9jV2QYWkzFOPWStmcUVH2RHEB1JCdY2oVvCQ=
