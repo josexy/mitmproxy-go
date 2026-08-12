@@ -111,6 +111,54 @@ handler, err := mitmproxy.NewMitmProxyHandler(
 )
 ```
 
+### Upstream HTTP Timing
+
+Upstream timing is opt-in. Add `WithUpstreamHTTPTrace()` to enable the shared
+`httptrace.ClientTrace` instrumentation for ordinary HTTP exchanges and
+WebSocket opening handshakes. Register an HTTP observer inside the interceptor,
+before calling `invoker.Invoke`:
+
+```go
+func timedHTTPInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+	ok := mitmproxy.ObserveHTTPExchangeTiming(ctx, func(event mitmproxy.HTTPExchangeTimingEvent) {
+		log.Printf(
+			"phase=%s attempt=%d at=%s complete=%t err=%v",
+			event.Phase,
+			event.Attempt,
+			event.Timestamp.Format(time.RFC3339Nano),
+			event.Complete,
+			event.Error,
+		)
+	})
+	if !ok {
+		log.Print("upstream timing is disabled")
+	}
+	return invoker.Invoke(req)
+}
+
+handler, err := mitmproxy.NewMitmProxyHandler(
+	mitmproxy.WithCACertPath("certs/ca.crt"),
+	mitmproxy.WithCAKeyPath("certs/ca.key"),
+	mitmproxy.WithUpstreamHTTPTrace(),
+	mitmproxy.WithHTTPInterceptor(timedHTTPInterceptor),
+)
+```
+
+The phases have the following origin-facing meanings:
+
+- `request_started`: immediately before the first final upstream transport invocation; a transparent retry starts when the transport begins its replacement header write.
+- `request_ended`: the transport's `WroteRequest` callback, or the invocation error fallback when no callback was delivered.
+- `response_started`: the transport's `GotFirstResponseByte` callback, with response-header return as a fallback for custom transports.
+- `response_ended`: upstream response Body EOF, Body error, or early Close; bodyless responses end when their headers have been returned.
+
+`Attempt` starts at 1 and increments for transparent retries. Superseded-attempt
+callbacks are ignored. `Complete` is meaningful on terminal events and is false
+for write/read errors or an early response Body close. Response completion can
+happen after the interceptor has returned, and callbacks can arrive from
+different goroutines, so observers must be concurrency-safe and return quickly.
+The dumper example shows how to aggregate the four timestamps and derive request,
+wait, response, and total durations.
+
 ### WebSocket Interceptor
 
 ```go
@@ -154,12 +202,16 @@ func websocketInterceptor(ctx context.Context, req *http.Request, resp *http.Res
 }
 ```
 
-`WebsocketHandshakeTimingFromContext` describes the successful upstream opening handshake only. It does not include the lifetime of the upgraded connection or any WebSocket message/frame processing.
+`WebsocketHandshakeTimingFromContext` describes the successful upstream opening
+handshake only. It is available when `WithUpstreamHTTPTrace()` is enabled and
+does not include the lifetime of the upgraded connection or any WebSocket
+message/frame processing.
 
 ```go
 handler, err := mitmproxy.NewMitmProxyHandler(
 	mitmproxy.WithCACertPath("certs/ca.crt"),
 	mitmproxy.WithCAKeyPath("certs/ca.key"),
+	mitmproxy.WithUpstreamHTTPTrace(),
 	mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
 )
 ```
@@ -485,7 +537,7 @@ go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode 
 go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode socks5 -port 10086
 ```
 
-The dumper logs ordered HTTP/1 and HTTP/2 header blocks, decoded initial header field-line sizes, late trailer blocks, canonical four-part HTTP/2 fingerprints and hashes, separate standalone and HEADERS priority metadata, TLS negotiation/certificate metadata, bodies, WebSocket opening-handshake timing, WebSocket frames, and raw TCP tunnel metadata. Header field-line sizes exclude HTTP/1 start lines and terminating empty lines as well as HTTP/2 framing and HPACK bytes. WebSocket frames are reported separately and are not included in opening-handshake timing or header sizes.
+The dumper logs ordered HTTP/1 and HTTP/2 header blocks, decoded initial header field-line sizes, late trailer blocks, canonical four-part HTTP/2 fingerprints and hashes, separate standalone and HEADERS priority metadata, TLS negotiation/certificate metadata, bodies, per-attempt upstream HTTP timing, WebSocket opening-handshake timing, WebSocket frames, and raw TCP tunnel metadata. Header field-line sizes exclude HTTP/1 start lines and terminating empty lines as well as HTTP/2 framing and HPACK bytes. WebSocket frames are reported separately and are not included in opening-handshake timing or header sizes.
 
 ### Modify Content
 

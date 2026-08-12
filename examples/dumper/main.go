@@ -58,6 +58,38 @@ type wireProfileDump struct {
 	HTTP2Fingerprint        *http2FingerprintDump
 }
 
+type httpAttemptTiming struct {
+	Attempt           int
+	RequestStartedAt  time.Time
+	RequestEndedAt    time.Time
+	ResponseStartedAt time.Time
+	ResponseEndedAt   time.Time
+}
+
+type httpExchangeTimingLogger struct {
+	mu     sync.Mutex
+	timing httpAttemptTiming
+}
+
+func (l *httpExchangeTimingLogger) apply(event mitmproxy.HTTPExchangeTimingEvent) httpAttemptTiming {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.timing.Attempt != event.Attempt {
+		l.timing = httpAttemptTiming{Attempt: event.Attempt}
+	}
+	switch event.Phase {
+	case mitmproxy.HTTPExchangeRequestStarted:
+		l.timing.RequestStartedAt = event.Timestamp
+	case mitmproxy.HTTPExchangeRequestEnded:
+		l.timing.RequestEndedAt = event.Timestamp
+	case mitmproxy.HTTPExchangeResponseStarted:
+		l.timing.ResponseStartedAt = event.Timestamp
+	case mitmproxy.HTTPExchangeResponseEnded:
+		l.timing.ResponseEndedAt = event.Timestamp
+	}
+	return l.timing
+}
+
 func requestWireProfileDump(req *http.Request) wireProfileDump {
 	order := mitmproxy.RequestWireHeaderOrder(req)
 	blocks := mitmproxy.RequestWireHeaderBlocks(req)
@@ -376,6 +408,7 @@ func main() {
 }
 
 func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+	registerHTTPExchangeTimingLogger(ctx, req)
 	_md, _ := metadata.FromContext(ctx)
 	md := _md.MD()
 	slog.Debug("request",
@@ -474,6 +507,60 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	}
 
 	return rsp, nil
+}
+
+func registerHTTPExchangeTimingLogger(ctx context.Context, req *http.Request) {
+	method := req.Method
+	target := req.URL.String()
+	timingLogger := &httpExchangeTimingLogger{}
+	if mitmproxy.ObserveHTTPExchangeTiming(ctx, func(event mitmproxy.HTTPExchangeTimingEvent) {
+		timing := timingLogger.apply(event)
+		attrs := []slog.Attr{
+			slog.String("method", method),
+			slog.String("url", target),
+			slog.String("phase", string(event.Phase)),
+			slog.Int("attempt", event.Attempt),
+			slog.Time("event_at", event.Timestamp),
+			slog.Bool("complete", event.Complete),
+		}
+		if event.Error != nil {
+			attrs = append(attrs, slog.String("error", event.Error.Error()))
+		}
+		attrs = appendHTTPAttemptTimingAttrs(attrs, timing)
+		slog.LogAttrs(ctx, slog.LevelDebug, "upstream HTTP timing", attrs...)
+	}) {
+		return
+	}
+	slog.WarnContext(ctx, "upstream HTTP timing unavailable",
+		slog.String("method", method),
+		slog.String("url", target),
+		slog.String("hint", "enable mitmproxy.WithUpstreamHTTPTrace()"),
+	)
+}
+
+func appendHTTPAttemptTimingAttrs(attrs []slog.Attr, timing httpAttemptTiming) []slog.Attr {
+	attrs = appendOptionalTimeAttr(attrs, "request_started_at", timing.RequestStartedAt)
+	attrs = appendOptionalTimeAttr(attrs, "request_ended_at", timing.RequestEndedAt)
+	attrs = appendOptionalDurationAttr(attrs, "request_duration", timing.RequestStartedAt, timing.RequestEndedAt)
+	attrs = appendOptionalTimeAttr(attrs, "response_started_at", timing.ResponseStartedAt)
+	attrs = appendOptionalTimeAttr(attrs, "response_ended_at", timing.ResponseEndedAt)
+	attrs = appendOptionalDurationAttr(attrs, "response_duration", timing.ResponseStartedAt, timing.ResponseEndedAt)
+	attrs = appendOptionalDurationAttr(attrs, "wait_duration", timing.RequestEndedAt, timing.ResponseStartedAt)
+	return appendOptionalDurationAttr(attrs, "total_duration", timing.RequestStartedAt, timing.ResponseEndedAt)
+}
+
+func appendOptionalTimeAttr(attrs []slog.Attr, name string, value time.Time) []slog.Attr {
+	if value.IsZero() {
+		return attrs
+	}
+	return append(attrs, slog.Time(name, value))
+}
+
+func appendOptionalDurationAttr(attrs []slog.Attr, name string, start, end time.Time) []slog.Attr {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return attrs
+	}
+	return append(attrs, slog.Duration(name, end.Sub(start)))
 }
 
 func durationBetween(start, end time.Time) time.Duration {
