@@ -28,6 +28,7 @@ import (
 	"github.com/josexy/mitmproxy-go/metadata"
 	"github.com/josexy/net/http2"
 	"github.com/josexy/websocket"
+	"github.com/josexy/xhttp/httptrace"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -2434,10 +2435,21 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	}
 
 	boundedDstConn := newBoundedHTTPHeaderConn(dstConn, cfg.state.maxHTTPHeaderBytes)
+	handshakeTiming := WebsocketHandshakeTiming{RequestStartedAt: time.Now()}
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			handshakeTiming.RequestEndedAt = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			handshakeTiming.ResponseStartedAt = time.Now()
+		},
+	}
+	reqClone = reqClone.WithContext(httptrace.WithClientTrace(reqClone.Context(), trace))
 	wsDstConn, resp, err := websocket.DialWithPreparedRequestAndNetConn(reqClone, boundedDstConn)
 	if err != nil {
 		return err
 	}
+	handshakeTiming.ResponseEndedAt = time.Now()
 	resp.Request = reqCtx.Request
 	sanitizeWebsocketUpgradeHeaders(resp.Header)
 	wsSrcConn, err := websocket.UpgradeWithPreparedResponseAndNetConn(resp, srcConn)
@@ -2456,6 +2468,7 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 		slog.Int("status_code", resp.StatusCode),
 	)
 
+	ctx = context.WithValue(ctx, websocketHandshakeTimingContextKey{}, handshakeTiming)
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(err)
 	go func() {

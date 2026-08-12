@@ -3,10 +3,37 @@ package mitmproxy
 import (
 	"context"
 	"errors"
+	"time"
+
 	"github.com/josexy/xhttp"
 
 	"github.com/josexy/mitmproxy-go/buf"
 )
+
+type websocketHandshakeTimingContextKey struct{}
+
+// WebsocketHandshakeTiming records the upstream WebSocket opening handshake.
+// RequestStartedAt is captured immediately before the request is sent,
+// RequestEndedAt after the request has been written, ResponseStartedAt when the
+// first response byte arrives, and ResponseEndedAt after the response headers
+// have been read.
+type WebsocketHandshakeTiming struct {
+	RequestStartedAt  time.Time
+	RequestEndedAt    time.Time
+	ResponseStartedAt time.Time
+	ResponseEndedAt   time.Time
+}
+
+// WebsocketHandshakeTimingFromContext returns the upstream opening-handshake
+// timing attached to a WebsocketInterceptor context. A successful WebSocket
+// upgrade supplies all four timestamps.
+func WebsocketHandshakeTimingFromContext(ctx context.Context) (WebsocketHandshakeTiming, bool) {
+	if ctx == nil {
+		return WebsocketHandshakeTiming{}, false
+	}
+	timing, ok := ctx.Value(websocketHandshakeTimingContextKey{}).(WebsocketHandshakeTiming)
+	return timing, ok
+}
 
 var (
 	ErrWebsocketFrameReleased   = errors.New("websocket frame was already invoked or released")

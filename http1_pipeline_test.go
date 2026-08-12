@@ -4,12 +4,169 @@ import (
 	"bufio"
 	"context"
 	"github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptrace"
 	"io"
 	"net"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestHTTP1PipelineConnTracesFirstResponseByte(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	pipeline := newHTTP1PipelineConn(client, 1, time.Second)
+	t.Cleanup(func() { _ = pipeline.Close() })
+
+	requestRead := make(chan struct{})
+	writeResponse := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		request, err := http.ReadRequest(bufio.NewReader(server))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		_ = request.Body.Close()
+		close(requestRead)
+		<-writeResponse
+		_, err = io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+		serverErr <- err
+	}()
+
+	var calls atomic.Int32
+	req := newPipelineTestRequest("/trace")
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotFirstResponseByte: func() {
+			calls.Add(1)
+		},
+	}))
+	type pipelineTraceResult struct {
+		response *http.Response
+		err      error
+	}
+	resultCh := make(chan pipelineTraceResult, 1)
+	go func() {
+		response, err := pipeline.RoundTrip(req)
+		resultCh <- pipelineTraceResult{response: response, err: err}
+	}()
+
+	select {
+	case <-requestRead:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not receive request")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("GotFirstResponseByte calls before response = %d; want 0", got)
+	}
+	close(writeResponse)
+
+	gotResult := <-resultCh
+	if gotResult.err != nil {
+		t.Fatal(gotResult.err)
+	}
+	_ = gotResult.response.Body.Close()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("GotFirstResponseByte calls = %d; want 1", got)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTP1PipelineConnTracesEarlyResponseBeforeRequestBodyCompletes(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	pipeline := newHTTP1PipelineConn(client, 1, time.Second)
+	t.Cleanup(func() { _ = pipeline.Close() })
+
+	bodyReader, bodyWriter := io.Pipe()
+	request := newPipelineTestRequest("/early-response")
+	request.Method = http.MethodPost
+	request.Body = bodyReader
+	request.ContentLength = 2
+
+	events := make(chan string, 2)
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err != nil {
+				t.Errorf("WroteRequest error = %v", info.Err)
+			}
+			events <- "wrote-request"
+		},
+		GotFirstResponseByte: func() {
+			events <- "got-first-response-byte"
+		},
+	}))
+
+	headersRead := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(server)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		close(headersRead)
+		if _, err := io.WriteString(server, "HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n"); err != nil {
+			serverErr <- err
+			return
+		}
+		_, err := io.CopyN(io.Discard, reader, 2)
+		serverErr <- err
+	}()
+
+	type result struct {
+		response *http.Response
+		err      error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		response, err := pipeline.RoundTrip(request)
+		resultCh <- result{response: response, err: err}
+	}()
+
+	select {
+	case <-headersRead:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not receive request headers")
+	}
+	select {
+	case got := <-events:
+		if got != "got-first-response-byte" {
+			t.Fatalf("first trace event = %q, want got-first-response-byte", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GotFirstResponseByte did not fire while request body was blocked")
+	}
+
+	if _, err := bodyWriter.Write([]byte("ok")); err != nil {
+		t.Fatalf("write request body: %v", err)
+	}
+	_ = bodyWriter.Close()
+
+	gotResult := <-resultCh
+	if gotResult.err != nil {
+		t.Fatal(gotResult.err)
+	}
+	_ = gotResult.response.Body.Close()
+	if got := <-events; got != "wrote-request" {
+		t.Fatalf("second trace event = %q, want wrote-request", got)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	if got, want := gotResult.response.StatusCode, http.StatusRequestEntityTooLarge; got != want {
+		t.Fatalf("status = %d, want %d", got, want)
+	}
+}
 
 func TestHTTP1PipelineConnSendsSecondRequestBeforeFirstResponse(t *testing.T) {
 	client, server := net.Pipe()

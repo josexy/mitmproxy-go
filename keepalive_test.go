@@ -863,6 +863,71 @@ func TestWebsocketDoesNotReportRawTCP(t *testing.T) {
 	}
 }
 
+func TestWebsocketInterceptorReceivesUpstreamHandshakeTiming(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer origin.Close()
+
+	type timingResult struct {
+		timing WebsocketHandshakeTiming
+		ok     bool
+	}
+	timingCh := make(chan timingResult, 1)
+	listener := startKeepAliveProxy(t,
+		WithWebsocketInterceptor(func(ctx context.Context, _ *http.Request, _ *http.Response, _ WebsocketFramesWatcher) {
+			timing, ok := WebsocketHandshakeTimingFromContext(ctx)
+			timingCh <- timingResult{timing: timing, ok: ok}
+		}),
+	)
+	proxyURL, err := url.Parse("http://" + listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := websocket.Dialer{
+		Proxy:            http.ProxyURL(proxyURL),
+		HandshakeTimeout: time.Second,
+	}
+	client, response, err := dialer.Dial("ws"+strings.TrimPrefix(origin.URL, "http"), nil)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var result timingResult
+	select {
+	case result = <-timingCh:
+	case <-time.After(time.Second):
+		t.Fatal("WebSocket interceptor was not called")
+	}
+	if !result.ok {
+		t.Fatal("WebSocket handshake timing was not attached to interceptor context")
+	}
+	timing := result.timing
+	for name, timestamp := range map[string]time.Time{
+		"request start":  timing.RequestStartedAt,
+		"request end":    timing.RequestEndedAt,
+		"response start": timing.ResponseStartedAt,
+		"response end":   timing.ResponseEndedAt,
+	} {
+		if timestamp.IsZero() {
+			t.Fatalf("%s is zero", name)
+		}
+	}
+	if timing.RequestEndedAt.Before(timing.RequestStartedAt) ||
+		timing.ResponseStartedAt.Before(timing.RequestEndedAt) ||
+		timing.ResponseEndedAt.Before(timing.ResponseStartedAt) {
+		t.Fatalf("handshake timestamps are out of order: %+v", timing)
+	}
+}
+
 func TestConnectTunnelInterceptsExtensionHTTPMethod(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		_, _ = io.WriteString(w, req.Method)
