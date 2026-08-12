@@ -126,6 +126,15 @@ import (
 
 func websocketInterceptor(ctx context.Context, req *http.Request, resp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
 	log.Printf("websocket upgrade %s -> %d", req.URL.String(), resp.StatusCode)
+	if timing, ok := mitmproxy.WebsocketHandshakeTimingFromContext(ctx); ok {
+		log.Printf(
+			"upstream handshake request=%s wait=%s response=%s total=%s",
+			timing.RequestEndedAt.Sub(timing.RequestStartedAt),
+			timing.ResponseStartedAt.Sub(timing.RequestEndedAt),
+			timing.ResponseEndedAt.Sub(timing.ResponseStartedAt),
+			timing.ResponseEndedAt.Sub(timing.RequestStartedAt),
+		)
+	}
 
 	for {
 		select {
@@ -144,6 +153,8 @@ func websocketInterceptor(ctx context.Context, req *http.Request, resp *http.Res
 	}
 }
 ```
+
+`WebsocketHandshakeTimingFromContext` describes the successful upstream opening handshake only. It does not include the lifetime of the upgraded connection or any WebSocket message/frame processing.
 
 ```go
 handler, err := mitmproxy.NewMitmProxyHandler(
@@ -474,7 +485,7 @@ go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode 
 go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode socks5 -port 10086
 ```
 
-The dumper logs ordered HTTP/1 and HTTP/2 header blocks, late trailer blocks, canonical four-part HTTP/2 fingerprints and hashes, separate standalone and HEADERS priority metadata, TLS negotiation/certificate metadata, bodies, WebSocket frames, and raw TCP tunnel metadata.
+The dumper logs ordered HTTP/1 and HTTP/2 header blocks, decoded initial header field-line sizes, late trailer blocks, canonical four-part HTTP/2 fingerprints and hashes, separate standalone and HEADERS priority metadata, TLS negotiation/certificate metadata, bodies, WebSocket opening-handshake timing, WebSocket frames, and raw TCP tunnel metadata. Header field-line sizes exclude HTTP/1 start lines and terminating empty lines as well as HTTP/2 framing and HPACK bytes. WebSocket frames are reported separately and are not included in opening-handshake timing or header sizes.
 
 ### Modify Content
 

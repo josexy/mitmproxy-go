@@ -51,18 +51,21 @@ type http2FingerprintDump struct {
 }
 
 type wireProfileDump struct {
-	HeaderOrder      []string
-	TrailerOrder     []string
-	HeaderBlocks     []headerBlockDump
-	HTTP2Fingerprint *http2FingerprintDump
+	HeaderOrder             []string
+	TrailerOrder            []string
+	HeaderBlocks            []headerBlockDump
+	InitialHeaderFieldsSize int64
+	HTTP2Fingerprint        *http2FingerprintDump
 }
 
 func requestWireProfileDump(req *http.Request) wireProfileDump {
 	order := mitmproxy.RequestWireHeaderOrder(req)
+	blocks := mitmproxy.RequestWireHeaderBlocks(req)
 	dump := wireProfileDump{
-		HeaderOrder:  append([]string(nil), order.Headers...),
-		TrailerOrder: append([]string(nil), order.Trailers...),
-		HeaderBlocks: headerBlocksDump(mitmproxy.RequestWireHeaderBlocks(req)),
+		HeaderOrder:             append([]string(nil), order.Headers...),
+		TrailerOrder:            append([]string(nil), order.Trailers...),
+		HeaderBlocks:            headerBlocksDump(blocks),
+		InitialHeaderFieldsSize: initialHeaderFieldsSize(blocks),
 	}
 	if fingerprint, ok := mitmproxy.RequestHTTP2Fingerprint(req); ok {
 		var headerPriority *http.FingerprintHeaderPriority
@@ -85,11 +88,33 @@ func requestWireProfileDump(req *http.Request) wireProfileDump {
 
 func responseWireProfileDump(response *http.Response) wireProfileDump {
 	order := mitmproxy.ResponseWireHeaderOrder(response)
+	blocks := mitmproxy.ResponseWireHeaderBlocks(response)
 	return wireProfileDump{
-		HeaderOrder:  append([]string(nil), order.Headers...),
-		TrailerOrder: append([]string(nil), order.Trailers...),
-		HeaderBlocks: headerBlocksDump(mitmproxy.ResponseWireHeaderBlocks(response)),
+		HeaderOrder:             append([]string(nil), order.Headers...),
+		TrailerOrder:            append([]string(nil), order.Trailers...),
+		HeaderBlocks:            headerBlocksDump(blocks),
+		InitialHeaderFieldsSize: initialHeaderFieldsSize(blocks),
 	}
+}
+
+// initialHeaderFieldsSize reports the decoded initial header field-line size:
+// sum of UTF-8 bytes in "name: value\r\n". It excludes the HTTP/1 start line,
+// the terminating empty line, trailers, HTTP/2 framing, and HPACK bytes.
+func initialHeaderFieldsSize(blocks []http.HeaderBlock) int64 {
+	for _, block := range blocks {
+		if block.Kind != http.HeaderBlockInitial {
+			continue
+		}
+		if block.Truncated {
+			return -1
+		}
+		var size int64
+		for _, field := range block.Fields {
+			size += int64(len(field.Name) + len(": ") + len(field.Value) + len("\r\n"))
+		}
+		return size
+	}
+	return -1
 }
 
 func headerBlocksDump(blocks []http.HeaderBlock) []headerBlockDump {
@@ -128,6 +153,7 @@ func logWireProfile(ctx context.Context, message, phase string, dump wireProfile
 		slog.Any("header_order", dump.HeaderOrder),
 		slog.Any("trailer_order", dump.TrailerOrder),
 		slog.Any("header_blocks", dump.HeaderBlocks),
+		slog.Int64("initial_header_fields_size_bytes", dump.InitialHeaderFieldsSize),
 	}
 	if fingerprint := dump.HTTP2Fingerprint; fingerprint != nil {
 		attrs = append(attrs, slog.Group("http2_fingerprint",
@@ -502,6 +528,8 @@ func rawTCPSourceName(source mitmproxy.RawTCPTunnelSource) string {
 func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
 	_md, _ := metadata.FromContext(ctx)
 	md := _md.MD()
+	requestProfile := requestWireProfileDump(req)
+	responseProfile := responseWireProfileDump(rsp)
 	slog.Debug("request",
 		slog.Bool("stream_body", md.StreamBody),
 		slog.String("local_source", md.LocalAddrInfo.SourceAddr.String()),
@@ -516,6 +544,13 @@ func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Resp
 		slog.Int("status_code", rsp.StatusCode),
 		slog.Any("request_headers", map[string][]string(req.Header)),
 		slog.Any("response_headers", map[string][]string(rsp.Header)),
+	)
+	logWireProfile(ctx, "websocket request wire profile", "complete", requestProfile)
+	logWireProfile(ctx, "websocket response wire profile", "complete", responseProfile)
+	logWebsocketHandshakeMetrics(
+		ctx,
+		requestProfile.InitialHeaderFieldsSize,
+		responseProfile.InitialHeaderFieldsSize,
 	)
 
 	data, _ := httputil.DumpRequest(req, false)
@@ -566,6 +601,28 @@ func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Resp
 			frame.Release()
 		}
 	}
+}
+
+func logWebsocketHandshakeMetrics(ctx context.Context, requestHeaderSize, responseHeaderSize int64) {
+	attrs := []slog.Attr{
+		slog.Int64("request_header_fields_size_bytes", requestHeaderSize),
+		slog.Int64("response_header_fields_size_bytes", responseHeaderSize),
+	}
+	timing, ok := mitmproxy.WebsocketHandshakeTimingFromContext(ctx)
+	attrs = append(attrs, slog.Bool("timing_available", ok))
+	if ok {
+		attrs = append(attrs,
+			slog.Time("request_started_at", timing.RequestStartedAt),
+			slog.Time("request_ended_at", timing.RequestEndedAt),
+			slog.Duration("request_duration", durationBetween(timing.RequestStartedAt, timing.RequestEndedAt)),
+			slog.Time("response_started_at", timing.ResponseStartedAt),
+			slog.Time("response_ended_at", timing.ResponseEndedAt),
+			slog.Duration("response_duration", durationBetween(timing.ResponseStartedAt, timing.ResponseEndedAt)),
+			slog.Duration("wait_duration", durationBetween(timing.RequestEndedAt, timing.ResponseStartedAt)),
+			slog.Duration("total_duration", durationBetween(timing.RequestStartedAt, timing.ResponseEndedAt)),
+		)
+	}
+	slog.LogAttrs(ctx, slog.LevelDebug, "websocket handshake metrics", attrs...)
 }
 
 func getDecodedReader(r io.Reader, encoding string) (io.ReadCloser, error) {
