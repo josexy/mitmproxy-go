@@ -217,23 +217,16 @@ type biConnContext struct {
 
 	// transport is replaced when a plain proxy connection is reused for a new
 	// origin, and it is read by Cleanup from another goroutine.
-	transportMu sync.Mutex
-	transport   *singleConnTransport
+	transport atomic.Pointer[singleConnTransport]
 }
 
 func (c *biConnContext) currentTransport() *singleConnTransport {
-	c.transportMu.Lock()
-	defer c.transportMu.Unlock()
-	return c.transport
+	return c.transport.Load()
 }
 
 // setTransport installs transport and returns the one it replaced.
 func (c *biConnContext) setTransport(transport *singleConnTransport) *singleConnTransport {
-	c.transportMu.Lock()
-	previous := c.transport
-	c.transport = transport
-	c.transportMu.Unlock()
-	return previous
+	return c.transport.Swap(transport)
 }
 
 func (c *biConnContext) closeTransport() {
