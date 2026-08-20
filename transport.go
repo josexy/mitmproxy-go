@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/josexy/xhttp"
 	"log/slog"
+	mathrand "math/rand"
 	"net"
 	"net/textproto"
 	"strings"
@@ -20,9 +21,11 @@ type singleConnTransport struct {
 	disableHTTP2  bool
 	pipelineDepth int
 
-	mu             sync.Mutex
-	clientConn     *http.ClientConn
-	http2Conns     map[string]*http.ClientConn
+	mu         sync.Mutex
+	clientConn *http.ClientConn
+	http2Conns map[string]*http.ClientConn
+	// http2Leases covers selected requests before ClientConn.InFlight can see them.
+	http2Leases    map[*http.ClientConn]int
 	http1Conn      *http1PipelineConn
 	http1Degraded  bool
 	retired        []*http.ClientConn
@@ -141,19 +144,49 @@ func (t *singleConnTransport) roundTripHTTP2(req *http.Request) (*http.Response,
 		closeRequestBody(req)
 		return nil, err
 	}
-	clientConn, key, err := t.getHTTP2ClientConn(preparedReq.Context(), preparedReq)
-	if err != nil {
-		closeRequestBody(req)
-		return nil, err
-	}
-	resp, err := clientConn.RoundTrip(preparedReq)
-	if err != nil {
-		if shouldDiscardClientConnAfterRoundTripError(preparedReq.Context(), clientConn, err) {
+	const maxRetries = 7
+	for attempt := 0; ; attempt++ {
+		clientConn, key, err := t.getHTTP2ClientConn(preparedReq.Context(), preparedReq)
+		if err != nil {
+			closeRequestBody(preparedReq)
+			return nil, err
+		}
+		resp, err := clientConn.RoundTrip(preparedReq)
+		t.releaseHTTP2ClientConnLease(preparedReq.Context(), key, clientConn)
+		if err == nil {
+			return prepareHTTP2Response(resp, req), nil
+		}
+
+		var retryReq *http.Request
+		returnErr := err
+		if attempt < maxRetries {
+			retryReq, returnErr = http.HTTP2RequestForRetry(preparedReq, err)
+		}
+		retry := retryReq != nil && returnErr == nil
+		discard := retry || shouldDiscardClientConnAfterRoundTripError(preparedReq.Context(), clientConn, err)
+		if discard {
 			t.discardHTTP2ClientConn(preparedReq.Context(), key, clientConn, shouldCloseDiscardedClientConn(clientConn, err))
 		}
-		return nil, err
+		if !retry {
+			return nil, returnErr
+		}
+
+		preparedReq = retryReq
+		if attempt == 0 {
+			continue
+		}
+		backoff := float64(uint(1) << uint(attempt-1))
+		backoff += backoff * (0.1 * mathrand.Float64())
+		timer := time.NewTimer(time.Second * time.Duration(backoff))
+		select {
+		case <-timer.C:
+			continue
+		case <-preparedReq.Context().Done():
+			timer.Stop()
+			closeRequestBody(preparedReq)
+			return nil, preparedReq.Context().Err()
+		}
 	}
-	return prepareHTTP2Response(resp, req), nil
 }
 
 func http2ConnectionKey(req *http.Request) string {
@@ -168,39 +201,73 @@ func http2ConnectionKey(req *http.Request) string {
 
 func (t *singleConnTransport) getHTTP2ClientConn(ctx context.Context, req *http.Request) (*http.ClientConn, string, error) {
 	key := http2ConnectionKey(req)
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.closed {
-		return nil, key, net.ErrClosed
-	}
-	if clientConn := t.http2Conns[key]; clientConn != nil {
-		if reason := unusableClientConnReason(clientConn); reason == "" {
-			return clientConn, key, nil
+	for {
+		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return nil, key, net.ErrClosed
 		}
-		delete(t.http2Conns, key)
-		_ = clientConn.Close()
-	}
+		if clientConn := t.http2Conns[key]; clientConn != nil {
+			reason := unusableClientConnReason(clientConn)
+			if reason == "" {
+				t.leaseHTTP2ClientConnLocked(clientConn)
+				t.mu.Unlock()
+				return clientConn, key, nil
+			}
+			delete(t.http2Conns, key)
+			if reason == "closed" {
+				t.retired = append(t.retired, clientConn)
+				stateLogger := loggerFromContext(ctx)
+				t.mu.Unlock()
+				t.handleHTTP2ClientConnState(context.Background(), stateLogger, key, clientConn)
+				continue
+			}
+			delete(t.http2Leases, clientConn)
+			t.mu.Unlock()
+			clientConn.SetStateHook(nil)
+			_ = clientConn.Close()
+			continue
+		}
 
-	if req == nil || req.URL == nil {
-		return nil, key, errors.New("HTTP/2 request URL is nil")
+		if req == nil || req.URL == nil {
+			t.mu.Unlock()
+			return nil, key, errors.New("HTTP/2 request URL is nil")
+		}
+		connScheme, protocols := clientConnSchemeAndProtocols(req.URL.Scheme, req.ProtoMajor, false, t.negotiatedALPN)
+		baseTransport := &http.Transport{
+			DialContext:        t.dialFn,
+			DialTLSContext:     t.dialFn,
+			DisableCompression: true,
+			IdleConnTimeout:    t.idleTimeout,
+			Protocols:          protocols,
+		}
+		clientConn, err := baseTransport.NewClientConn(ctx, connScheme, t.hostport)
+		if err != nil {
+			t.mu.Unlock()
+			return nil, key, err
+		}
+		stateCtx := context.Background()
+		stateLogger := loggerFromContext(ctx)
+		published := make(chan struct{})
+		// Install one lifecycle hook before publishing the connection. It remains
+		// in place when the connection moves from the cache to the retired list.
+		clientConn.SetStateHook(func(cc *http.ClientConn) {
+			select {
+			case <-published:
+				t.handleHTTP2ClientConnState(stateCtx, stateLogger, key, cc)
+			default:
+			}
+		})
+		if t.http2Conns == nil {
+			t.http2Conns = make(map[string]*http.ClientConn)
+		}
+		t.http2Conns[key] = clientConn
+		t.leaseHTTP2ClientConnLocked(clientConn)
+		close(published)
+		t.mu.Unlock()
+		t.handleHTTP2ClientConnState(stateCtx, stateLogger, key, clientConn)
+		return clientConn, key, nil
 	}
-	connScheme, protocols := clientConnSchemeAndProtocols(req.URL.Scheme, req.ProtoMajor, false, t.negotiatedALPN)
-	baseTransport := &http.Transport{
-		DialContext:        t.dialFn,
-		DialTLSContext:     t.dialFn,
-		DisableCompression: true,
-		IdleConnTimeout:    t.idleTimeout,
-		Protocols:          protocols,
-	}
-	clientConn, err := baseTransport.NewClientConn(ctx, connScheme, t.hostport)
-	if err != nil {
-		return nil, key, err
-	}
-	if t.http2Conns == nil {
-		t.http2Conns = make(map[string]*http.ClientConn)
-	}
-	t.http2Conns[key] = clientConn
-	return clientConn, key, nil
 }
 
 func (t *singleConnTransport) shouldUseHTTP1Pipeline(req *http.Request) bool {
@@ -427,6 +494,7 @@ func (t *singleConnTransport) Close() error {
 		http2Conns = append(http2Conns, conn)
 	}
 	t.http2Conns = nil
+	t.http2Leases = nil
 	retired := t.retired
 	t.retired = nil
 	t.mu.Unlock()
@@ -506,9 +574,14 @@ func (t *singleConnTransport) discardHTTP2ClientConn(ctx context.Context, key st
 		t.mu.Unlock()
 		return
 	}
+	if closeConn && clientConn.Err() == nil && (t.http2Leases[clientConn] > 0 || clientConn.InFlight() > 0) {
+		closeConn = false
+	}
 	delete(t.http2Conns, key)
 	if !closeConn {
 		t.retired = append(t.retired, clientConn)
+	} else {
+		delete(t.http2Leases, clientConn)
 	}
 	retiredCount := len(t.retired)
 	t.mu.Unlock()
@@ -522,10 +595,83 @@ func (t *singleConnTransport) discardHTTP2ClientConn(ctx context.Context, key st
 		clientConnErrorAttr(clientConn),
 	)
 	if closeConn {
+		clientConn.SetStateHook(nil)
 		_ = clientConn.Close()
 	} else {
-		t.watchRetiredClientConn(ctx, logger, clientConn)
+		t.handleHTTP2ClientConnState(ctx, logger, key, clientConn)
 	}
+}
+
+func (t *singleConnTransport) handleHTTP2ClientConnState(ctx context.Context, logger *slog.Logger, key string, clientConn *http.ClientConn) {
+	location := ""
+	reason := ""
+
+	t.mu.Lock()
+	connErr := clientConn.Err()
+	switch {
+	case connErr != nil && t.http2Conns[key] == clientConn:
+		delete(t.http2Conns, key)
+		delete(t.http2Leases, clientConn)
+		location = "cached"
+		reason = "error"
+	case t.http2Leases[clientConn] == 0 && (connErr != nil || clientConn.InFlight() == 0):
+		for i, retired := range t.retired {
+			if retired != clientConn {
+				continue
+			}
+			t.retired = append(t.retired[:i], t.retired[i+1:]...)
+			location = "retired"
+			if connErr != nil {
+				reason = "error"
+			} else {
+				reason = "drained"
+			}
+			delete(t.http2Leases, clientConn)
+			break
+		}
+	}
+	retiredCount := len(t.retired)
+	t.mu.Unlock()
+	if location == "" {
+		return
+	}
+
+	clientConn.SetStateHook(nil)
+	_ = clientConn.Close()
+	logAttrs(ctx, logger, slog.LevelDebug, "transport HTTP/2 client connection closed",
+		slog.String("hostport", t.hostport),
+		slog.String("fingerprint_key", key),
+		slog.String("location", location),
+		slog.String("reason", reason),
+		slog.Int("retired_count", retiredCount),
+		slog.Int("in_flight", clientConn.InFlight()),
+		clientConnErrorAttr(clientConn),
+	)
+}
+
+func (t *singleConnTransport) leaseHTTP2ClientConnLocked(clientConn *http.ClientConn) {
+	if t.http2Leases == nil {
+		t.http2Leases = make(map[*http.ClientConn]int)
+	}
+	t.http2Leases[clientConn]++
+}
+
+func (t *singleConnTransport) releaseHTTP2ClientConnLease(ctx context.Context, key string, clientConn *http.ClientConn) {
+	logger := loggerFromContext(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	} else {
+		ctx = context.WithoutCancel(ctx)
+	}
+	t.mu.Lock()
+	switch leases := t.http2Leases[clientConn]; leases {
+	case 0, 1:
+		delete(t.http2Leases, clientConn)
+	default:
+		t.http2Leases[clientConn] = leases - 1
+	}
+	t.mu.Unlock()
+	t.handleHTTP2ClientConnState(ctx, logger, key, clientConn)
 }
 
 func (t *singleConnTransport) watchRetiredClientConn(ctx context.Context, logger *slog.Logger, clientConn *http.ClientConn) {
