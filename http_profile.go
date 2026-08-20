@@ -8,8 +8,8 @@ import (
 	"sync"
 	"weak"
 
-	"github.com/josexy/net/http/httpguts"
 	http "github.com/josexy/xhttp"
+	"golang.org/x/net/http/httpguts"
 )
 
 type requestWireProfileContextKey struct{}

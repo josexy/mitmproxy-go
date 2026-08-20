@@ -10,9 +10,8 @@ import (
 	"net/textproto"
 	"time"
 
-	"github.com/josexy/net/http/httpguts"
-	"github.com/josexy/net/http2"
 	http "github.com/josexy/xhttp"
+	"golang.org/x/net/http/httpguts"
 )
 
 func isH2CUpgrade(h http.Header) bool {
@@ -48,7 +47,7 @@ func initH2CWithPriorKnowledge(w http.ResponseWriter, prefaceTimeout time.Durati
 		conn = newBufConnExt(conn, rw)
 		return &bufConnExt{
 			Conn:   conn,
-			Reader: bufio.NewReader(io.MultiReader(bytes.NewBufferString(http2.ClientPreface), conn)),
+			Reader: bufio.NewReader(io.MultiReader(bytes.NewBufferString(http2ClientPreface), conn)),
 		}, nil
 	}
 

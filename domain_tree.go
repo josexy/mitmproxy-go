@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"strings"
 
-	"github.com/josexy/net/idna"
+	"golang.org/x/net/idna"
 )
 
 type trieNode struct {

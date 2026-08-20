@@ -5,7 +5,7 @@ import (
 	"net/textproto"
 	"strings"
 
-	"github.com/josexy/net/http/httpguts"
+	"golang.org/x/net/http/httpguts"
 )
 
 const (

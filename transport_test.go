@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/net/http2"
+	"golang.org/x/net/http2"
 )
 
 func TestProtocolsForRequest(t *testing.T) {
@@ -755,7 +755,11 @@ func TestSingleConnTransportIsolatesHTTP2ConnectionsByFingerprint(t *testing.T) 
 	}
 	defer ln.Close()
 
-	captured := make(chan string, 2)
+	type capture struct {
+		fingerprint http.Fingerprint
+		ok          bool
+	}
+	captured := make(chan capture, 4)
 	serverDone := make(chan error, 2)
 	go func() {
 		for range 2 {
@@ -767,11 +771,7 @@ func TestSingleConnTransportIsolatesHTTP2ConnectionsByFingerprint(t *testing.T) 
 			go func() {
 				handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 					fingerprint, ok := http.RequestFingerprint(req)
-					if !ok {
-						captured <- "missing"
-					} else {
-						captured <- fingerprint.String()
-					}
+					captured <- capture{fingerprint: fingerprint, ok: ok}
 					_, _ = w.Write([]byte("ok"))
 				})
 				serverDone <- serveHTTP2Conn(context.Background(), conn, handler, nil, false)
@@ -789,15 +789,21 @@ func TestSingleConnTransportIsolatesHTTP2ConnectionsByFingerprint(t *testing.T) 
 		time.Second,
 		false,
 	)
+	baseFingerprint := http.Fingerprint{
+		Settings:          []http.Setting{{ID: http.SettingHeaderTableSize, Val: 4096}},
+		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+	}
+	differentPseudoOrder := cloneHTTP2Fingerprint(baseFingerprint)
+	differentPseudoOrder.PseudoHeaderOrder = []string{":scheme", ":method", ":authority", ":path"}
+	differentHeaderPriority := cloneHTTP2Fingerprint(baseFingerprint)
+	differentHeaderPriority.HeaderPriority = &http.FingerprintHeaderPriority{StreamDep: 0, Exclusive: true, Weight: 33}
+	differentConnection := cloneHTTP2Fingerprint(baseFingerprint)
+	differentConnection.Settings[0].Val = 65536
 	fingerprints := []http.Fingerprint{
-		{
-			Settings:          []http.Setting{{ID: http.SettingHeaderTableSize, Val: 4096}},
-			PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
-		},
-		{
-			Settings:          []http.Setting{{ID: http.SettingHeaderTableSize, Val: 65536}},
-			PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
-		},
+		baseFingerprint,
+		differentPseudoOrder,
+		differentHeaderPriority,
+		differentConnection,
 	}
 	for _, fingerprint := range fingerprints {
 		req, requestErr := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/isolation", nil)
@@ -822,9 +828,13 @@ func TestSingleConnTransportIsolatesHTTP2ConnectionsByFingerprint(t *testing.T) 
 	for index, fingerprint := range fingerprints {
 		select {
 		case got := <-captured:
-			if got != fingerprint.String() {
+			if !got.ok {
 				_ = tr.Close()
-				t.Fatalf("fingerprint %d = %q; want %q", index, got, fingerprint.String())
+				t.Fatalf("fingerprint %d was not captured", index)
+			}
+			if !reflect.DeepEqual(got.fingerprint, fingerprint) {
+				_ = tr.Close()
+				t.Fatalf("fingerprint %d = %#v; want %#v", index, got.fingerprint, fingerprint)
 			}
 		case <-time.After(2 * time.Second):
 			_ = tr.Close()

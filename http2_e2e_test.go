@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	nethttp2 "github.com/josexy/net/http2"
 	http "github.com/josexy/xhttp"
 	utls "github.com/refraction-networking/utls"
 )
@@ -54,7 +53,7 @@ func TestHTTP2UpstreamExchangeTimingThroughProxy(t *testing.T) {
 	)
 
 	tunnel := connectProxyTunnel(t, proxyAddr, originAddr)
-	transport := newSingleUseHTTP2Transport(t, tunnel, true)
+	transport := newSingleUseHTTP2Transport(t, tunnel)
 	request := newOrderedHTTP2Request(t, "http://"+originAddr+"/timing", testHTTP2E2EFingerprint(t))
 	response, err := transport.RoundTrip(request)
 	if err != nil {
@@ -96,7 +95,7 @@ func TestHTTP2WireProfileThroughProxyEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	caCertPath, caKeyPath, serverCertPath, _ := writeTestCertificates(t, dir)
 	fingerprint := testHTTP2E2EFingerprint(t)
-	expectedFingerprint := xhttpFingerprintFromNetHTTP2(t, fingerprint)
+	expectedFingerprint := fingerprint
 
 	originObserved := make(chan http2E2EObservation, 1)
 	originAddr := startH2CWireOrigin(t, orderedHTTP2OriginHandler(originObserved, "through-proxy"))
@@ -110,7 +109,7 @@ func TestHTTP2WireProfileThroughProxyEndToEnd(t *testing.T) {
 	)
 
 	tunnel := connectProxyTunnel(t, proxyAddr, originAddr)
-	transport := newSingleUseHTTP2Transport(t, tunnel, true)
+	transport := newSingleUseHTTP2Transport(t, tunnel)
 	request := newOrderedHTTP2Request(t, "http://"+originAddr+"/wire-profile", fingerprint)
 	response, err := transport.RoundTrip(request)
 	if err != nil {
@@ -155,7 +154,7 @@ func TestHTTP2NonRootHeaderPriorityDoesNotCollideAcrossProxy(t *testing.T) {
 	)
 
 	tunnel := connectProxyTunnel(t, proxyAddr, originAddr)
-	transport := newSingleUseHTTP2Transport(t, tunnel, true)
+	transport := newSingleUseHTTP2Transport(t, tunnel)
 	localFingerprint := testHTTP2E2EFingerprint(t)
 	localRequest := newOrderedHTTP2Request(t, "http://"+originAddr+"/local", localFingerprint)
 	localResponse, err := transport.RoundTrip(localRequest)
@@ -171,7 +170,7 @@ func TestHTTP2NonRootHeaderPriorityDoesNotCollideAcrossProxy(t *testing.T) {
 	}
 
 	forwardedFingerprint := testHTTP2E2EFingerprint(t)
-	forwardedFingerprint.HeaderPriority = &nethttp2.FingerprintHeaderPriority{
+	forwardedFingerprint.HeaderPriority = &http.FingerprintHeaderPriority{
 		StreamDep: 1,
 		Exclusive: true,
 		Weight:    101,
@@ -196,7 +195,7 @@ func TestHTTP2NonRootHeaderPriorityDoesNotCollideAcrossProxy(t *testing.T) {
 	}
 	assertOrderedHTTP2Response(t, forwardedResponse, "forwarded")
 
-	wantDownstream := xhttpFingerprintFromNetHTTP2(t, forwardedFingerprint)
+	wantDownstream := forwardedFingerprint
 	wantUpstream := wantDownstream
 	wantUpstream.HeaderPriority = nil
 	assertHTTP2E2EObservation(t, receiveHTTP2Observation(t, interceptorObserved), wantDownstream, false)
@@ -208,7 +207,7 @@ func TestTLSHTTP2FingerprintThroughUTLSMitmEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	caCertPath, caKeyPath, serverCertPath, serverKeyPath := writeTestCertificates(t, dir)
 	fingerprint := testHTTP2E2EFingerprint(t)
-	expectedFingerprint := xhttpFingerprintFromNetHTTP2(t, fingerprint)
+	expectedFingerprint := fingerprint
 
 	originObserved := make(chan http2E2EObservation, 1)
 	originAddr, upstreamClientHello, upstreamALPN := startTLSHTTP2WireOrigin(
@@ -235,7 +234,7 @@ func TestTLSHTTP2FingerprintThroughUTLSMitmEndToEnd(t *testing.T) {
 	downstream := utls.UClient(captureConn, &utls.Config{
 		ServerName:         "localhost",
 		InsecureSkipVerify: true,
-		NextProtos:         []string{nethttp2.NextProtoTLS, "http/1.1"},
+		NextProtos:         []string{http2NextProtoTLS, "http/1.1"},
 	}, utls.HelloCustom)
 	if err := downstream.ApplyPreset(&spec); err != nil {
 		t.Fatal(err)
@@ -249,11 +248,11 @@ func TestTLSHTTP2FingerprintThroughUTLSMitmEndToEnd(t *testing.T) {
 	if err := downstream.SetDeadline(time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := downstream.ConnectionState().NegotiatedProtocol; got != nethttp2.NextProtoTLS {
-		t.Fatalf("downstream ALPN = %q; want %q", got, nethttp2.NextProtoTLS)
+	if got := downstream.ConnectionState().NegotiatedProtocol; got != http2NextProtoTLS {
+		t.Fatalf("downstream ALPN = %q; want %q", got, http2NextProtoTLS)
 	}
 
-	transport := newSingleUseHTTP2Transport(t, downstream, false)
+	transport := newSingleUseHTTP2Transport(t, downstream)
 	request := newOrderedHTTP2Request(t, "https://"+originAddr+"/tls-wire-profile", fingerprint)
 	response, err := transport.RoundTrip(request)
 	if err != nil {
@@ -262,8 +261,8 @@ func TestTLSHTTP2FingerprintThroughUTLSMitmEndToEnd(t *testing.T) {
 	assertOrderedHTTP2Response(t, response, "tls-through-proxy")
 
 	assertMirroredClientHello(t, captureConn, receiveRawClientHello(t, upstreamClientHello))
-	if got := receiveString(t, upstreamALPN); got != nethttp2.NextProtoTLS {
-		t.Fatalf("upstream ALPN = %q; want %q", got, nethttp2.NextProtoTLS)
+	if got := receiveString(t, upstreamALPN); got != http2NextProtoTLS {
+		t.Fatalf("upstream ALPN = %q; want %q", got, http2NextProtoTLS)
 	}
 	assertHTTP2E2EObservation(t, receiveHTTP2Observation(t, interceptorObserved), expectedFingerprint, false)
 	assertHTTP2E2EObservation(t, receiveHTTP2Observation(t, originObserved), expectedFingerprint, true)
@@ -284,9 +283,9 @@ func wireInitialFieldNames(req *http.Request) []string {
 	return nil
 }
 
-func http2ResponseFieldNames(resp *http.Response, kind nethttp2.HeaderBlockKind) []string {
+func http2ResponseFieldNames(resp *http.Response, kind http.HeaderBlockKind) []string {
 	var fields []string
-	for _, block := range nethttp2.ResponseHeaderBlocks(resp) {
+	for _, block := range http.ResponseHeaderBlocks(resp) {
 		if block.Kind != kind {
 			continue
 		}
@@ -410,7 +409,7 @@ func startTLSHTTP2WireOrigin(
 		captureConn := newClientHelloCaptureConn(conn)
 		tlsConn := tls.Server(captureConn, &tls.Config{
 			Certificates: []tls.Certificate{certificate},
-			NextProtos:   []string{nethttp2.NextProtoTLS},
+			NextProtos:   []string{http2NextProtoTLS},
 		})
 		handshakeCtx, cancelHandshake := context.WithTimeout(ctx, 5*time.Second)
 		handshakeErr := tlsConn.HandshakeContext(handshakeCtx)
@@ -446,14 +445,14 @@ func startTLSHTTP2WireOrigin(
 	return listener.Addr().String(), clientHello, negotiatedALPN
 }
 
-func testHTTP2E2EFingerprint(t *testing.T) nethttp2.Fingerprint {
+func testHTTP2E2EFingerprint(t *testing.T) http.Fingerprint {
 	t.Helper()
 	const canonical = "1:65536;3:1000;4:6291456;6:262144|15663105|3:0:0:201,5:1:3:101|s,m,a,p"
-	fingerprint, err := nethttp2.ParseFingerprint(canonical)
+	fingerprint, err := http.ParseFingerprint(canonical)
 	if err != nil {
 		t.Fatalf("parse HTTP/2 E2E fingerprint: %v", err)
 	}
-	fingerprint.HeaderPriority = &nethttp2.FingerprintHeaderPriority{
+	fingerprint.HeaderPriority = &http.FingerprintHeaderPriority{
 		StreamDep: 0,
 		Exclusive: true,
 		Weight:    101,
@@ -461,67 +460,72 @@ func testHTTP2E2EFingerprint(t *testing.T) nethttp2.Fingerprint {
 	return fingerprint
 }
 
-func xhttpFingerprintFromNetHTTP2(t *testing.T, source nethttp2.Fingerprint) http.Fingerprint {
-	t.Helper()
-	converted := http.Fingerprint{
-		WindowUpdate:      source.WindowUpdate,
-		PseudoHeaderOrder: append([]string(nil), source.PseudoHeaderOrder...),
-	}
-	if source.Settings != nil {
-		converted.Settings = make([]http.Setting, len(source.Settings))
-	}
-	for i, setting := range source.Settings {
-		converted.Settings[i] = http.Setting{ID: http.SettingID(setting.ID), Val: setting.Val}
-	}
-	if source.Priorities != nil {
-		converted.Priorities = make([]http.FingerprintPriority, len(source.Priorities))
-	}
-	for i, priority := range source.Priorities {
-		converted.Priorities[i] = http.FingerprintPriority{
-			StreamID:  priority.StreamID,
-			StreamDep: priority.StreamDep,
-			Exclusive: priority.Exclusive,
-			Weight:    priority.Weight,
-		}
-	}
-	if source.HeaderPriority != nil {
-		converted.HeaderPriority = &http.FingerprintHeaderPriority{
-			StreamDep: source.HeaderPriority.StreamDep,
-			Exclusive: source.HeaderPriority.Exclusive,
-			Weight:    source.HeaderPriority.Weight,
-		}
-	}
-	if err := converted.Validate(); err != nil {
-		t.Fatalf("convert HTTP/2 E2E fingerprint: %v", err)
-	}
-	return converted
+type singleUseHTTP2Transport struct {
+	mu         sync.Mutex
+	conn       net.Conn
+	clientConn *http.ClientConn
+	used       bool
 }
 
-func newSingleUseHTTP2Transport(t *testing.T, conn net.Conn, allowHTTP bool) *nethttp2.Transport {
+func newSingleUseHTTP2Transport(t *testing.T, conn net.Conn) *singleUseHTTP2Transport {
 	t.Helper()
-	var mu sync.Mutex
-	used := false
-	transport := &nethttp2.Transport{
-		AllowHTTP:          allowHTTP,
-		DisableCompression: true,
-		DialTLSContext: func(context.Context, string, string, *tls.Config) (net.Conn, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			if used {
-				return nil, errors.New("HTTP/2 E2E transport attempted a second dial")
-			}
-			used = true
-			return conn, nil
-		},
-	}
-	t.Cleanup(func() {
-		transport.CloseIdleConnections()
-		_ = conn.Close()
-	})
+	transport := &singleUseHTTP2Transport{conn: conn}
+	t.Cleanup(transport.Close)
 	return transport
 }
 
-func newOrderedHTTP2Request(t *testing.T, target string, fingerprint nethttp2.Fingerprint) *http.Request {
+func (t *singleUseHTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	clientConn := t.clientConn
+	if clientConn == nil {
+		if t.used {
+			t.mu.Unlock()
+			return nil, errors.New("HTTP/2 E2E transport attempted a second dial")
+		}
+		t.used = true
+		protocols := &http.Protocols{}
+		protocols.SetUnencryptedHTTP2(true)
+		dialed := false
+		baseTransport := &http.Transport{
+			DisableCompression: true,
+			Protocols:          protocols,
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				if dialed {
+					return nil, errors.New("HTTP/2 E2E transport attempted a second dial")
+				}
+				dialed = true
+				return t.conn, nil
+			},
+		}
+		var err error
+		clientConn, err = baseTransport.NewClientConn(req.Context(), "http", req.URL.Host)
+		if err != nil {
+			t.mu.Unlock()
+			return nil, err
+		}
+		t.clientConn = clientConn
+	}
+	t.mu.Unlock()
+	return clientConn.RoundTrip(req)
+}
+
+func (t *singleUseHTTP2Transport) Close() {
+	t.mu.Lock()
+	clientConn := t.clientConn
+	t.clientConn = nil
+	conn := t.conn
+	t.conn = nil
+	t.mu.Unlock()
+	if clientConn != nil {
+		_ = clientConn.Close()
+		return
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func newOrderedHTTP2Request(t *testing.T, target string, fingerprint http.Fingerprint) *http.Request {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, target, nil)
 	if err != nil {
@@ -530,13 +534,13 @@ func newOrderedHTTP2Request(t *testing.T, target string, fingerprint nethttp2.Fi
 	req.Header.Set("X-Zeta", "one")
 	req.Header.Set("X-Alpha", "two")
 	req.Header.Set("User-Agent", "mitmproxy-go-http2-e2e")
-	req, err = nethttp2.WithRequestHeaderOrder(req, nethttp2.HeaderOrder{
+	req, err = http.WithRequestHeaderOrder(req, http.HeaderOrder{
 		Headers: []string{"x-zeta", "x-alpha", "user-agent"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err = nethttp2.WithRequestFingerprint(req, fingerprint)
+	req, err = http.WithRequestFingerprint(req, fingerprint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +653,7 @@ func assertOrderedHTTP2Response(t *testing.T, response *http.Response, wantBody 
 	if response.ProtoMajor != 2 || response.StatusCode != http.StatusOK {
 		t.Fatalf("response = %s %s; want HTTP/2 200", response.Proto, response.Status)
 	}
-	initialFields := http2ResponseFieldNames(response, nethttp2.HeaderBlockInitial)
+	initialFields := http2ResponseFieldNames(response, http.HeaderBlockInitial)
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -661,7 +665,7 @@ func assertOrderedHTTP2Response(t *testing.T, response *http.Response, wantBody 
 		t.Fatalf("interceptor response header = %q; want seen", got)
 	}
 	assertFieldPrefix(t, initialFields, []string{":status", "x-upstream-b", "x-upstream-a"})
-	trailerFields := http2ResponseFieldNames(response, nethttp2.HeaderBlockTrailer)
+	trailerFields := http2ResponseFieldNames(response, http.HeaderBlockTrailer)
 	if want := []string{"x-trailer-b", "x-trailer-a"}; !slices.Equal(trailerFields, want) {
 		t.Fatalf("response trailer fields = %v; want %v", trailerFields, want)
 	}

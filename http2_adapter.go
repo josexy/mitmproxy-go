@@ -6,8 +6,12 @@ import (
 	"strings"
 	"weak"
 
-	nethttp2 "github.com/josexy/net/http2"
 	http "github.com/josexy/xhttp"
+)
+
+const (
+	http2NextProtoTLS  = "h2"
+	http2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 )
 
 func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
@@ -18,10 +22,6 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 	profile := requestWireProfileFromRequest(req)
 
 	order := requestHeaderOrder(req)
-	netOrder := nethttp2.HeaderOrder{
-		Headers:  order.Headers,
-		Trailers: order.Trailers,
-	}
 	if profile != nil && profile.fingerprint == nil {
 		pseudos := make([]string, 0, len(profile.headerOrder))
 		for _, name := range profile.headerOrder {
@@ -29,20 +29,20 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 				pseudos = append(pseudos, name)
 			}
 		}
-		netOrder.Headers = append(pseudos, netOrder.Headers...)
+		order.Headers = append(pseudos, order.Headers...)
 	}
 	var err error
-	if len(netOrder.Headers) > 0 || len(netOrder.Trailers) > 0 {
-		preparedReq, err = nethttp2.WithRequestHeaderOrder(preparedReq, netOrder)
+	if len(order.Headers) > 0 || len(order.Trailers) > 0 {
+		preparedReq, err = http.WithRequestHeaderOrder(preparedReq, order)
 		if err != nil {
 			return nil, fmt.Errorf("apply HTTP/2 header order: %w", err)
 		}
 	}
 
 	if profile != nil && profile.fingerprint != nil {
-		converted := convertHTTP2Fingerprint(*profile.fingerprint)
-		converted.PseudoHeaderOrder = compatiblePseudoHeaderOrder(preparedReq, converted.PseudoHeaderOrder)
-		preparedReq, err = nethttp2.WithRequestFingerprint(preparedReq, converted)
+		fingerprint := upstreamHTTP2Fingerprint(*profile.fingerprint)
+		fingerprint.PseudoHeaderOrder = compatiblePseudoHeaderOrder(preparedReq, fingerprint.PseudoHeaderOrder)
+		preparedReq, err = http.WithRequestFingerprint(preparedReq, fingerprint)
 		if err != nil {
 			return nil, fmt.Errorf("apply HTTP/2 fingerprint: %w", err)
 		}
@@ -50,42 +50,15 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 	return preparedReq, nil
 }
 
-func convertHTTP2Fingerprint(source http.Fingerprint) nethttp2.Fingerprint {
-	converted := nethttp2.Fingerprint{
-		WindowUpdate:      source.WindowUpdate,
-		PseudoHeaderOrder: append([]string(nil), source.PseudoHeaderOrder...),
-	}
-	if source.Settings != nil {
-		converted.Settings = make([]nethttp2.Setting, len(source.Settings))
-	}
-	for i, setting := range source.Settings {
-		converted.Settings[i] = nethttp2.Setting{
-			ID:  nethttp2.SettingID(setting.ID),
-			Val: setting.Val,
-		}
-	}
-	if source.Priorities != nil {
-		converted.Priorities = make([]nethttp2.FingerprintPriority, len(source.Priorities))
-	}
-	for i, priority := range source.Priorities {
-		converted.Priorities[i] = nethttp2.FingerprintPriority{
-			StreamID:  priority.StreamID,
-			StreamDep: priority.StreamDep,
-			Exclusive: priority.Exclusive,
-			Weight:    priority.Weight,
-		}
-	}
+func upstreamHTTP2Fingerprint(source http.Fingerprint) http.Fingerprint {
+	fingerprint := cloneHTTP2Fingerprint(source)
 	// Stream IDs are scoped to one HTTP/2 connection. Without a mapping from
 	// downstream streams to independently allocated upstream streams, only a
 	// dependency on the connection root can be replayed safely.
-	if source.HeaderPriority != nil && source.HeaderPriority.StreamDep == 0 {
-		converted.HeaderPriority = &nethttp2.FingerprintHeaderPriority{
-			StreamDep: source.HeaderPriority.StreamDep,
-			Exclusive: source.HeaderPriority.Exclusive,
-			Weight:    source.HeaderPriority.Weight,
-		}
+	if fingerprint.HeaderPriority != nil && fingerprint.HeaderPriority.StreamDep != 0 {
+		fingerprint.HeaderPriority = nil
 	}
-	return converted
+	return fingerprint
 }
 
 func compatiblePseudoHeaderOrder(req *http.Request, captured []string) []string {
@@ -130,7 +103,7 @@ func prepareHTTP2Response(resp *http.Response, req *http.Request) *http.Response
 		if response == nil {
 			return nil
 		}
-		blocks := convertHTTP2ResponseHeaderBlocks(nethttp2.ResponseHeaderBlocks(response))
+		blocks := http.ResponseHeaderBlocks(response)
 		runtime.KeepAlive(response)
 		return blocks
 	}
@@ -150,27 +123,4 @@ func prepareHTTP2Response(resp *http.Response, req *http.Request) *http.Response
 		return order
 	}, blocks)
 	return resp
-}
-
-func convertHTTP2ResponseHeaderBlocks(source []nethttp2.HeaderBlock) []http.HeaderBlock {
-	if len(source) == 0 {
-		return nil
-	}
-	converted := make([]http.HeaderBlock, len(source))
-	for i, block := range source {
-		converted[i] = http.HeaderBlock{
-			Kind:       http.HeaderBlockKind(block.Kind),
-			Truncated:  block.Truncated,
-			ProtoMajor: 2,
-			Fields:     make([]http.HeaderField, len(block.Fields)),
-		}
-		for j, field := range block.Fields {
-			converted[i].Fields[j] = http.HeaderField{
-				Name:      field.Name,
-				Value:     field.Value,
-				Sensitive: field.Sensitive,
-			}
-		}
-	}
-	return converted
 }

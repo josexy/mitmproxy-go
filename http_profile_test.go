@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	nethttp2 "github.com/josexy/net/http2"
 	http "github.com/josexy/xhttp"
 )
 
@@ -104,7 +103,7 @@ func TestRequestWireProfileCopiesHTTP2Fingerprint(t *testing.T) {
 	}
 }
 
-func TestConvertHTTP2FingerprintPreservesNonCanonicalHeaderPriority(t *testing.T) {
+func TestUpstreamHTTP2FingerprintPreservesNonCanonicalHeaderPriority(t *testing.T) {
 	source := http.Fingerprint{
 		Settings:          []http.Setting{{ID: http.SettingHeaderTableSize, Val: 65536}},
 		WindowUpdate:      15663105,
@@ -112,11 +111,11 @@ func TestConvertHTTP2FingerprintPreservesNonCanonicalHeaderPriority(t *testing.T
 		HeaderPriority:    &http.FingerprintHeaderPriority{StreamDep: 0, Exclusive: true, Weight: 101},
 		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
 	}
-	converted := convertHTTP2Fingerprint(source)
+	converted := upstreamHTTP2Fingerprint(source)
 	if got := converted.String(); got != source.String() {
 		t.Fatalf("converted fingerprint string = %q; want %q", got, source.String())
 	}
-	wantHeaderPriority := &nethttp2.FingerprintHeaderPriority{StreamDep: 0, Exclusive: true, Weight: 101}
+	wantHeaderPriority := &http.FingerprintHeaderPriority{StreamDep: 0, Exclusive: true, Weight: 101}
 	if !reflect.DeepEqual(converted.HeaderPriority, wantHeaderPriority) {
 		t.Fatalf("converted HEADERS priority = %#v; want %#v", converted.HeaderPriority, wantHeaderPriority)
 	}
@@ -126,7 +125,7 @@ func TestConvertHTTP2FingerprintPreservesNonCanonicalHeaderPriority(t *testing.T
 	}
 }
 
-func TestConvertHTTP2FingerprintDropsConnectionRelativeHeaderPriority(t *testing.T) {
+func TestUpstreamHTTP2FingerprintDropsConnectionRelativeHeaderPriority(t *testing.T) {
 	source := http.Fingerprint{
 		HeaderPriority: &http.FingerprintHeaderPriority{
 			StreamDep: 3,
@@ -135,7 +134,7 @@ func TestConvertHTTP2FingerprintDropsConnectionRelativeHeaderPriority(t *testing
 		},
 		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
 	}
-	converted := convertHTTP2Fingerprint(source)
+	converted := upstreamHTTP2Fingerprint(source)
 	if converted.HeaderPriority != nil {
 		t.Fatalf("converted HEADERS priority = %#v; want nil", converted.HeaderPriority)
 	}
@@ -260,57 +259,6 @@ func TestRequestWireHeaderBlocksSurviveContextCloneAndTrackTrailers(t *testing.T
 	wantTrailers := []string{"x-trailer-b", "x-trailer-a"}
 	if got := RequestWireHeaderOrder(req).Trailers; !reflect.DeepEqual(got, wantTrailers) {
 		t.Fatalf("trailer order = %v; want %v", got, wantTrailers)
-	}
-}
-
-func TestConvertHTTP2ResponseHeaderBlocks(t *testing.T) {
-	source := []nethttp2.HeaderBlock{
-		{
-			Kind:      nethttp2.HeaderBlockInformational,
-			Truncated: true,
-			Fields: []nethttp2.HeaderField{
-				{Name: ":status", Value: "103"},
-				{Name: "link", Value: "</style.css>; rel=preload", Sensitive: true},
-			},
-		},
-		{
-			Kind: nethttp2.HeaderBlockInitial,
-			Fields: []nethttp2.HeaderField{
-				{Name: ":status", Value: "200"},
-				{Name: "x-zeta", Value: "one"},
-			},
-		},
-		{
-			Kind:   nethttp2.HeaderBlockTrailer,
-			Fields: []nethttp2.HeaderField{{Name: "x-end", Value: "done"}},
-		},
-	}
-	want := []http.HeaderBlock{
-		{
-			Kind:       http.HeaderBlockInformational,
-			ProtoMajor: 2,
-			Truncated:  true,
-			Fields: []http.HeaderField{
-				{Name: ":status", Value: "103"},
-				{Name: "link", Value: "</style.css>; rel=preload", Sensitive: true},
-			},
-		},
-		{
-			Kind:       http.HeaderBlockInitial,
-			ProtoMajor: 2,
-			Fields: []http.HeaderField{
-				{Name: ":status", Value: "200"},
-				{Name: "x-zeta", Value: "one"},
-			},
-		},
-		{
-			Kind:       http.HeaderBlockTrailer,
-			ProtoMajor: 2,
-			Fields:     []http.HeaderField{{Name: "x-end", Value: "done"}},
-		},
-	}
-	if got := convertHTTP2ResponseHeaderBlocks(source); !reflect.DeepEqual(got, want) {
-		t.Fatalf("converted blocks = %#v; want %#v", got, want)
 	}
 }
 

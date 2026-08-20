@@ -26,7 +26,6 @@ import (
 	"github.com/josexy/mitmproxy-go/internal/cert"
 	"github.com/josexy/mitmproxy-go/internal/iocopy"
 	"github.com/josexy/mitmproxy-go/metadata"
-	"github.com/josexy/net/http2"
 	"github.com/josexy/websocket"
 	"github.com/josexy/xhttp/httptrace"
 	utls "github.com/refraction-networking/utls"
@@ -1453,7 +1452,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		// then we should hand over the process of processing the http2 stream to the underlying go http2 library,
 		// and finally we only need to get the [http.Request] and process the [http.ResponseWriter].
 		// Early process http2
-		if state.NegotiatedProtocol == http2.NextProtoTLS {
+		if state.NegotiatedProtocol == http2NextProtoTLS {
 			logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http2 connection serving",
 				slog.String("hostport", reqCtx.Hostport),
 				slog.String("mode", "tls"),

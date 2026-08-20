@@ -9,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/josexy/net/http2"
 	utls "github.com/refraction-networking/utls"
 )
 
@@ -156,7 +155,7 @@ func filteredClientHelloProtos(protos []string, disableHTTP2 bool) []string {
 	filtered := slices.Clone(protos)
 	if disableHTTP2 {
 		filtered = slices.DeleteFunc(filtered, func(proto string) bool {
-			return proto == http2.NextProtoTLS
+			return proto == http2NextProtoTLS
 		})
 	}
 	return filtered

@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/josexy/net/http/httpproxy"
-	"github.com/josexy/net/proxy"
+	"golang.org/x/net/http/httpproxy"
+	"golang.org/x/net/proxy"
 )
 
 const dialTimeout = 15 * time.Second
