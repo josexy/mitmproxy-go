@@ -2,21 +2,26 @@ package mitmproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
+	"reflect"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 func TestProtocolsForRequest(t *testing.T) {
@@ -496,7 +501,7 @@ func TestSingleConnTransportRetriesReplayableRequestAfterBadClientConn(t *testin
 	<-done
 }
 
-func TestSingleConnTransportRetriesHTTP2RequestAfterBadClientConn(t *testing.T) {
+func TestSingleConnTransportDoesNotRetryHTTP2RequestAfterHeadersMayHaveBeenProcessed(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -552,17 +557,11 @@ func TestSingleConnTransportRetriesHTTP2RequestAfterBadClientConn(t *testing.T) 
 	req.Proto = "HTTP/2.0"
 	req.ProtoMajor = 2
 	req.ProtoMinor = 0
-	resp, err := tr.RoundTrip(req)
-	if err != nil {
-		t.Fatalf("RoundTrip: %v", err)
+	if _, err := tr.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip succeeded; want the first connection error without replaying the request")
 	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK || string(body) != "ok" {
-		t.Fatalf("response = proto %s status %d body %q, want HTTP/2 200 ok", resp.Proto, resp.StatusCode, body)
-	}
-	if dialCount != 2 {
-		t.Fatalf("dialCount = %d, want HTTP/2 retry on a new connection", dialCount)
+	if dialCount != 1 {
+		t.Fatalf("dialCount = %d, want no retry after the request headers may have reached the origin", dialCount)
 	}
 	select {
 	case err := <-errCh:
@@ -571,6 +570,885 @@ func TestSingleConnTransportRetriesHTTP2RequestAfterBadClientConn(t *testing.T) 
 	}
 	_ = server.Close()
 	<-firstDone
+}
+
+func TestSingleConnTransportRetriesHTTP2RefusedStream(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 2)
+	protos := &http.Protocols{}
+	protos.SetHTTP1(true)
+	protos.SetUnencryptedHTTP2(true)
+	server := &http.Server{
+		Protocols: protos,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, readErr := io.ReadAll(r.Body)
+			if readErr != nil || string(body) != "payload" {
+				errCh <- fmt.Errorf("retried request body = %q, %v; want payload", body, readErr)
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}
+	defer server.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		firstConn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			errCh <- acceptErr
+			return
+		}
+		defer firstConn.Close()
+		if refuseErr := refuseHTTP2Request(firstConn); refuseErr != nil {
+			errCh <- refuseErr
+			return
+		}
+		if serveErr := server.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed && !errors.Is(serveErr, net.ErrClosed) {
+			errCh <- serveErr
+		}
+	}()
+
+	var dialCount atomic.Int32
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount.Add(1)
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", strings.NewReader("payload"))
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip after REFUSED_STREAM: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got, want := string(body), "ok"; got != want {
+		t.Fatalf("response body = %q; want %q", got, want)
+	}
+	if got := dialCount.Load(); got != 2 {
+		t.Fatalf("HTTP/2 dial count = %d; want one retry on a new connection", got)
+	}
+	select {
+	case serverErr := <-errCh:
+		t.Fatal(serverErr)
+	default:
+	}
+	_ = server.Close()
+	<-done
+}
+
+func TestSingleConnTransportRetriesHTTP2RequestRejectedByGoAway(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 2)
+	protos := &http.Protocols{}
+	protos.SetHTTP1(true)
+	protos.SetUnencryptedHTTP2(true)
+	server := &http.Server{
+		Protocols: protos,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}
+	defer server.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		firstConn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			errCh <- acceptErr
+			return
+		}
+		defer firstConn.Close()
+		if goAwayErr := rejectHTTP2RequestWithGoAway(firstConn); goAwayErr != nil {
+			errCh <- goAwayErr
+			return
+		}
+		if serveErr := server.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed && !errors.Is(serveErr, net.ErrClosed) {
+			errCh <- serveErr
+		}
+	}()
+
+	var dialCount atomic.Int32
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount.Add(1)
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip after GOAWAY: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got, want := string(body), "ok"; got != want {
+		t.Fatalf("response body = %q; want %q", got, want)
+	}
+	if got := dialCount.Load(); got != 2 {
+		t.Fatalf("HTTP/2 dial count = %d; want one retry on a new connection", got)
+	}
+	select {
+	case serverErr := <-errCh:
+		t.Fatal(serverErr)
+	default:
+	}
+	_ = server.Close()
+	<-done
+}
+
+func TestSingleConnTransportDoesNotRetryHTTP2BodyWithoutGetBody(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	releaseConn := make(chan struct{})
+	defer func() {
+		close(releaseConn)
+		<-done
+	}()
+	go func() {
+		defer close(done)
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			errCh <- acceptErr
+			return
+		}
+		defer conn.Close()
+		if refuseErr := refuseHTTP2Request(conn); refuseErr != nil {
+			errCh <- refuseErr
+		}
+		<-releaseConn
+	}()
+
+	var dialCount atomic.Int32
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount.Add(1)
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", io.NopCloser(strings.NewReader("payload")))
+	req.GetBody = nil
+	req.ContentLength = int64(len("payload"))
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	if _, err := tr.RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip succeeded; want non-replayable request body error")
+	}
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("HTTP/2 dial count = %d; want no retry without GetBody", got)
+	}
+	select {
+	case serverErr := <-errCh:
+		t.Fatal(serverErr)
+	default:
+	}
+}
+
+func TestSingleConnTransportDrainsAcceptedHTTP2StreamAfterGoAway(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	firstHeaders := make(chan struct{})
+	retryReachedOrigin := make(chan struct{})
+	acceptedResponseConsumed := make(chan struct{})
+	errCh := make(chan error, 2)
+	protos := &http.Protocols{}
+	protos.SetHTTP1(true)
+	protos.SetUnencryptedHTTP2(true)
+	server := &http.Server{
+		Protocols: protos,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(retryReachedOrigin)
+			_, _ = w.Write([]byte("retried"))
+		}),
+	}
+	defer server.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		firstConn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			errCh <- acceptErr
+			return
+		}
+		defer firstConn.Close()
+		serveDone := make(chan struct{})
+		go func() {
+			defer close(serveDone)
+			if serveErr := server.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed && !errors.Is(serveErr, net.ErrClosed) {
+				errCh <- serveErr
+			}
+		}()
+		if drainErr := goAwayAfterSecondHTTP2Request(firstConn, firstHeaders, retryReachedOrigin, acceptedResponseConsumed); drainErr != nil {
+			errCh <- drainErr
+		}
+		_ = server.Close()
+		<-serveDone
+	}()
+
+	var dialCount atomic.Int32
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount.Add(1)
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	request := func(path string) *http.Request {
+		req, requestErr := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+path, nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		req.Proto = "HTTP/2.0"
+		req.ProtoMajor = 2
+		req.ProtoMinor = 0
+		return req
+	}
+	type result struct {
+		response *http.Response
+		err      error
+	}
+	firstResult := make(chan result, 1)
+	go func() {
+		response, roundTripErr := tr.RoundTrip(request("/accepted"))
+		firstResult <- result{response: response, err: roundTripErr}
+	}()
+	select {
+	case <-firstHeaders:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for first HTTP/2 request headers")
+	}
+
+	secondResult := make(chan result, 1)
+	go func() {
+		response, roundTripErr := tr.RoundTrip(request("/rejected"))
+		secondResult <- result{response: response, err: roundTripErr}
+	}()
+
+	select {
+	case second := <-secondResult:
+		if second.err != nil {
+			t.Fatalf("rejected stream retry: %v", second.err)
+		}
+		body, readErr := io.ReadAll(second.response.Body)
+		_ = second.response.Body.Close()
+		if readErr != nil || string(body) != "retried" {
+			t.Fatalf("retried response = %q, %v; want retried", body, readErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for rejected stream retry")
+	}
+
+	select {
+	case first := <-firstResult:
+		if first.err != nil {
+			t.Fatalf("accepted stream interrupted after GOAWAY: %v", first.err)
+		}
+		_ = first.response.Body.Close()
+		if first.response.StatusCode != http.StatusNoContent {
+			t.Fatalf("accepted stream status = %d; want 204", first.response.StatusCode)
+		}
+		close(acceptedResponseConsumed)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for accepted stream response")
+	}
+	if got := dialCount.Load(); got != 2 {
+		t.Fatalf("HTTP/2 dial count = %d; want old draining connection plus retry connection", got)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return len(tr.retired) == 0
+	})
+	_ = server.Close()
+	<-done
+	select {
+	case serverErr := <-errCh:
+		t.Fatal(serverErr)
+	default:
+	}
+}
+
+func TestSingleConnTransportEvictsClosedHTTP2Connection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	protos := &http.Protocols{}
+	protos.SetHTTP1(true)
+	protos.SetUnencryptedHTTP2(true)
+	server := &http.Server{
+		Protocols: protos,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		_ = server.Serve(ln)
+	}()
+
+	tr := newTransport(ln.Addr().String(), (&net.Dialer{Timeout: time.Second}).DialContext, time.Second, false)
+	defer tr.Close()
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	tr.mu.Lock()
+	cachedCount := len(tr.http2Conns)
+	tr.mu.Unlock()
+	if cachedCount != 1 {
+		t.Fatalf("cached HTTP/2 connection count = %d; want 1", cachedCount)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return len(tr.http2Conns) == 0
+	})
+	<-serverDone
+}
+
+func TestSingleConnTransportLeasePreventsSelectedHTTP2ConnectionForceClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverErr := make(chan error, 1)
+	releaseServer := make(chan struct{})
+	serverDone := make(chan struct{})
+	defer func() {
+		close(releaseServer)
+		<-serverDone
+	}()
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		framer, streamID, readErr := readHTTP2RequestHeaders(conn)
+		if readErr == nil {
+			readErr = writeHTTP2Status(framer, streamID, "204")
+		}
+		serverErr <- readErr
+		<-releaseServer
+	}()
+
+	tr := newTransport(ln.Addr().String(), (&net.Dialer{Timeout: time.Second}).DialContext, time.Second, false)
+	defer tr.Close()
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	preparedReq, err := prepareHTTP2Request(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, key, err := tr.getHTTP2ClientConn(preparedReq.Context(), preparedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tr.discardHTTP2ClientConn(preparedReq.Context(), key, clientConn, true)
+	tr.mu.Lock()
+	retiredCount := len(tr.retired)
+	leaseCount := tr.http2Leases[clientConn]
+	tr.mu.Unlock()
+	if retiredCount != 1 || leaseCount != 1 {
+		t.Fatalf("retired/lease counts = %d/%d; want 1/1", retiredCount, leaseCount)
+	}
+	if clientConn.Err() != nil {
+		t.Fatal("leased HTTP/2 connection closed when it entered retired state")
+	}
+
+	resp, roundTripErr := clientConn.RoundTrip(preparedReq)
+	tr.releaseHTTP2ClientConnLease(preparedReq.Context(), key, clientConn)
+	if roundTripErr != nil {
+		t.Fatalf("selected request on retired HTTP/2 connection: %v", roundTripErr)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("response status = %d; want 204", resp.StatusCode)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return len(tr.retired) == 0 && tr.http2Leases[clientConn] == 0
+	})
+	if clientConn.Err() == nil {
+		t.Fatal("retired HTTP/2 connection remained open after its lease drained")
+	}
+}
+
+func TestSingleConnTransportCachedEvictionPreservesHTTP2Lease(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	settingsSent := make(chan struct{})
+	releaseServer := make(chan struct{})
+	serverDone := make(chan struct{})
+	serverErr := make(chan error, 1)
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		framer, prefaceErr := readHTTP2ClientPreface(conn)
+		if prefaceErr != nil {
+			serverErr <- prefaceErr
+			return
+		}
+		if settingsErr := framer.WriteSettings(http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 0}); settingsErr != nil {
+			serverErr <- settingsErr
+			return
+		}
+		if settingsErr := framer.WriteSettingsAck(); settingsErr != nil {
+			serverErr <- settingsErr
+			return
+		}
+		close(settingsSent)
+		<-releaseServer
+	}()
+	defer func() {
+		close(releaseServer)
+		<-serverDone
+	}()
+
+	dialErr := errors.New("test second HTTP/2 dial")
+	var dialCount atomic.Int32
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if dialCount.Add(1) > 1 {
+				return nil, dialErr
+			}
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	preparedReq, err := prepareHTTP2Request(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, key, err := tr.getHTTP2ClientConn(preparedReq.Context(), preparedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-settingsSent:
+	case serverErr := <-serverErr:
+		t.Fatal(serverErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for HTTP/2 concurrency limit update")
+	}
+	waitForCondition(t, time.Second, func() bool {
+		return clientConn.Err() == nil && clientConn.Available() == 0 && clientConn.InFlight() == 0
+	})
+
+	_, _, err = tr.getHTTP2ClientConn(preparedReq.Context(), preparedReq)
+	if !errors.Is(err, dialErr) {
+		t.Fatalf("replacement HTTP/2 dial error = %v; want %v", err, dialErr)
+	}
+
+	tr.mu.Lock()
+	retired := len(tr.retired) == 1 && tr.retired[0] == clientConn
+	leaseCount := tr.http2Leases[clientConn]
+	tr.mu.Unlock()
+	if !retired || leaseCount != 1 {
+		t.Fatalf("cached eviction retired/lease state = %v/%d; want true/1", retired, leaseCount)
+	}
+	if clientConn.Err() != nil {
+		t.Fatal("cached eviction closed an HTTP/2 connection with an existing lease")
+	}
+
+	tr.releaseHTTP2ClientConnLease(preparedReq.Context(), key, clientConn)
+	waitForCondition(t, time.Second, func() bool {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return len(tr.retired) == 0 && tr.http2Leases[clientConn] == 0 && clientConn.Err() != nil
+	})
+	select {
+	case err := <-serverErr:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func TestSingleConnTransportDoesNotOverrideHTTP2TransportRetryDecision(t *testing.T) {
+	permanentErr := errors.New("permanent HTTP/2 dial failure")
+	var dialCount atomic.Int32
+	tr := newTransport(
+		"example.test:80",
+		func(context.Context, string, string) (net.Conn, error) {
+			dialCount.Add(1)
+			return nil, permanentErr
+		},
+		time.Second,
+		false,
+	)
+	defer tr.Close()
+
+	req, err := http.NewRequest(http.MethodGet, "http://example.test/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	if _, err = tr.RoundTrip(req); !errors.Is(err, permanentErr) {
+		t.Fatalf("RoundTrip error = %v; want %v", err, permanentErr)
+	}
+	if got := dialCount.Load(); got != 1 {
+		t.Fatalf("HTTP/2 dial count = %d; want the underlying transport decision to be returned without an outer retry", got)
+	}
+}
+
+func TestSingleConnTransportReplaysHTTP2FingerprintAndHeaderOrder(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type capture struct {
+		fingerprint http.Fingerprint
+		fields      []string
+		err         error
+	}
+	captured := make(chan capture, 1)
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			fingerprint, ok := http.RequestFingerprint(req)
+			if !ok {
+				captured <- capture{err: errors.New("server did not capture HTTP/2 fingerprint")}
+				return
+			}
+			var fields []string
+			for _, block := range http.RequestHeaderBlocks(req) {
+				if block.Kind != http.HeaderBlockInitial {
+					continue
+				}
+				for _, field := range block.Fields {
+					fields = append(fields, field.Name)
+				}
+				break
+			}
+			captured <- capture{fingerprint: fingerprint, fields: fields}
+			w.Header().Set("X-Zeta", "one")
+			w.Header().Set("X-Alpha", "two")
+			w.Header().Set("Trailer", "X-Trailer-B, X-Trailer-A")
+			if err := http.SetResponseHeaderOrder(w, http.HeaderOrder{
+				Headers:  []string{":status", "x-zeta", "x-alpha", "trailer"},
+				Trailers: []string{"x-trailer-b", "x-trailer-a"},
+			}); err != nil {
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+			w.Header().Set("X-Trailer-B", "b")
+			w.Header().Set("X-Trailer-A", "a")
+		})
+		serverDone <- serveHTTP2Conn(context.Background(), conn, handler, nil, false)
+	}()
+
+	const canonicalFingerprint = "1:65536;3:1000;4:6291456;6:262144|15663105|3:0:0:201,5:1:3:101|m,a,s,p"
+	fingerprint, parseFingerprintErr := http.ParseFingerprint(canonicalFingerprint)
+	if parseFingerprintErr != nil {
+		t.Fatal(parseFingerprintErr)
+	}
+	fingerprint.HeaderPriority = &http.FingerprintHeaderPriority{
+		StreamDep: 0,
+		Exclusive: true,
+		Weight:    101,
+	}
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/fingerprint", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Proto = "HTTP/2.0"
+	req.ProtoMajor = 2
+	req.ProtoMinor = 0
+	req.Header.Set("X-Zeta", "one")
+	req.Header.Set("X-Alpha", "two")
+	req = withRequestWireProfile(req, &requestWireProfile{
+		headerOrder: []string{":method", ":authority", ":scheme", ":path", "x-zeta", "x-alpha"},
+		fingerprint: func() *http.Fingerprint {
+			clone := cloneHTTP2Fingerprint(fingerprint)
+			return &clone
+		}(),
+	})
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		_ = tr.Close()
+		t.Fatal(err)
+	}
+	if got, want := responseHeaderOrder(resp).Headers, []string{":status", "x-zeta", "x-alpha", "trailer"}; len(got) < len(want) || !slices.Equal(got[:len(want)], want) {
+		_ = tr.Close()
+		t.Fatalf("captured response header order = %v; want %v", got, want)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "ok" {
+		_ = resp.Body.Close()
+		_ = tr.Close()
+		t.Fatalf("response body = %q, %v; want ok", body, err)
+	}
+	if got, want := responseHeaderOrder(resp).Trailers, []string{"x-trailer-b", "x-trailer-a"}; !slices.Equal(got, want) {
+		_ = resp.Body.Close()
+		_ = tr.Close()
+		t.Fatalf("captured response trailer order = %v; want %v", got, want)
+	}
+	_ = resp.Body.Close()
+
+	got := <-captured
+	if got.err != nil {
+		_ = tr.Close()
+		t.Fatal(got.err)
+	}
+	if !reflect.DeepEqual(got.fingerprint, fingerprint) {
+		_ = tr.Close()
+		t.Fatalf("captured fingerprint = %#v; want %#v", got.fingerprint, fingerprint)
+	}
+	indexOf := func(name string) int {
+		for i, field := range got.fields {
+			if field == name {
+				return i
+			}
+		}
+		return -1
+	}
+	method, authority := indexOf(":method"), indexOf(":authority")
+	scheme, path := indexOf(":scheme"), indexOf(":path")
+	zeta, alpha := indexOf("x-zeta"), indexOf("x-alpha")
+	if method < 0 || authority < 0 || scheme < 0 || path < 0 || zeta < 0 || alpha < 0 ||
+		!(method < authority && authority < scheme && scheme < path && path < zeta && zeta < alpha) {
+		_ = tr.Close()
+		t.Fatalf("captured header order = %v", got.fields)
+	}
+
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP/2 server did not stop")
+	}
+}
+
+func TestSingleConnTransportIsolatesHTTP2ConnectionsByFingerprint(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type capture struct {
+		fingerprint http.Fingerprint
+		ok          bool
+	}
+	captured := make(chan capture, 4)
+	serverDone := make(chan error, 2)
+	go func() {
+		for range 2 {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				serverDone <- acceptErr
+				return
+			}
+			go func() {
+				handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					fingerprint, ok := http.RequestFingerprint(req)
+					captured <- capture{fingerprint: fingerprint, ok: ok}
+					_, _ = w.Write([]byte("ok"))
+				})
+				serverDone <- serveHTTP2Conn(context.Background(), conn, handler, nil, false)
+			}()
+		}
+	}()
+
+	var dialCount atomic.Int32
+	tr := newTransport(
+		ln.Addr().String(),
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialCount.Add(1)
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, addr)
+		},
+		time.Second,
+		false,
+	)
+	baseFingerprint := http.Fingerprint{
+		Settings:          []http.Setting{{ID: http.SettingHeaderTableSize, Val: 4096}},
+		PseudoHeaderOrder: []string{":method", ":authority", ":scheme", ":path"},
+	}
+	differentPseudoOrder := cloneHTTP2Fingerprint(baseFingerprint)
+	differentPseudoOrder.PseudoHeaderOrder = []string{":scheme", ":method", ":authority", ":path"}
+	differentHeaderPriority := cloneHTTP2Fingerprint(baseFingerprint)
+	differentHeaderPriority.HeaderPriority = &http.FingerprintHeaderPriority{StreamDep: 0, Exclusive: true, Weight: 33}
+	differentConnection := cloneHTTP2Fingerprint(baseFingerprint)
+	differentConnection.Settings[0].Val = 65536
+	fingerprints := []http.Fingerprint{
+		baseFingerprint,
+		differentPseudoOrder,
+		differentHeaderPriority,
+		differentConnection,
+	}
+	for _, fingerprint := range fingerprints {
+		req, requestErr := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/isolation", nil)
+		if requestErr != nil {
+			_ = tr.Close()
+			t.Fatal(requestErr)
+		}
+		req.Proto = "HTTP/2.0"
+		req.ProtoMajor = 2
+		req.ProtoMinor = 0
+		clone := cloneHTTP2Fingerprint(fingerprint)
+		req = withRequestWireProfile(req, &requestWireProfile{fingerprint: &clone})
+		resp, roundTripErr := tr.RoundTrip(req)
+		if roundTripErr != nil {
+			_ = tr.Close()
+			t.Fatal(roundTripErr)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	for index, fingerprint := range fingerprints {
+		select {
+		case got := <-captured:
+			if !got.ok {
+				_ = tr.Close()
+				t.Fatalf("fingerprint %d was not captured", index)
+			}
+			if !reflect.DeepEqual(got.fingerprint, fingerprint) {
+				_ = tr.Close()
+				t.Fatalf("fingerprint %d = %#v; want %#v", index, got.fingerprint, fingerprint)
+			}
+		case <-time.After(2 * time.Second):
+			_ = tr.Close()
+			t.Fatal("timed out waiting for fingerprint capture")
+		}
+	}
+	if got := dialCount.Load(); got != 2 {
+		_ = tr.Close()
+		t.Fatalf("HTTP/2 dial count = %d; want two fingerprint-isolated connections", got)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("HTTP/2 server did not stop")
+		}
+	}
 }
 
 func TestSingleConnTransportDoesNotRetryNonIdempotentRequestAfterBadClientConn(t *testing.T) {
@@ -940,38 +1818,115 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
 
 func closeHTTP2ConnAfterRequestHeaders(conn net.Conn) error {
 	defer conn.Close()
+	_, _, err := readHTTP2RequestHeaders(conn)
+	return err
+}
 
-	preface := make([]byte, len(http2.ClientPreface))
-	if _, err := io.ReadFull(conn, preface); err != nil {
+func refuseHTTP2Request(conn net.Conn) error {
+	framer, streamID, err := readHTTP2RequestHeaders(conn)
+	if err != nil {
 		return err
 	}
+	return framer.WriteRSTStream(streamID, http2.ErrCodeRefusedStream)
+}
+
+func rejectHTTP2RequestWithGoAway(conn net.Conn) error {
+	framer, streamID, err := readHTTP2RequestHeaders(conn)
+	if err != nil {
+		return err
+	}
+	return framer.WriteGoAway(streamID-1, http2.ErrCodeNo, nil)
+}
+
+func goAwayAfterSecondHTTP2Request(conn net.Conn, firstHeaders chan<- struct{}, retryReachedOrigin, acceptedResponseConsumed <-chan struct{}) error {
+	framer, firstStreamID, err := readHTTP2RequestHeaders(conn)
+	if err != nil {
+		return err
+	}
+	close(firstHeaders)
+
+	var secondStreamID uint32
+	for secondStreamID == 0 {
+		frame, readErr := framer.ReadFrame()
+		if readErr != nil {
+			return readErr
+		}
+		if headers, ok := frame.(*http2.HeadersFrame); ok && headers.StreamID != firstStreamID {
+			secondStreamID = headers.StreamID
+		}
+	}
+	if err := framer.WriteGoAway(firstStreamID, http2.ErrCodeNo, nil); err != nil {
+		return err
+	}
+	select {
+	case <-retryReachedOrigin:
+	case <-time.After(2 * time.Second):
+		return errors.New("timeout waiting for GOAWAY-rejected stream retry")
+	}
+	if err := writeHTTP2Status(framer, firstStreamID, "204"); err != nil {
+		return err
+	}
+	select {
+	case <-acceptedResponseConsumed:
+		return nil
+	case <-time.After(2 * time.Second):
+		return errors.New("timeout waiting for accepted GOAWAY stream response consumption")
+	}
+}
+
+func writeHTTP2Status(framer *http2.Framer, streamID uint32, status string) error {
+	var block bytes.Buffer
+	encoder := hpack.NewEncoder(&block)
+	if err := encoder.WriteField(hpack.HeaderField{Name: ":status", Value: status}); err != nil {
+		return err
+	}
+	return framer.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      streamID,
+		BlockFragment: block.Bytes(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+}
+
+func readHTTP2RequestHeaders(conn net.Conn) (*http2.Framer, uint32, error) {
+	framer, err := readHTTP2ClientPreface(conn)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := framer.WriteSettings(); err != nil {
+		return nil, 0, err
+	}
+	if err := framer.WriteSettingsAck(); err != nil {
+		return nil, 0, err
+	}
+	for {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			return nil, 0, err
+		}
+		if headers, ok := frame.(*http2.HeadersFrame); ok {
+			return framer, headers.StreamID, nil
+		}
+	}
+}
+
+func readHTTP2ClientPreface(conn net.Conn) (*http2.Framer, error) {
+	preface := make([]byte, len(http2.ClientPreface))
+	if _, err := io.ReadFull(conn, preface); err != nil {
+		return nil, err
+	}
 	if string(preface) != http2.ClientPreface {
-		return fmt.Errorf("client preface = %q, want HTTP/2 client preface", preface)
+		return nil, fmt.Errorf("client preface = %q, want HTTP/2 client preface", preface)
 	}
 
 	framer := http2.NewFramer(conn, conn)
 	for {
 		frame, err := framer.ReadFrame()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if _, ok := frame.(*http2.SettingsFrame); ok {
-			break
-		}
-	}
-	if err := framer.WriteSettings(); err != nil {
-		return err
-	}
-	if err := framer.WriteSettingsAck(); err != nil {
-		return err
-	}
-	for {
-		frame, err := framer.ReadFrame()
-		if err != nil {
-			return err
-		}
-		if _, ok := frame.(*http2.HeadersFrame); ok {
-			return nil
+			return framer, nil
 		}
 	}
 }

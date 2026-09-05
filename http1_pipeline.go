@@ -4,10 +4,11 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptrace"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"sync"
 	"time"
 )
@@ -243,8 +244,30 @@ func (p *http1PipelineConn) writeLoop() {
 	for {
 		select {
 		case exchange := <-p.writeQueue:
+			// Register the exchange with the ordered response reader before
+			// writing its body. HTTP/1 servers may legitimately send a final
+			// response while an upload is still in progress; the read loop must
+			// be able to fire GotFirstResponseByte without waiting for
+			// Request.Write (and WroteRequest) to finish.
+			select {
+			case p.readQueue <- exchange:
+			case <-p.done:
+				exchange.release()
+				return
+			}
 			request := withoutForwardedExpectContinue(exchange.request)
-			err := request.Write(p.conn)
+			var err error
+			if len(request.Trailer) > 0 {
+				// Resolve trailer order only after Write has consumed the body.
+				// The writer buffers header blocks, never the streaming payload.
+				writer := &http1ResponseWriter{dst: p.conn, request: request, chunked: true}
+				err = request.Write(writer)
+				if flushErr := writer.flush(); err == nil {
+					err = flushErr
+				}
+			} else {
+				err = request.Write(p.conn)
+			}
 			if request.Body != nil {
 				_ = request.Body.Close()
 			}
@@ -258,12 +281,6 @@ func (p *http1PipelineConn) writeLoop() {
 				slog.String("target", exchange.info.target),
 				slog.Duration("queue_duration", time.Since(exchange.queuedAt)),
 			)
-			select {
-			case p.readQueue <- exchange:
-			case <-p.done:
-				exchange.release()
-				return
-			}
 		case <-p.done:
 			return
 		}
@@ -281,6 +298,10 @@ func (p *http1PipelineConn) readLoop() {
 		}
 		select {
 		case exchange := <-p.readQueue:
+			trace := httptrace.ContextClientTrace(exchange.request.Context())
+			if trace != nil && trace.GotFirstResponseByte != nil {
+				trace.GotFirstResponseByte()
+			}
 			response, err := p.readFinalResponse(exchange.request)
 			if err != nil {
 				exchange.result <- http1PipelineResult{err: err}

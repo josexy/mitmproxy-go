@@ -12,16 +12,17 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/josexy/mitmproxy-go"
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httputil"
 )
 
 const CHUNK_SIZE = 512
@@ -31,13 +32,209 @@ const (
 	CHUNK_TYPE_RSP
 )
 
+type headerBlockDump struct {
+	Kind       string             `json:"kind"`
+	ProtoMajor int                `json:"proto_major,omitempty"`
+	StatusCode int                `json:"status_code,omitempty"`
+	Truncated  bool               `json:"truncated,omitempty"`
+	Fields     []http.HeaderField `json:"fields"`
+}
+
+type http2FingerprintDump struct {
+	Canonical         string                          `json:"canonical"`
+	Hash              string                          `json:"hash"`
+	Settings          []http.Setting                  `json:"settings"`
+	WindowUpdate      uint32                          `json:"window_update"`
+	Priorities        []http.FingerprintPriority      `json:"priorities"`
+	HeaderPriority    *http.FingerprintHeaderPriority `json:"header_priority,omitempty"`
+	PseudoHeaderOrder []string                        `json:"pseudo_header_order"`
+}
+
+type wireProfileDump struct {
+	HeaderOrder             []string
+	TrailerOrder            []string
+	HeaderBlocks            []headerBlockDump
+	InitialHeaderFieldsSize int64
+	HTTP2Fingerprint        *http2FingerprintDump
+}
+
+type httpAttemptTiming struct {
+	Attempt           int
+	RequestStartedAt  time.Time
+	RequestEndedAt    time.Time
+	ResponseStartedAt time.Time
+	ResponseEndedAt   time.Time
+}
+
+type httpExchangeTimingLogger struct {
+	mu     sync.Mutex
+	timing httpAttemptTiming
+}
+
+func (l *httpExchangeTimingLogger) apply(event mitmproxy.HTTPExchangeTimingEvent) httpAttemptTiming {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.timing.Attempt != event.Attempt {
+		l.timing = httpAttemptTiming{Attempt: event.Attempt}
+	}
+	switch event.Phase {
+	case mitmproxy.HTTPExchangeRequestStarted:
+		l.timing.RequestStartedAt = event.Timestamp
+	case mitmproxy.HTTPExchangeRequestEnded:
+		l.timing.RequestEndedAt = event.Timestamp
+	case mitmproxy.HTTPExchangeResponseStarted:
+		l.timing.ResponseStartedAt = event.Timestamp
+	case mitmproxy.HTTPExchangeResponseEnded:
+		l.timing.ResponseEndedAt = event.Timestamp
+	}
+	return l.timing
+}
+
+func requestWireProfileDump(req *http.Request) wireProfileDump {
+	order := mitmproxy.RequestWireHeaderOrder(req)
+	blocks := mitmproxy.RequestWireHeaderBlocks(req)
+	dump := wireProfileDump{
+		HeaderOrder:             append([]string(nil), order.Headers...),
+		TrailerOrder:            append([]string(nil), order.Trailers...),
+		HeaderBlocks:            headerBlocksDump(blocks),
+		InitialHeaderFieldsSize: initialHeaderFieldsSize(blocks),
+	}
+	if fingerprint, ok := mitmproxy.RequestHTTP2Fingerprint(req); ok {
+		var headerPriority *http.FingerprintHeaderPriority
+		if fingerprint.HeaderPriority != nil {
+			cloned := *fingerprint.HeaderPriority
+			headerPriority = &cloned
+		}
+		dump.HTTP2Fingerprint = &http2FingerprintDump{
+			Canonical:         fingerprint.String(),
+			Hash:              fingerprint.Hash(),
+			Settings:          append([]http.Setting(nil), fingerprint.Settings...),
+			WindowUpdate:      fingerprint.WindowUpdate,
+			Priorities:        append([]http.FingerprintPriority(nil), fingerprint.Priorities...),
+			HeaderPriority:    headerPriority,
+			PseudoHeaderOrder: append([]string(nil), fingerprint.PseudoHeaderOrder...),
+		}
+	}
+	return dump
+}
+
+func responseWireProfileDump(response *http.Response) wireProfileDump {
+	order := mitmproxy.ResponseWireHeaderOrder(response)
+	blocks := mitmproxy.ResponseWireHeaderBlocks(response)
+	return wireProfileDump{
+		HeaderOrder:             append([]string(nil), order.Headers...),
+		TrailerOrder:            append([]string(nil), order.Trailers...),
+		HeaderBlocks:            headerBlocksDump(blocks),
+		InitialHeaderFieldsSize: initialHeaderFieldsSize(blocks),
+	}
+}
+
+// initialHeaderFieldsSize reports the decoded initial header field-line size:
+// sum of UTF-8 bytes in "name: value\r\n". It excludes the HTTP/1 start line,
+// the terminating empty line, trailers, HTTP/2 framing, and HPACK bytes.
+func initialHeaderFieldsSize(blocks []http.HeaderBlock) int64 {
+	for _, block := range blocks {
+		if block.Kind != http.HeaderBlockInitial {
+			continue
+		}
+		if block.Truncated {
+			return -1
+		}
+		var size int64
+		for _, field := range block.Fields {
+			size += int64(len(field.Name) + len(": ") + len(field.Value) + len("\r\n"))
+		}
+		return size
+	}
+	return -1
+}
+
+func headerBlocksDump(blocks []http.HeaderBlock) []headerBlockDump {
+	if len(blocks) == 0 {
+		return nil
+	}
+	dump := make([]headerBlockDump, len(blocks))
+	for i, block := range blocks {
+		dump[i] = headerBlockDump{
+			Kind:       headerBlockKindName(block.Kind),
+			ProtoMajor: block.ProtoMajor,
+			StatusCode: block.StatusCode,
+			Truncated:  block.Truncated,
+			Fields:     append([]http.HeaderField(nil), block.Fields...),
+		}
+	}
+	return dump
+}
+
+func headerBlockKindName(kind http.HeaderBlockKind) string {
+	switch kind {
+	case http.HeaderBlockInitial:
+		return "initial"
+	case http.HeaderBlockInformational:
+		return "informational"
+	case http.HeaderBlockTrailer:
+		return "trailer"
+	default:
+		return fmt.Sprintf("unknown(%d)", kind)
+	}
+}
+
+func logWireProfile(ctx context.Context, message, phase string, dump wireProfileDump) {
+	attrs := []slog.Attr{
+		slog.String("phase", phase),
+		slog.Any("header_order", dump.HeaderOrder),
+		slog.Any("trailer_order", dump.TrailerOrder),
+		slog.Any("header_blocks", dump.HeaderBlocks),
+		slog.Int64("initial_header_fields_size_bytes", dump.InitialHeaderFieldsSize),
+	}
+	if fingerprint := dump.HTTP2Fingerprint; fingerprint != nil {
+		attrs = append(attrs, slog.Group("http2_fingerprint",
+			slog.String("canonical", fingerprint.Canonical),
+			slog.String("hash", fingerprint.Hash),
+			slog.Any("settings", fingerprint.Settings),
+			slog.Uint64("window_update", uint64(fingerprint.WindowUpdate)),
+			slog.Any("priorities", fingerprint.Priorities),
+			slog.Any("header_priority", fingerprint.HeaderPriority),
+			slog.Any("pseudo_header_order", fingerprint.PseudoHeaderOrder),
+		))
+	}
+	slog.LogAttrs(ctx, slog.LevelDebug, message, attrs...)
+}
+
+type observedReadCloser struct {
+	io.ReadCloser
+	once   sync.Once
+	onDone func()
+}
+
+func (r *observedReadCloser) complete() {
+	r.once.Do(func() {
+		if r.onDone != nil {
+			r.onDone()
+		}
+	})
+}
+
+func (r *observedReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil {
+		r.complete()
+	}
+	return n, err
+}
+
+func (r *observedReadCloser) Close() error {
+	r.complete()
+	return r.ReadCloser.Close()
+}
+
 type bodyDecoder struct {
 	reader io.ReadCloser
 	pw     *io.PipeWriter
 }
 
 func newBodyDecoder(r io.ReadCloser, encoding string, chunkType int) (io.ReadCloser, error) {
-	if r == http.NoBody { // no body and no need to replace it
+	if r == nil || r == http.NoBody { // no body and no need to replace it
 		return r, nil
 	}
 	if encoding == "" {
@@ -138,6 +335,7 @@ func main() {
 		mitmproxy.WithCACertPath(caCertPath),
 		mitmproxy.WithCAKeyPath(caKeyPath),
 		mitmproxy.WithLogger(logger),
+		mitmproxy.WithUpstreamHTTPTrace(),
 		mitmproxy.WithHTTPInterceptor(httpInterceptor),
 		mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
 		mitmproxy.WithRawTCPInterceptor(rawTCPInterceptor),
@@ -210,6 +408,7 @@ func main() {
 }
 
 func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+	registerHTTPExchangeTimingLogger(ctx, req)
 	_md, _ := metadata.FromContext(ctx)
 	md := _md.MD()
 	slog.Debug("request",
@@ -251,7 +450,22 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 		)
 	}
 
-	req.Body, _ = newBodyDecoder(req.Body, req.Header.Get("Content-Encoding"), CHUNK_TYPE_REQ)
+	var err error
+	req.Body, err = newBodyDecoder(req.Body, req.Header.Get("Content-Encoding"), CHUNK_TYPE_REQ)
+	if err != nil {
+		return nil, err
+	}
+	logWireProfile(ctx, "request wire profile", "initial", requestWireProfileDump(req))
+	if req.Body == nil || req.Body == http.NoBody {
+		logWireProfile(ctx, "request wire profile", "complete", requestWireProfileDump(req))
+	} else {
+		req.Body = &observedReadCloser{
+			ReadCloser: req.Body,
+			onDone: func() {
+				logWireProfile(ctx, "request wire profile", "complete", requestWireProfileDump(req))
+			},
+		}
+	}
 
 	rsp, err := invoker.Invoke(req)
 	if err != nil {
@@ -277,8 +491,76 @@ func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.H
 	)
 
 	rsp.Body, err = newBodyDecoder(rsp.Body, rsp.Header.Get("Content-Encoding"), CHUNK_TYPE_RSP)
+	if err != nil {
+		return rsp, err
+	}
+	logWireProfile(ctx, "response wire profile", "initial", responseWireProfileDump(rsp))
+	if rsp.Body == nil || rsp.Body == http.NoBody {
+		logWireProfile(ctx, "response wire profile", "complete", responseWireProfileDump(rsp))
+	} else {
+		rsp.Body = &observedReadCloser{
+			ReadCloser: rsp.Body,
+			onDone: func() {
+				logWireProfile(ctx, "response wire profile", "complete", responseWireProfileDump(rsp))
+			},
+		}
+	}
 
-	return rsp, err
+	return rsp, nil
+}
+
+func registerHTTPExchangeTimingLogger(ctx context.Context, req *http.Request) {
+	method := req.Method
+	target := req.URL.String()
+	timingLogger := &httpExchangeTimingLogger{}
+	if mitmproxy.ObserveHTTPExchangeTiming(ctx, func(event mitmproxy.HTTPExchangeTimingEvent) {
+		timing := timingLogger.apply(event)
+		attrs := []slog.Attr{
+			slog.String("method", method),
+			slog.String("url", target),
+			slog.String("phase", string(event.Phase)),
+			slog.Int("attempt", event.Attempt),
+			slog.Time("event_at", event.Timestamp),
+			slog.Bool("complete", event.Complete),
+		}
+		if event.Error != nil {
+			attrs = append(attrs, slog.String("error", event.Error.Error()))
+		}
+		attrs = appendHTTPAttemptTimingAttrs(attrs, timing)
+		slog.LogAttrs(ctx, slog.LevelDebug, "upstream HTTP timing", attrs...)
+	}) {
+		return
+	}
+	slog.WarnContext(ctx, "upstream HTTP timing unavailable",
+		slog.String("method", method),
+		slog.String("url", target),
+		slog.String("hint", "enable mitmproxy.WithUpstreamHTTPTrace()"),
+	)
+}
+
+func appendHTTPAttemptTimingAttrs(attrs []slog.Attr, timing httpAttemptTiming) []slog.Attr {
+	attrs = appendOptionalTimeAttr(attrs, "request_started_at", timing.RequestStartedAt)
+	attrs = appendOptionalTimeAttr(attrs, "request_ended_at", timing.RequestEndedAt)
+	attrs = appendOptionalDurationAttr(attrs, "request_duration", timing.RequestStartedAt, timing.RequestEndedAt)
+	attrs = appendOptionalTimeAttr(attrs, "response_started_at", timing.ResponseStartedAt)
+	attrs = appendOptionalTimeAttr(attrs, "response_ended_at", timing.ResponseEndedAt)
+	attrs = appendOptionalDurationAttr(attrs, "response_duration", timing.ResponseStartedAt, timing.ResponseEndedAt)
+	attrs = appendOptionalDurationAttr(attrs, "wait_duration", timing.RequestEndedAt, timing.ResponseStartedAt)
+	return appendOptionalDurationAttr(attrs, "total_duration", timing.RequestStartedAt, timing.ResponseEndedAt)
+}
+
+func appendOptionalTimeAttr(attrs []slog.Attr, name string, value time.Time) []slog.Attr {
+	if value.IsZero() {
+		return attrs
+	}
+	return append(attrs, slog.Time(name, value))
+}
+
+func appendOptionalDurationAttr(attrs []slog.Attr, name string, start, end time.Time) []slog.Attr {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return attrs
+	}
+	return append(attrs, slog.Duration(name, end.Sub(start)))
 }
 
 func durationBetween(start, end time.Time) time.Duration {
@@ -334,6 +616,8 @@ func rawTCPSourceName(source mitmproxy.RawTCPTunnelSource) string {
 func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
 	_md, _ := metadata.FromContext(ctx)
 	md := _md.MD()
+	requestProfile := requestWireProfileDump(req)
+	responseProfile := responseWireProfileDump(rsp)
 	slog.Debug("request",
 		slog.Bool("stream_body", md.StreamBody),
 		slog.String("local_source", md.LocalAddrInfo.SourceAddr.String()),
@@ -348,6 +632,13 @@ func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Resp
 		slog.Int("status_code", rsp.StatusCode),
 		slog.Any("request_headers", map[string][]string(req.Header)),
 		slog.Any("response_headers", map[string][]string(rsp.Header)),
+	)
+	logWireProfile(ctx, "websocket request wire profile", "complete", requestProfile)
+	logWireProfile(ctx, "websocket response wire profile", "complete", responseProfile)
+	logWebsocketHandshakeMetrics(
+		ctx,
+		requestProfile.InitialHeaderFieldsSize,
+		responseProfile.InitialHeaderFieldsSize,
 	)
 
 	data, _ := httputil.DumpRequest(req, false)
@@ -398,6 +689,28 @@ func websocketInterceptor(ctx context.Context, req *http.Request, rsp *http.Resp
 			frame.Release()
 		}
 	}
+}
+
+func logWebsocketHandshakeMetrics(ctx context.Context, requestHeaderSize, responseHeaderSize int64) {
+	attrs := []slog.Attr{
+		slog.Int64("request_header_fields_size_bytes", requestHeaderSize),
+		slog.Int64("response_header_fields_size_bytes", responseHeaderSize),
+	}
+	timing, ok := mitmproxy.WebsocketHandshakeTimingFromContext(ctx)
+	attrs = append(attrs, slog.Bool("timing_available", ok))
+	if ok {
+		attrs = append(attrs,
+			slog.Time("request_started_at", timing.RequestStartedAt),
+			slog.Time("request_ended_at", timing.RequestEndedAt),
+			slog.Duration("request_duration", durationBetween(timing.RequestStartedAt, timing.RequestEndedAt)),
+			slog.Time("response_started_at", timing.ResponseStartedAt),
+			slog.Time("response_ended_at", timing.ResponseEndedAt),
+			slog.Duration("response_duration", durationBetween(timing.ResponseStartedAt, timing.ResponseEndedAt)),
+			slog.Duration("wait_duration", durationBetween(timing.RequestEndedAt, timing.ResponseStartedAt)),
+			slog.Duration("total_duration", durationBetween(timing.RequestStartedAt, timing.ResponseEndedAt)),
+		)
+	}
+	slog.LogAttrs(ctx, slog.LevelDebug, "websocket handshake metrics", attrs...)
 }
 
 func getDecodedReader(r io.Reader, encoding string) (io.ReadCloser, error) {

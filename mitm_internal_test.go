@@ -6,10 +6,10 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,14 +17,36 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/internal/cert"
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/internal/cert"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 type flushingResponseWriter struct {
 	header  http.Header
 	body    bytes.Buffer
 	flushes int
+}
+
+func TestBiConnContextTransportSwap(t *testing.T) {
+	connCtx := &biConnContext{}
+	first := &singleConnTransport{hostport: "first.test:443"}
+	second := &singleConnTransport{hostport: "second.test:443"}
+
+	if previous := connCtx.setTransport(first); previous != nil {
+		t.Fatalf("initial previous transport = %p, want nil", previous)
+	}
+	if current := connCtx.currentTransport(); current != first {
+		t.Fatalf("current transport = %p, want %p", current, first)
+	}
+	if previous := connCtx.setTransport(second); previous != first {
+		t.Fatalf("replaced transport = %p, want %p", previous, first)
+	}
+	if previous := connCtx.setTransport(nil); previous != second {
+		t.Fatalf("cleared transport = %p, want %p", previous, second)
+	}
+	if current := connCtx.currentTransport(); current != nil {
+		t.Fatalf("transport after clear = %p, want nil", current)
+	}
 }
 
 type immediateReadErrorConn struct {
@@ -792,10 +814,9 @@ func testRuntimeConfig(t *testing.T) *runtimeConfig {
 func newHTTP2HandlerTestContext(cfg *runtimeConfig, hostport string, transport *singleConnTransport) context.Context {
 	ctx := AppendToRequestContext(context.Background(), ReqContext{Hostport: hostport})
 	ctx = metadata.AppendToContext(ctx, metadata.NewMD())
-	return context.WithValue(ctx, connContextKey, &biConnContext{
-		config:    cfg,
-		transport: transport,
-	})
+	connCtx := &biConnContext{config: cfg}
+	connCtx.setTransport(transport)
+	return context.WithValue(ctx, connContextKey, connCtx)
 }
 
 func TestDialTCPWithMetadataRefreshesCurrentAndBaseRemoteMetadata(t *testing.T) {

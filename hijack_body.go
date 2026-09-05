@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"io"
 	"net"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -47,7 +47,7 @@ type hijackedRequestBody struct {
 }
 
 // rebindRequestBodyAfterHijack replaces the server-owned request body with one
-// that reads from the bufio.Reader returned by Hijack. The net/http contract
+// that reads from the bufio.Reader returned by Hijack. The xhttp contract
 // forbids using the original Request.Body after Hijack. This requires the proxy
 // handler to receive the request before middleware consumes or replaces Body.
 func rebindRequestBodyAfterHijack(req *http.Request, conn net.Conn, rw *bufio.ReadWriter) (*http.Request, net.Conn, error) {
@@ -73,6 +73,25 @@ func rebindRequestBodyAfterHijack(req *http.Request, conn net.Conn, rw *bufio.Re
 	req.TransferEncoding = append([]string(nil), parsed.TransferEncoding...)
 	req.Trailer = parsed.Trailer
 	req.GetBody = nil
+	// Keep the real initial headers, but obtain late trailers from the parser
+	// that now owns the body after Hijack.
+	profile := requestWireProfileFromRequest(ensureRequestWireProfile(req))
+	reboundProfile := *profile
+	reboundProfile.blocks = func() []http.HeaderBlock {
+		var blocks []http.HeaderBlock
+		for _, block := range profile.blocks() {
+			if block.Kind != http.HeaderBlockTrailer {
+				blocks = append(blocks, block)
+			}
+		}
+		for _, block := range http.RequestHeaderBlocks(parsed) {
+			if block.Kind == http.HeaderBlockTrailer {
+				blocks = append(blocks, block)
+			}
+		}
+		return blocks
+	}
+	req = withRequestWireProfile(req, &reboundProfile)
 	req = prepareHijackedRequestBody(req, parsed, conn)
 
 	return req, &bufConnExt{Conn: conn, Reader: reader}, nil

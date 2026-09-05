@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/internal/cache"
-	"github.com/josexy/mitmproxy-go/internal/cert"
+	"github.com/josexy/mitmproxy-go/v2/internal/cache"
+	"github.com/josexy/mitmproxy-go/v2/internal/cert"
 )
 
 var errNoPriKey = errors.New("no available private key")

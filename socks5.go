@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/josexy/mitmproxy-go/buf"
+	"github.com/josexy/mitmproxy-go/v2/buf"
 )
 
 var (

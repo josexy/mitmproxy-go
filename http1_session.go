@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/josexy/xhttp"
 	"log/slog"
 	"net"
-	"net/http"
 	"sync"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 type http1SessionResult struct {

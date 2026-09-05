@@ -5,6 +5,8 @@ An easy-to-use and flexible MITM proxy library for Go. It can intercept and insp
 ## Features
 
 - HTTP/1.1 keep-alive and end-to-end pipelining, HTTP/2 over TLS, and h2c support
+- Wire-order preservation for HTTP/1 and HTTP/2 request/response headers and trailers
+- HTTP/2 SETTINGS, connection WINDOW_UPDATE, standalone PRIORITY, HEADERS priority, and pseudo-header fingerprint mirroring
 - HTTPS interception with custom CA certificates
 - WebSocket and secure WebSocket interception
 - Pre-relay observation for classified raw TCP tunnels without exposing payloads
@@ -20,8 +22,10 @@ An easy-to-use and flexible MITM proxy library for Go. It can intercept and insp
 
 ## Installation
 
+Requires Go 1.27 or later.
+
 ```bash
-go get github.com/josexy/mitmproxy-go
+go get github.com/josexy/mitmproxy-go/v2
 ```
 
 ## Prerequisites
@@ -55,9 +59,9 @@ package main
 import (
 	"fmt"
 	"log"
-	"net/http"
+	"github.com/josexy/xhttp"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func main() {
@@ -83,9 +87,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"github.com/josexy/xhttp"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
@@ -109,6 +113,54 @@ handler, err := mitmproxy.NewMitmProxyHandler(
 )
 ```
 
+### Upstream HTTP Timing
+
+Upstream timing is opt-in. Add `WithUpstreamHTTPTrace()` to enable the shared
+`httptrace.ClientTrace` instrumentation for ordinary HTTP exchanges and
+WebSocket opening handshakes. Register an HTTP observer inside the interceptor,
+before calling `invoker.Invoke`:
+
+```go
+func timedHTTPInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
+	ok := mitmproxy.ObserveHTTPExchangeTiming(ctx, func(event mitmproxy.HTTPExchangeTimingEvent) {
+		log.Printf(
+			"phase=%s attempt=%d at=%s complete=%t err=%v",
+			event.Phase,
+			event.Attempt,
+			event.Timestamp.Format(time.RFC3339Nano),
+			event.Complete,
+			event.Error,
+		)
+	})
+	if !ok {
+		log.Print("upstream timing is disabled")
+	}
+	return invoker.Invoke(req)
+}
+
+handler, err := mitmproxy.NewMitmProxyHandler(
+	mitmproxy.WithCACertPath("certs/ca.crt"),
+	mitmproxy.WithCAKeyPath("certs/ca.key"),
+	mitmproxy.WithUpstreamHTTPTrace(),
+	mitmproxy.WithHTTPInterceptor(timedHTTPInterceptor),
+)
+```
+
+The phases have the following origin-facing meanings:
+
+- `request_started`: immediately before the first final upstream transport invocation; a transparent retry starts before its backoff, connection acquisition, and writes, including retries that fail before writing headers.
+- `request_ended`: the transport's `WroteRequest` callback, or the invocation error fallback when no callback was delivered.
+- `response_started`: the transport's `GotFirstResponseByte` callback, with response-header return as a fallback for custom transports.
+- `response_ended`: upstream response Body EOF, Body error, or early Close; bodyless responses end when their headers have been returned.
+
+`Attempt` starts at 1 and increments for transparent retries. Superseded-attempt
+callbacks are ignored. `Complete` is meaningful on terminal events and is false
+for write/read errors or an early response Body close. Response completion can
+happen after the interceptor has returned, and callbacks can arrive from
+different goroutines, so observers must be concurrency-safe and return quickly.
+The dumper example shows how to aggregate the four timestamps and derive request,
+wait, response, and total durations.
+
 ### WebSocket Interceptor
 
 ```go
@@ -117,13 +169,22 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
+	"github.com/josexy/xhttp"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func websocketInterceptor(ctx context.Context, req *http.Request, resp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
 	log.Printf("websocket upgrade %s -> %d", req.URL.String(), resp.StatusCode)
+	if timing, ok := mitmproxy.WebsocketHandshakeTimingFromContext(ctx); ok {
+		log.Printf(
+			"upstream handshake request=%s wait=%s response=%s total=%s",
+			timing.RequestEndedAt.Sub(timing.RequestStartedAt),
+			timing.ResponseStartedAt.Sub(timing.RequestEndedAt),
+			timing.ResponseEndedAt.Sub(timing.ResponseStartedAt),
+			timing.ResponseEndedAt.Sub(timing.RequestStartedAt),
+		)
+	}
 
 	for {
 		select {
@@ -143,10 +204,16 @@ func websocketInterceptor(ctx context.Context, req *http.Request, resp *http.Res
 }
 ```
 
+`WebsocketHandshakeTimingFromContext` describes the successful upstream opening
+handshake only. It is available when `WithUpstreamHTTPTrace()` is enabled and
+does not include the lifetime of the upgraded connection or any WebSocket
+message/frame processing.
+
 ```go
 handler, err := mitmproxy.NewMitmProxyHandler(
 	mitmproxy.WithCACertPath("certs/ca.crt"),
 	mitmproxy.WithCAKeyPath("certs/ca.key"),
+	mitmproxy.WithUpstreamHTTPTrace(),
 	mitmproxy.WithWebsocketInterceptor(websocketInterceptor),
 )
 ```
@@ -162,7 +229,7 @@ import (
 	"log"
 	"net"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func main() {
@@ -249,6 +316,16 @@ mitmproxy.WithCertCachePool(2048, 30, 15)
 ```
 
 HTTPS and WSS interception automatically captures the client's TLS ClientHello, fingerprints it with uTLS (`github.com/refraction-networking/utls`), patches SNI/ALPN for the target server, and uses that spec for the upstream TLS handshake. `WithDisableHTTP2` also removes `h2` from mirrored ALPN protocols.
+
+For HTTP/2, the proxy captures the client's ordered SETTINGS values, initial connection WINDOW_UPDATE, pre-request standalone PRIORITY frames, priority carried by each request's initial HEADERS frame, and per-request pseudo-header order. It replays the connection-level fingerprint, pseudo-header order, and HEADERS priority that depends on the connection root (stream 0). A captured non-root HEADERS dependency remains available as structured request metadata but is not copied to the upstream hop, because HTTP/2 stream IDs are scoped to each connection and require explicit translation. The canonical four-part fingerprint string/hash contains only standalone PRIORITY frames. Connections with different connection-level fingerprints use separate upstream HTTP/2 pool entries; initial headers and trailers preserve their observed wire order for both HTTP/1 and HTTP/2.
+
+Request trailer order is resolved after the streaming body reaches EOF, not from
+the earlier `Trailer` declaration. Declare request trailer names in the initial
+headers so the upstream writer can arrange to send them after the body. Before
+EOF, `RequestWireHeaderOrder` can only report the declaration order; after EOF,
+`RequestWireHeaderOrder` and `RequestWireHeaderBlocks` expose the actual received
+trailer block. These snapshots retain inbound metadata even when an interceptor
+edits the outgoing headers.
 
 `WithCertCachePool(capacity, intervalSecond, expireSecond)` configures the generated certificate cache. `capacity` must be a multiple of 256 when it is set; the interval and expiration values are seconds.
 
@@ -386,11 +463,11 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"net/http"
+	"github.com/josexy/xhttp"
 	"time"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
-	"github.com/josexy/mitmproxy-go/metadata"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
@@ -469,6 +546,8 @@ go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode 
 # SOCKS5 proxy mode
 go run ./examples/dumper/main.go -cacert certs/ca.crt -cakey certs/ca.key -mode socks5 -port 10086
 ```
+
+The dumper logs ordered HTTP/1 and HTTP/2 header blocks, decoded initial header field-line sizes, late trailer blocks, canonical four-part HTTP/2 fingerprints and hashes, separate standalone and HEADERS priority metadata, TLS negotiation/certificate metadata, bodies, per-attempt upstream HTTP timing, WebSocket opening-handshake timing, WebSocket frames, and raw TCP tunnel metadata. Header field-line sizes exclude HTTP/1 start lines and terminating empty lines as well as HTTP/2 framing and HPACK bytes. WebSocket frames are reported separately and are not included in opening-handshake timing or header sizes.
 
 ### Modify Content
 

@@ -3,10 +3,10 @@ package mitmproxy
 import (
 	"bufio"
 	"context"
+	"github.com/josexy/xhttp"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -364,10 +364,17 @@ func newBufioReader(conn net.Conn) *bufio.Reader {
 func requireLogMessage(t *testing.T, sink *captureLogSink, message string) capturedLogRecord {
 	t.Helper()
 	want := logMessage(message)
-	for _, record := range sink.recordsSnapshot() {
-		if record.message == want {
-			return record
+	deadline := time.Now().Add(time.Second)
+	for {
+		for _, record := range sink.recordsSnapshot() {
+			if record.message == want {
+				return record
+			}
 		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("missing log message %q; records = %#v", want, sink.recordsSnapshot())
 	return capturedLogRecord{}

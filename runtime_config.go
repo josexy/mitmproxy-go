@@ -68,15 +68,16 @@ type ResourceLimitedDynamicMitmProxyHandler interface {
 type runtimeConfigState struct {
 	streamBaseCtx context.Context
 
-	proxy         string
-	skipVerifySSL bool
-	disableHTTP2  bool
-	disableProxy  bool
-	includeHosts  []string
-	excludeHosts  []string
-	rootCAs       []string
-	dialer        *net.Dialer
-	logger        *slog.Logger
+	proxy             string
+	skipVerifySSL     bool
+	disableHTTP2      bool
+	disableProxy      bool
+	upstreamHTTPTrace bool
+	includeHosts      []string
+	excludeHosts      []string
+	rootCAs           []string
+	dialer            *net.Dialer
+	logger            *slog.Logger
 
 	idleConnTimeout       time.Duration
 	handshakeTimeout      time.Duration
@@ -115,6 +116,7 @@ func newRuntimeConfigStateFromOptions(opts *options) runtimeConfigState {
 		skipVerifySSL:         opts.skipVerifySSL,
 		disableHTTP2:          opts.disableHTTP2,
 		disableProxy:          opts.disableProxy,
+		upstreamHTTPTrace:     opts.upstreamHTTPTrace,
 		includeHosts:          slices.Clone(opts.includeHosts),
 		excludeHosts:          slices.Clone(opts.excludeHosts),
 		rootCAs:               slices.Clone(opts.rootCAs),

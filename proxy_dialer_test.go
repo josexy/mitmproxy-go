@@ -5,17 +5,17 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 func TestHostPortNoPort(t *testing.T) {

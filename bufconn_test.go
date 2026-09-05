@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	mitmbuf "github.com/josexy/mitmproxy-go/buf"
+	mitmbuf "github.com/josexy/mitmproxy-go/v2/buf"
 )
 
 func TestBoundedHTTPRequestReaderRejectsOversizedHeader(t *testing.T) {
