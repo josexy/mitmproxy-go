@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/buf"
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/buf"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 func TestParseAddressForSocks5(t *testing.T) {

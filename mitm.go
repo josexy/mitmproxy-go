@@ -22,10 +22,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/buf"
-	"github.com/josexy/mitmproxy-go/internal/cert"
-	"github.com/josexy/mitmproxy-go/internal/iocopy"
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/buf"
+	"github.com/josexy/mitmproxy-go/v2/internal/cert"
+	"github.com/josexy/mitmproxy-go/v2/internal/iocopy"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 	"github.com/josexy/websocket"
 	"github.com/josexy/xhttp/httptrace"
 	utls "github.com/refraction-networking/utls"
@@ -1716,6 +1716,7 @@ type http1ResponseWriter struct {
 	buf        []byte
 	order      []string
 	response   *http.Response
+	request    *http.Request
 	chunked    bool
 	chunkState uint8
 	chunkLeft  int64
@@ -1744,6 +1745,9 @@ func (w *http1ResponseWriter) Write(data []byte) (int, error) {
 		pending := w.buf
 		w.buf = nil
 		headerEnd := index + len("\r\n\r\n")
+		if w.request != nil {
+			w.chunked = bytes.Contains(bytes.ToLower(pending[:headerEnd]), []byte("\r\ntransfer-encoding: chunked\r\n"))
+		}
 		header := reorderHTTP1ResponseHeader(pending[:headerEnd], index, w.order)
 		if err := writeAll(w.dst, header); err != nil {
 			return 0, err
@@ -1900,6 +1904,12 @@ func (w *http1ResponseWriter) writeAfterHeader(data []byte) error {
 		case http1ChunkTrailers:
 			w.chunkBuf = append(w.chunkBuf, data...)
 			data = nil
+			if bytes.HasPrefix(w.chunkBuf, []byte("\r\n")) {
+				pending := w.chunkBuf
+				w.chunkBuf = nil
+				w.chunkState = http1ChunkDone
+				return writeAll(w.dst, pending)
+			}
 			index := bytes.Index(w.chunkBuf, []byte("\r\n\r\n"))
 			if index < 0 {
 				if len(w.chunkBuf) > maxBufferedResponseHeaderBytes {
@@ -1911,6 +1921,9 @@ func (w *http1ResponseWriter) writeAfterHeader(data []byte) error {
 				return nil
 			}
 			order := responseHeaderOrder(w.response).Trailers
+			if w.request != nil {
+				order = RequestWireHeaderOrder(w.request).Trailers
+			}
 			trailers := reorderHTTP1TrailerBlock(w.chunkBuf, index, order)
 			w.chunkBuf = nil
 			w.chunkState = http1ChunkDone
@@ -2452,7 +2465,12 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	}
 	resp.Request = reqCtx.Request
 	sanitizeWebsocketUpgradeHeaders(resp.Header)
-	wsSrcConn, err := websocket.UpgradeWithPreparedResponseAndNetConn(resp, srcConn)
+	upgradeResponse, err := websocketResponseForUpgrade(resp)
+	if err != nil {
+		wsDstConn.Close()
+		return err
+	}
+	wsSrcConn, err := websocket.UpgradeWithPreparedResponseAndNetConn(upgradeResponse, srcConn)
 	if err != nil {
 		wsDstConn.Close()
 		return err

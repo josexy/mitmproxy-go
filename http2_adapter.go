@@ -32,7 +32,16 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 		order.Headers = append(pseudos, order.Headers...)
 	}
 	var err error
-	if len(order.Headers) > 0 || len(order.Trailers) > 0 {
+	if len(preparedReq.Trailer) > 0 {
+		headerOrder := order.Headers
+		if profile != nil && profile.fingerprint != nil {
+			headerOrder = append(compatiblePseudoHeaderOrder(preparedReq, profile.fingerprint.PseudoHeaderOrder), headerOrder...)
+		}
+		preparedReq, err = withHTTP2RequestTrailers(preparedReq, headerOrder)
+		if err != nil {
+			return nil, fmt.Errorf("apply HTTP/2 streaming trailers: %w", err)
+		}
+	} else if len(order.Headers) > 0 || len(order.Trailers) > 0 {
 		preparedReq, err = http.WithRequestHeaderOrder(preparedReq, order)
 		if err != nil {
 			return nil, fmt.Errorf("apply HTTP/2 header order: %w", err)
@@ -68,10 +77,15 @@ func compatiblePseudoHeaderOrder(req *http.Request, captured []string) []string 
 	}
 	required := map[string]bool{":authority": true, ":method": true}
 	defaults := []string{":authority", ":method"}
-	if method != http.MethodConnect {
+	protocol := req.Header.Get(":protocol")
+	if method != http.MethodConnect || protocol != "" {
 		required[":path"] = true
 		required[":scheme"] = true
 		defaults = append(defaults, ":path", ":scheme")
+	}
+	if protocol != "" {
+		required[":protocol"] = true
+		defaults = append(defaults, ":protocol")
 	}
 
 	result := make([]string, 0, len(required))

@@ -120,7 +120,7 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 			t.discardClientConn(req.Context(), clientConn, shouldCloseDiscardedClientConn(clientConn, err))
 		}
 		if retry {
-			req = nextReq
+			req = traceHTTPRetry(nextReq, err)
 			continue
 		}
 		return nil, err
@@ -171,7 +171,7 @@ func (t *singleConnTransport) roundTripHTTP2(req *http.Request) (*http.Response,
 			return nil, returnErr
 		}
 
-		preparedReq = retryReq
+		preparedReq = traceHTTPRetry(retryReq, err)
 		if attempt == 0 {
 			continue
 		}
@@ -271,7 +271,11 @@ func (t *singleConnTransport) getHTTP2ClientConn(ctx context.Context, req *http.
 }
 
 func (t *singleConnTransport) shouldUseHTTP1Pipeline(req *http.Request) bool {
-	if t.pipelineDepth < 1 || req == nil || req.URL == nil || req.ProtoMajor != 1 {
+	if req == nil || req.URL == nil || (req.ProtoMajor != 1 && len(req.Trailer) == 0) {
+		return false
+	}
+	// Even in serial mode, use our streaming writer for late trailer order.
+	if t.pipelineDepth < 1 && len(req.Trailer) == 0 {
 		return false
 	}
 	if req.URL.Scheme == "http" {
@@ -315,7 +319,7 @@ func (t *singleConnTransport) roundTripHTTP1(req *http.Request) (*http.Response,
 			errorAttr(err),
 		)
 		if retry {
-			req = nextReq
+			req = traceHTTPRetry(nextReq, err)
 			continue
 		}
 		return nil, err

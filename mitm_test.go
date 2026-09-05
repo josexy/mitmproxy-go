@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmproxy-go"
-	"github.com/josexy/mitmproxy-go/internal/cert"
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2"
+	"github.com/josexy/mitmproxy-go/v2/internal/cert"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 var (

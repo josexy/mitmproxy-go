@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 type http1SessionResult struct {

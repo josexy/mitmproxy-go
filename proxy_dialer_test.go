@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 func TestHostPortNoPort(t *testing.T) {

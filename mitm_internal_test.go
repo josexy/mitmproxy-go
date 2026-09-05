@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/internal/cert"
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2/internal/cert"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 type flushingResponseWriter struct {

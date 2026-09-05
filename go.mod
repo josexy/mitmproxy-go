@@ -1,4 +1,4 @@
-module github.com/josexy/mitmproxy-go
+module github.com/josexy/mitmproxy-go/v2
 
 go 1.27.0
 

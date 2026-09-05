@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/josexy/mitmproxy-go/internal/cert"
+	"github.com/josexy/mitmproxy-go/v2/internal/cert"
 )
 
 func TestNewDynamicMitmProxyHandler(t *testing.T) {

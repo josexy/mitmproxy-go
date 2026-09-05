@@ -8,7 +8,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/josexy/mitmproxy-go/buf"
+	"github.com/josexy/mitmproxy-go/v2/buf"
 	"github.com/josexy/websocket"
 )
 

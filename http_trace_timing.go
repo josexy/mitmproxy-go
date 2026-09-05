@@ -36,6 +36,7 @@ type HTTPExchangeTimingEvent struct {
 }
 
 type httpExchangeTimingContextKey struct{}
+type httpTraceAttemptContextKey struct{}
 
 type httpExchangeTiming struct {
 	mu              sync.Mutex
@@ -98,17 +99,35 @@ func (t *httpExchangeTiming) startAttempt() int {
 }
 
 func (t *httpExchangeTiming) traceRequest(request *http.Request) (*http.Request, *httpTraceAttempt) {
-	attempt := &httpTraceAttempt{timing: t, attempt: t.startAttempt()}
+	attempt := &httpTraceAttempt{timing: t}
+	request = request.WithContext(context.WithValue(request.Context(), httpTraceAttemptContextKey{}, attempt))
+	return attempt.traceRequest(request), attempt
+}
+
+func (a *httpTraceAttempt) traceRequest(request *http.Request) *http.Request {
+	attempt := a.timing.startAttempt()
+	a.attempt.Store(int64(attempt))
 	trace := &httptrace.ClientTrace{
-		WroteHeaders: attempt.wroteHeaders,
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
-			t.requestFinished(attempt.current(), info.Err)
+			a.timing.requestFinished(attempt, info.Err)
 		},
 		GotFirstResponseByte: func() {
-			t.responseFirstByte(attempt.current())
+			a.timing.responseFirstByte(attempt)
 		},
 	}
-	return request.WithContext(httptrace.WithClientTrace(request.Context(), trace)), attempt
+	return request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
+}
+
+// Start the replacement attempt before backoff, connection acquisition or any
+// writes. Each trace captures its own attempt ID, so late callbacks from an
+// earlier connection cannot be attributed to the replacement request.
+func traceHTTPRetry(request *http.Request, previousErr error) *http.Request {
+	state, _ := request.Context().Value(httpTraceAttemptContextKey{}).(*httpTraceAttempt)
+	if state == nil {
+		return request
+	}
+	state.timing.requestFinished(state.current(), previousErr)
+	return state.traceRequest(request)
 }
 
 func (t *httpExchangeTiming) requestFinished(attempt int, writeErr error) {
@@ -232,27 +251,12 @@ func (t *httpExchangeTiming) notify(observers []func(HTTPExchangeTimingEvent), e
 }
 
 type httpTraceAttempt struct {
-	mu             sync.Mutex
-	timing         *httpExchangeTiming
-	attempt        int
-	headersWritten bool
+	timing  *httpExchangeTiming
+	attempt atomic.Int64
 }
 
 func (a *httpTraceAttempt) current() int {
-	a.mu.Lock()
-	attempt := a.attempt
-	a.mu.Unlock()
-	return attempt
-}
-
-func (a *httpTraceAttempt) wroteHeaders() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !a.headersWritten {
-		a.headersWritten = true
-		return
-	}
-	a.attempt = a.timing.startAttempt()
+	return int(a.attempt.Load())
 }
 
 type httpTimingResponseBody struct {

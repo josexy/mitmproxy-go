@@ -7,7 +7,7 @@ import (
 
 	"github.com/josexy/xhttp"
 
-	"github.com/josexy/mitmproxy-go/buf"
+	"github.com/josexy/mitmproxy-go/v2/buf"
 )
 
 type websocketHandshakeTimingContextKey struct{}

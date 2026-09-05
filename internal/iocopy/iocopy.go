@@ -3,7 +3,7 @@ package iocopy
 import (
 	"io"
 
-	"github.com/josexy/mitmproxy-go/buf"
+	"github.com/josexy/mitmproxy-go/v2/buf"
 )
 
 const maxTcpBufferSize = 16 * 1024

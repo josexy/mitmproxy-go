@@ -22,8 +22,10 @@ An easy-to-use and flexible MITM proxy library for Go. It can intercept and insp
 
 ## Installation
 
+Requires Go 1.27 or later.
+
 ```bash
-go get github.com/josexy/mitmproxy-go
+go get github.com/josexy/mitmproxy-go/v2
 ```
 
 ## Prerequisites
@@ -59,7 +61,7 @@ import (
 	"log"
 	"github.com/josexy/xhttp"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func main() {
@@ -87,7 +89,7 @@ import (
 	"fmt"
 	"github.com/josexy/xhttp"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
@@ -146,7 +148,7 @@ handler, err := mitmproxy.NewMitmProxyHandler(
 
 The phases have the following origin-facing meanings:
 
-- `request_started`: immediately before the first final upstream transport invocation; a transparent retry starts when the transport begins its replacement header write.
+- `request_started`: immediately before the first final upstream transport invocation; a transparent retry starts before its backoff, connection acquisition, and writes, including retries that fail before writing headers.
 - `request_ended`: the transport's `WroteRequest` callback, or the invocation error fallback when no callback was delivered.
 - `response_started`: the transport's `GotFirstResponseByte` callback, with response-header return as a fallback for custom transports.
 - `response_ended`: upstream response Body EOF, Body error, or early Close; bodyless responses end when their headers have been returned.
@@ -169,7 +171,7 @@ import (
 	"log"
 	"github.com/josexy/xhttp"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func websocketInterceptor(ctx context.Context, req *http.Request, resp *http.Response, fw mitmproxy.WebsocketFramesWatcher) {
@@ -227,7 +229,7 @@ import (
 	"log"
 	"net"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func main() {
@@ -316,6 +318,14 @@ mitmproxy.WithCertCachePool(2048, 30, 15)
 HTTPS and WSS interception automatically captures the client's TLS ClientHello, fingerprints it with uTLS (`github.com/refraction-networking/utls`), patches SNI/ALPN for the target server, and uses that spec for the upstream TLS handshake. `WithDisableHTTP2` also removes `h2` from mirrored ALPN protocols.
 
 For HTTP/2, the proxy captures the client's ordered SETTINGS values, initial connection WINDOW_UPDATE, pre-request standalone PRIORITY frames, priority carried by each request's initial HEADERS frame, and per-request pseudo-header order. It replays the connection-level fingerprint, pseudo-header order, and HEADERS priority that depends on the connection root (stream 0). A captured non-root HEADERS dependency remains available as structured request metadata but is not copied to the upstream hop, because HTTP/2 stream IDs are scoped to each connection and require explicit translation. The canonical four-part fingerprint string/hash contains only standalone PRIORITY frames. Connections with different connection-level fingerprints use separate upstream HTTP/2 pool entries; initial headers and trailers preserve their observed wire order for both HTTP/1 and HTTP/2.
+
+Request trailer order is resolved after the streaming body reaches EOF, not from
+the earlier `Trailer` declaration. Declare request trailer names in the initial
+headers so the upstream writer can arrange to send them after the body. Before
+EOF, `RequestWireHeaderOrder` can only report the declaration order; after EOF,
+`RequestWireHeaderOrder` and `RequestWireHeaderBlocks` expose the actual received
+trailer block. These snapshots retain inbound metadata even when an interceptor
+edits the outgoing headers.
 
 `WithCertCachePool(capacity, intervalSecond, expireSecond)` configures the generated certificate cache. `capacity` must be a multiple of 256 when it is set; the interval and expiration values are seconds.
 
@@ -456,8 +466,8 @@ import (
 	"github.com/josexy/xhttp"
 	"time"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
-	"github.com/josexy/mitmproxy-go/metadata"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 )
 
 func httpInterceptor(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {

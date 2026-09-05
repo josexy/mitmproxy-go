@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/josexy/mitmproxy-go"
-	"github.com/josexy/mitmproxy-go/metadata"
+	"github.com/josexy/mitmproxy-go/v2"
+	"github.com/josexy/mitmproxy-go/v2/metadata"
 	http "github.com/josexy/xhttp"
 	"github.com/josexy/xhttp/httputil"
 )

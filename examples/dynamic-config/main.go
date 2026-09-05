@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	mitmproxy "github.com/josexy/mitmproxy-go"
+	mitmproxy "github.com/josexy/mitmproxy-go/v2"
 )
 
 func main() {

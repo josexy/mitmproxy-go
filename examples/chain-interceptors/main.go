@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/josexy/mitmproxy-go"
+	"github.com/josexy/mitmproxy-go/v2"
 )
 
 func main() {

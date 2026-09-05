@@ -254,7 +254,7 @@ func requestHeaderOrder(req *http.Request) http.HeaderOrder {
 	}
 	return http.HeaderOrder{
 		Headers:  headers,
-		Trailers: append([]string(nil), profile.trailerOrder...),
+		Trailers: RequestWireHeaderOrder(req).Trailers,
 	}
 }
 
@@ -322,14 +322,17 @@ func unregisterResponseWireProfile(response *http.Response) {
 }
 
 func responseTrailerHeaderBlock(response *http.Response) http.HeaderBlock {
-	block := http.HeaderBlock{Kind: http.HeaderBlockTrailer, ProtoMajor: 2}
-	if response == nil || len(response.Trailer) == 0 {
-		return block
+	if response == nil {
+		return http.HeaderBlock{Kind: http.HeaderBlockTrailer, ProtoMajor: 2}
 	}
-	order := responseHeaderOrder(response).Trailers
-	values := make(map[string][]string, len(response.Trailer))
-	keys := make([]string, 0, len(response.Trailer))
-	for name := range response.Trailer {
+	return trailerHeaderBlock(response.Trailer, responseHeaderOrder(response).Trailers)
+}
+
+func trailerHeaderBlock(trailer http.Header, order []string) http.HeaderBlock {
+	block := http.HeaderBlock{Kind: http.HeaderBlockTrailer, ProtoMajor: 2}
+	values := make(map[string][]string, len(trailer))
+	keys := make([]string, 0, len(trailer))
+	for name := range trailer {
 		keys = append(keys, name)
 	}
 	sort.Slice(keys, func(i, j int) bool {
@@ -344,7 +347,7 @@ func responseTrailerHeaderBlock(response *http.Response) http.HeaderBlock {
 		if !httpguts.ValidTrailerHeader(lower) {
 			continue
 		}
-		values[lower] = append(values[lower], response.Trailer[name]...)
+		values[lower] = append(values[lower], trailer[name]...)
 	}
 
 	emitted := make(map[string]bool, len(values))

@@ -256,7 +256,18 @@ func (p *http1PipelineConn) writeLoop() {
 				return
 			}
 			request := withoutForwardedExpectContinue(exchange.request)
-			err := request.Write(p.conn)
+			var err error
+			if len(request.Trailer) > 0 {
+				// Resolve trailer order only after Write has consumed the body.
+				// The writer buffers header blocks, never the streaming payload.
+				writer := &http1ResponseWriter{dst: p.conn, request: request, chunked: true}
+				err = request.Write(writer)
+				if flushErr := writer.flush(); err == nil {
+					err = flushErr
+				}
+			} else {
+				err = request.Write(p.conn)
+			}
 			if request.Body != nil {
 				_ = request.Body.Close()
 			}

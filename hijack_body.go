@@ -73,6 +73,25 @@ func rebindRequestBodyAfterHijack(req *http.Request, conn net.Conn, rw *bufio.Re
 	req.TransferEncoding = append([]string(nil), parsed.TransferEncoding...)
 	req.Trailer = parsed.Trailer
 	req.GetBody = nil
+	// Keep the real initial headers, but obtain late trailers from the parser
+	// that now owns the body after Hijack.
+	profile := requestWireProfileFromRequest(ensureRequestWireProfile(req))
+	reboundProfile := *profile
+	reboundProfile.blocks = func() []http.HeaderBlock {
+		var blocks []http.HeaderBlock
+		for _, block := range profile.blocks() {
+			if block.Kind != http.HeaderBlockTrailer {
+				blocks = append(blocks, block)
+			}
+		}
+		for _, block := range http.RequestHeaderBlocks(parsed) {
+			if block.Kind == http.HeaderBlockTrailer {
+				blocks = append(blocks, block)
+			}
+		}
+		return blocks
+	}
+	req = withRequestWireProfile(req, &reboundProfile)
 	req = prepareHijackedRequestBody(req, parsed, conn)
 
 	return req, &bufConnExt{Conn: conn, Reader: reader}, nil

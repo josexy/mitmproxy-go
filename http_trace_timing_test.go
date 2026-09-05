@@ -55,7 +55,6 @@ func TestHTTPExchangeTimingEmitsLifecycleAndBodyEOF(t *testing.T) {
 	request := &http.Request{Method: http.MethodGet, Body: http.NoBody}
 	request, attempt := timing.traceRequest(request)
 	trace := httptrace.ContextClientTrace(request.Context())
-	trace.WroteHeaders()
 	trace.WroteRequest(httptrace.WroteRequestInfo{})
 	trace.GotFirstResponseByte()
 	response := &http.Response{
@@ -95,7 +94,6 @@ func TestHTTPExchangeTimingStartsNewAttemptForRetryAndIgnoresStaleTrace(t *testi
 
 	firstRequest, _ := timing.traceRequest(&http.Request{})
 	firstTrace := httptrace.ContextClientTrace(firstRequest.Context())
-	firstTrace.WroteHeaders()
 	secondRequest, _ := timing.traceRequest(&http.Request{})
 	secondTrace := httptrace.ContextClientTrace(secondRequest.Context())
 
@@ -103,7 +101,6 @@ func TestHTTPExchangeTimingStartsNewAttemptForRetryAndIgnoresStaleTrace(t *testi
 	// the logical exchange after attempt 2 starts.
 	firstTrace.WroteRequest(httptrace.WroteRequestInfo{})
 	firstTrace.GotFirstResponseByte()
-	secondTrace.WroteHeaders()
 	secondTrace.WroteRequest(httptrace.WroteRequestInfo{})
 
 	if got := []HTTPExchangeTimingPhase{events[0].Phase, events[1].Phase, events[2].Phase}; !reflect.DeepEqual(got, []HTTPExchangeTimingPhase{
@@ -118,22 +115,39 @@ func TestHTTPExchangeTimingStartsNewAttemptForRetryAndIgnoresStaleTrace(t *testi
 	}
 }
 
-func TestHTTPExchangeTimingTreatsSecondWroteHeadersAsTransparentRetry(t *testing.T) {
+func TestHTTPExchangeTimingStartsRetryBeforeHeadersAndIgnoresStaleCallbacks(t *testing.T) {
 	base := time.Date(2026, time.August, 12, 20, 0, 0, 0, time.UTC)
-	clock := &sequenceTimingClock{timestamps: []time.Time{base, base.Add(time.Microsecond)}}
+	clock := &sequenceTimingClock{timestamps: []time.Time{base, base.Add(time.Microsecond), base.Add(2 * time.Microsecond), base.Add(3 * time.Microsecond)}}
 	timing := newHTTPExchangeTiming(clock)
 	ctx := withHTTPExchangeTiming(context.Background(), timing)
 	var events []HTTPExchangeTimingEvent
 	ObserveHTTPExchangeTiming(ctx, func(event HTTPExchangeTimingEvent) { events = append(events, event) })
 
-	request, _ := timing.traceRequest(&http.Request{})
-	trace := httptrace.ContextClientTrace(request.Context())
-	trace.WroteHeaders()
-	trace.WroteHeaders()
-
-	if len(events) != 2 || events[0].Attempt != 1 || events[1].Attempt != 2 ||
-		events[1].Phase != HTTPExchangeRequestStarted {
-		t.Fatalf("retry events = %#v", events)
+	var userWroteRequest int
+	request := (&http.Request{}).WithContext(httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { userWroteRequest++ },
+	}))
+	request, attempt := timing.traceRequest(request)
+	firstTrace := httptrace.ContextClientTrace(request.Context())
+	firstErr := errors.New("write failed before headers")
+	request = traceHTTPRetry(request, firstErr)
+	if len(events) != 3 || events[2].Phase != HTTPExchangeRequestStarted || events[2].Attempt != 2 {
+		t.Fatalf("events before retry writes = %#v", events)
+	}
+	firstTrace.WroteRequest(httptrace.WroteRequestInfo{})
+	firstTrace.GotFirstResponseByte()
+	if len(events) != 3 {
+		t.Fatalf("stale callbacks changed retry events = %#v", events)
+	}
+	secondErr := errors.New("redial failed")
+	timing.observeResult(request, nil, secondErr, attempt)
+	if len(events) != 4 || events[3].Attempt != 2 || events[3].Phase != HTTPExchangeRequestEnded || !errors.Is(events[3].Error, secondErr) {
+		t.Fatalf("failed retry events = %#v", events)
+	}
+	// Composed callbacks from previous attempts must not duplicate user hooks.
+	httptrace.ContextClientTrace(request.Context()).WroteRequest(httptrace.WroteRequestInfo{})
+	if userWroteRequest != 2 {
+		t.Fatalf("user WroteRequest calls = %d, want 2", userWroteRequest)
 	}
 }
 
@@ -281,7 +295,6 @@ func TestRoundTripWithInvokerUpstreamHTTPTraceIsOptIn(t *testing.T) {
 					if trace == nil {
 						t.Fatal("enabled request has no client trace")
 					}
-					trace.WroteHeaders()
 					trace.WroteRequest(httptrace.WroteRequestInfo{})
 					trace.GotFirstResponseByte()
 				} else if trace != nil {
