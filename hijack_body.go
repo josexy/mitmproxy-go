@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"io"
 	"net"
 	"sort"
@@ -14,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	http "github.com/josexy/xhttp"
 	"golang.org/x/net/http/httpguts"
 )
 

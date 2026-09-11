@@ -1,16 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"io"
 	"log/slog"
 	"os"
-	"strings"
+	"strconv"
 
 	"github.com/josexy/mitmproxy-go/v2"
+	http "github.com/josexy/xhttp"
 )
 
 func main() {
@@ -47,8 +48,15 @@ func main() {
 		)
 
 		rsp.Header.Add("X-MITMPGO-RSP-HEADER", "MITMPGO")
-		rsp.Body.Close()
-		rsp.Body = io.NopCloser(strings.NewReader("hello!"))
+		body := []byte("hello!")
+		_ = rsp.Body.Close()
+		rsp.Body = io.NopCloser(bytes.NewReader(body))
+		rsp.ContentLength = int64(len(body))
+		rsp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		rsp.Header.Del("Content-Encoding")
+		rsp.Header.Del("Transfer-Encoding")
+		rsp.TransferEncoding = nil
+		rsp.Trailer = nil
 		return rsp, err
 	}
 

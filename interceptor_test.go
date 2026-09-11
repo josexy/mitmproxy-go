@@ -3,11 +3,11 @@ package mitmproxy
 import (
 	"context"
 	"errors"
-	"github.com/josexy/xhttp"
 	"reflect"
 	"testing"
 
 	"github.com/josexy/mitmproxy-go/v2/buf"
+	http "github.com/josexy/xhttp"
 )
 
 func TestWSDirectionString(t *testing.T) {

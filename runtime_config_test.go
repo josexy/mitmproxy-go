@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509/pkix"
 	"errors"
-	"github.com/josexy/xhttp"
 	"io"
 	"net"
 	"net/url"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/josexy/mitmproxy-go/v2/internal/cert"
+	http "github.com/josexy/xhttp"
 )
 
 func TestNewDynamicMitmProxyHandler(t *testing.T) {

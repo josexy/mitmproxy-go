@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"io"
 	"net"
 	"net/url"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"github.com/josexy/mitmproxy-go/v2/internal/cert"
+	http "github.com/josexy/xhttp"
 	utls "github.com/refraction-networking/utls"
 )
 

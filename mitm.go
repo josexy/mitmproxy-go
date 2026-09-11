@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"io"
 	"log/slog"
 	"net"
@@ -27,6 +26,7 @@ import (
 	"github.com/josexy/mitmproxy-go/v2/internal/iocopy"
 	"github.com/josexy/mitmproxy-go/v2/metadata"
 	"github.com/josexy/websocket"
+	http "github.com/josexy/xhttp"
 	"github.com/josexy/xhttp/httptrace"
 	utls "github.com/refraction-networking/utls"
 )

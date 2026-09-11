@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"io"
 	"net"
 
 	"github.com/josexy/mitmproxy-go/v2/buf"
 	"github.com/josexy/websocket"
+	http "github.com/josexy/xhttp"
 )
 
 var ErrHTTPHeaderTooLarge = errors.New("HTTP header too large")

@@ -3,14 +3,15 @@ package mitmproxy
 import (
 	"bufio"
 	"context"
-	"github.com/josexy/xhttp"
-	"github.com/josexy/xhttp/httptrace"
 	"io"
 	"net"
 	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptrace"
 )
 
 func TestHTTP1PipelineConnTracesFirstResponseByte(t *testing.T) {

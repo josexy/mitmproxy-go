@@ -7,8 +7,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
-	"github.com/josexy/xhttp/httptest"
 	"io"
 	"log/slog"
 	"net"
@@ -20,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )

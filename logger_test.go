@@ -3,13 +3,14 @@ package mitmproxy
 import (
 	"bufio"
 	"context"
-	"github.com/josexy/xhttp"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	http "github.com/josexy/xhttp"
 )
 
 func TestRequestURLRedactsCredentialsAndQuery(t *testing.T) {

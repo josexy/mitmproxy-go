@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"log/slog"
 	mathrand "math/rand"
 	"net"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	http "github.com/josexy/xhttp"
 )
 
 type singleConnTransport struct {

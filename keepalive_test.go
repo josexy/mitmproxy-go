@@ -6,8 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
-	"github.com/josexy/xhttp/httptest"
 	"io"
 	"net"
 	"net/url"
@@ -18,6 +16,8 @@ import (
 	"time"
 
 	"github.com/josexy/websocket"
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 )
 
 // startKeepAliveProxy runs the handler behind a real http.Server so tests go

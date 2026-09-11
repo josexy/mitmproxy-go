@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509/pkix"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"io"
 	"net"
 	"net/url"
@@ -20,6 +19,7 @@ import (
 	"github.com/josexy/mitmproxy-go/v2"
 	"github.com/josexy/mitmproxy-go/v2/internal/cert"
 	"github.com/josexy/mitmproxy-go/v2/metadata"
+	http "github.com/josexy/xhttp"
 )
 
 var (

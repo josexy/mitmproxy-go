@@ -4,13 +4,14 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"github.com/josexy/xhttp"
-	"github.com/josexy/xhttp/httptrace"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"time"
+
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptrace"
 )
 
 var errHTTP1PipelineClosed = errors.New("HTTP/1 pipeline connection closed")

@@ -5,14 +5,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/josexy/xhttp"
-	"github.com/josexy/xhttp/httptest"
 	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 )
 
 func TestHTTPProxyPreservesMethodAfterHijackedRequestBody(t *testing.T) {

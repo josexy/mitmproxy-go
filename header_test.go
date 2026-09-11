@@ -1,8 +1,9 @@
 package mitmproxy
 
 import (
-	"github.com/josexy/xhttp"
 	"testing"
+
+	http "github.com/josexy/xhttp"
 )
 
 func TestRemoveHopByHopRequestHeaders(t *testing.T) {

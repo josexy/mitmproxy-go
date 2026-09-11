@@ -5,9 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/josexy/xhttp"
-
 	"github.com/josexy/mitmproxy-go/v2/buf"
+	http "github.com/josexy/xhttp"
 )
 
 type websocketHandshakeTimingContextKey struct{}

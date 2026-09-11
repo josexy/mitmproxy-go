@@ -2,12 +2,12 @@ package mitmproxy
 
 import (
 	"context"
-	"github.com/josexy/xhttp"
 	"log/slog"
 	"net"
 	"time"
 
 	"github.com/josexy/mitmproxy-go/v2/internal/cert"
+	http "github.com/josexy/xhttp"
 )
 
 const (

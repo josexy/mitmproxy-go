@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"io"
 	"log/slog"
 	"net"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	mitmproxy "github.com/josexy/mitmproxy-go/v2"
+	http "github.com/josexy/xhttp"
 )
 
 func main() {

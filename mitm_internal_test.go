@@ -6,8 +6,6 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
-	"github.com/josexy/xhttp/httptest"
 	"io"
 	"net"
 	"net/url"
@@ -19,6 +17,8 @@ import (
 
 	"github.com/josexy/mitmproxy-go/v2/internal/cert"
 	"github.com/josexy/mitmproxy-go/v2/metadata"
+	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptest"
 )
 
 type flushingResponseWriter struct {

@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"net"
 	"net/url"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	http "github.com/josexy/xhttp"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/proxy"
 )

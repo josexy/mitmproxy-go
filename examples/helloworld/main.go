@@ -4,13 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/josexy/xhttp"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/josexy/mitmproxy-go/v2"
+	http "github.com/josexy/xhttp"
 )
 
 func main() {
