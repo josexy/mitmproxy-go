@@ -1871,10 +1871,7 @@ func (w *http1ResponseWriter) writeAfterHeader(data []byte) error {
 				w.chunkState = http1ChunkData
 			}
 		case http1ChunkData:
-			count := int64(len(data))
-			if count > w.chunkLeft {
-				count = w.chunkLeft
-			}
+			count := min(int64(len(data)), w.chunkLeft)
 			if err := writeAll(w.dst, data[:int(count)]); err != nil {
 				return err
 			}
@@ -1884,10 +1881,7 @@ func (w *http1ResponseWriter) writeAfterHeader(data []byte) error {
 				w.chunkState = http1ChunkDataCRLF
 			}
 		case http1ChunkDataCRLF:
-			needed := 2 - len(w.chunkBuf)
-			if needed > len(data) {
-				needed = len(data)
-			}
+			needed := min(2-len(w.chunkBuf), len(data))
 			w.chunkBuf = append(w.chunkBuf, data[:needed]...)
 			data = data[needed:]
 			if len(w.chunkBuf) < 2 {

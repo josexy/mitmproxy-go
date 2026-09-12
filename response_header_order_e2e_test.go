@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -33,9 +34,7 @@ func TestInterceptorResponseHeaderOrder(t *testing.T) {
 					if local {
 						t.Error("short-circuit response contacted the origin handler")
 					}
-					for name, values := range newHeader() {
-						w.Header()[name] = values
-					}
+					maps.Copy(w.Header(), newHeader())
 					if err := http.SetResponseHeaderOrder(w, http.HeaderOrder{
 						Headers: []string{"x-a", "x-b"}, Trailers: []string{"x-end-a", "x-end-b"},
 					}); err != nil {

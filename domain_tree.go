@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 
 	"golang.org/x/net/idna"
@@ -39,8 +40,8 @@ func (node *trieNode) insert(pattern string) error {
 		return fmt.Errorf("%w %q: %v", ErrInvalidHostFilter, pattern, err)
 	}
 	parts := strings.Split(normalized, ".")
-	for i := len(parts) - 1; i >= 0; i-- {
-		part := parts[i]
+	for _, part := range slices.Backward(parts) {
+
 		if node.children == nil {
 			node.children = make(map[string]*trieNode)
 		}

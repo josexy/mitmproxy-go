@@ -218,12 +218,10 @@ func TestHTTPTimingResponseBodyFinishesOnceConcurrently(t *testing.T) {
 	start := make(chan struct{})
 	var wait sync.WaitGroup
 	for index := range 64 {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
+		wait.Go(func() {
 			<-start
 			body.finish(index%2 == 0, errors.New("terminal response"))
-		}()
+		})
 	}
 	close(start)
 	wait.Wait()

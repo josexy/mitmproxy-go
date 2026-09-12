@@ -157,7 +157,7 @@ func declaredTrailerOrder(fields []http.HeaderField) []string {
 		if !strings.EqualFold(field.Name, "trailer") {
 			continue
 		}
-		for _, value := range strings.Split(field.Value, ",") {
+		for value := range strings.SplitSeq(field.Value, ",") {
 			name := strings.ToLower(strings.TrimSpace(value))
 			if name == "" {
 				continue

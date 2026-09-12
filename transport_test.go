@@ -159,7 +159,7 @@ func TestSingleConnTransportRoundTripAndReuse(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			req, err := http.ReadRequest(bufio.NewReader(conn))
 			if err != nil {
 				return
@@ -182,7 +182,7 @@ func TestSingleConnTransportRoundTripAndReuse(t *testing.T) {
 	)
 	defer tr.Close()
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		req, _ := http.NewRequest(http.MethodGet, "http://"+ln.Addr().String()+"/", nil)
 		resp, err := tr.RoundTrip(req)
 		if err != nil {

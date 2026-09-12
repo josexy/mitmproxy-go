@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"slices"
@@ -261,8 +262,6 @@ func cloneClientCerts(src map[string]ClientCert) map[string]ClientCert {
 		return nil
 	}
 	dst := make(map[string]ClientCert, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
+	maps.Copy(dst, src)
 	return dst
 }

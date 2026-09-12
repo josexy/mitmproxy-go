@@ -37,7 +37,7 @@ func TestNewDynamicMitmProxyHandler(t *testing.T) {
 }
 
 func TestRawTCPInterceptorRuntimeConfiguration(t *testing.T) {
-	managerType := reflect.TypeOf((*RuntimeConfigManager)(nil)).Elem()
+	managerType := reflect.TypeFor[RuntimeConfigManager]()
 	if _, found := managerType.MethodByName("SetRawTCPInterceptor"); !found {
 		t.Fatal("RuntimeConfigManager does not expose SetRawTCPInterceptor")
 	}

@@ -68,7 +68,7 @@ func removeHopByHopRequestHeaders(header http.Header) {
 
 func removeHopByHopHeaders(header http.Header) {
 	for _, value := range header.Values(HttpHeaderConnection) {
-		for _, token := range strings.Split(value, ",") {
+		for token := range strings.SplitSeq(value, ",") {
 			if token = textproto.TrimString(token); token != "" {
 				header.Del(token)
 			}
@@ -82,7 +82,7 @@ func removeHopByHopHeaders(header http.Header) {
 
 func sanitizeWebsocketUpgradeHeaders(header http.Header) {
 	for _, value := range header.Values(HttpHeaderConnection) {
-		for _, token := range strings.Split(value, ",") {
+		for token := range strings.SplitSeq(value, ",") {
 			token = textproto.TrimString(token)
 			if token != "" && !isWebsocketHandshakeHeader(token) {
 				header.Del(token)
