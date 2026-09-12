@@ -2,9 +2,7 @@ package mitmproxy
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
-	"weak"
 
 	http "github.com/josexy/xhttp"
 )
@@ -23,19 +21,17 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 
 	order := requestHeaderOrder(req)
 	if profile != nil && profile.fingerprint == nil {
-		pseudos := make([]string, 0, len(profile.headerOrder))
-		for _, name := range profile.headerOrder {
-			if strings.HasPrefix(name, ":") {
-				pseudos = append(pseudos, name)
-			}
-		}
-		order.Headers = append(pseudos, order.Headers...)
+		order.Headers = append(requestPseudoHeaderOrder(profile), order.Headers...)
 	}
 	var err error
 	if len(preparedReq.Trailer) > 0 {
 		headerOrder := order.Headers
 		if profile != nil && profile.fingerprint != nil {
-			headerOrder = append(compatiblePseudoHeaderOrder(preparedReq, profile.fingerprint.PseudoHeaderOrder), headerOrder...)
+			pseudoOrder := profile.fingerprint.PseudoHeaderOrder
+			if customPseudos := requestPseudoHeaderOrder(profile); len(customPseudos) > 0 {
+				pseudoOrder = customPseudos
+			}
+			headerOrder = append(compatiblePseudoHeaderOrder(preparedReq, pseudoOrder), headerOrder...)
 		}
 		preparedReq, err = withHTTP2RequestTrailers(preparedReq, headerOrder)
 		if err != nil {
@@ -50,6 +46,9 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 
 	if profile != nil && profile.fingerprint != nil {
 		fingerprint := upstreamHTTP2Fingerprint(*profile.fingerprint)
+		if customPseudos := requestPseudoHeaderOrder(profile); len(customPseudos) > 0 {
+			fingerprint.PseudoHeaderOrder = customPseudos
+		}
 		fingerprint.PseudoHeaderOrder = compatiblePseudoHeaderOrder(preparedReq, fingerprint.PseudoHeaderOrder)
 		preparedReq, err = http.WithRequestFingerprint(preparedReq, fingerprint)
 		if err != nil {
@@ -104,37 +103,4 @@ func compatiblePseudoHeaderOrder(req *http.Request, captured []string) []string 
 		appendName(name)
 	}
 	return result
-}
-
-func prepareHTTP2Response(resp *http.Response, req *http.Request) *http.Response {
-	if resp == nil {
-		return nil
-	}
-	resp.Request = req
-	responseRef := weak.Make(resp)
-	blocks := func() []http.HeaderBlock {
-		response := responseRef.Value()
-		if response == nil {
-			return nil
-		}
-		blocks := http.ResponseHeaderBlocks(response)
-		runtime.KeepAlive(response)
-		return blocks
-	}
-	registerResponseWireProfile(resp, func() http.HeaderOrder {
-		var order http.HeaderOrder
-		for _, block := range blocks() {
-			names := uniqueHeaderNames(block.Fields, true)
-			switch block.Kind {
-			case http.HeaderBlockInitial:
-				if len(order.Headers) == 0 {
-					order.Headers = names
-				}
-			case http.HeaderBlockTrailer:
-				order.Trailers = names
-			}
-		}
-		return order
-	}, blocks)
-	return resp
 }

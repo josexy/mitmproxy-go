@@ -113,6 +113,34 @@ handler, err := mitmproxy.NewMitmProxyHandler(
 )
 ```
 
+An interceptor can set the downstream response wire order before returning a
+response. Non-empty `Headers` and `Trailers` slices override the corresponding
+block; an empty slice keeps the received order, including trailers that arrive
+after the response body reaches EOF:
+
+```go
+if err := mitmproxy.SetResponseHeaderOrder(resp, http.HeaderOrder{
+	Headers:  []string{"x-interceptor", "content-length"},
+	Trailers: []string{"x-end-b", "x-end-a"},
+}); err != nil {
+	return nil, err
+}
+```
+
+The request side uses a returned request copy. Apply header changes first, then
+pass the returned request to the delegated invoker:
+
+```go
+req.Header.Set("X-Debug", "1")
+req, err := mitmproxy.WithRequestHeaderOrder(req, http.HeaderOrder{
+	Headers: []string{"x-debug", "host", "user-agent"},
+})
+if err != nil {
+	return nil, err
+}
+resp, err := invoker.Invoke(req)
+```
+
 ### Upstream HTTP Timing
 
 Upstream timing is opt-in. Add `WithUpstreamHTTPTrace()` to enable the shared

@@ -25,6 +25,8 @@ type headerBlockSnapshotProvider func() []http.HeaderBlock
 type responseWireProfile struct {
 	order  headerOrderSnapshotProvider
 	blocks headerBlockSnapshotProvider
+	// writeOrder is an immutable sending override, separate from received metadata.
+	writeOrder *http.HeaderOrder
 }
 
 var responseWireProfiles = struct {
@@ -52,6 +54,8 @@ type requestWireProfile struct {
 	trailerOrder []string
 	fingerprint  *http.Fingerprint
 	blocks       headerBlockSnapshotProvider
+	// writeOrder is an immutable sending override, separate from received metadata.
+	writeOrder *http.HeaderOrder
 }
 
 func ensureRequestWireProfile(req *http.Request) *http.Request {
@@ -195,7 +199,7 @@ func RequestWireHeaderOrder(req *http.Request) http.HeaderOrder {
 // and trailer order observed on the upstream connection. HTTP/2 pseudo-headers
 // are retained in Headers.
 func ResponseWireHeaderOrder(response *http.Response) http.HeaderOrder {
-	return responseHeaderOrder(response)
+	return responseWireHeaderOrder(response)
 }
 
 // RequestHTTP2Fingerprint returns a defensive snapshot of the HTTP/2 client
@@ -246,16 +250,53 @@ func requestHeaderOrder(req *http.Request) http.HeaderOrder {
 	if profile == nil {
 		return http.HeaderOrder{}
 	}
+	wireOrder := RequestWireHeaderOrder(req)
 	headers := make([]string, 0, len(profile.headerOrder))
 	for _, name := range profile.headerOrder {
 		if !strings.HasPrefix(name, ":") {
 			headers = append(headers, name)
 		}
 	}
-	return http.HeaderOrder{
+	order := http.HeaderOrder{
 		Headers:  headers,
-		Trailers: RequestWireHeaderOrder(req).Trailers,
+		Trailers: wireOrder.Trailers,
 	}
+	if profile.writeOrder != nil {
+		if len(profile.writeOrder.Headers) > 0 {
+			order.Headers = filterRequestHeaderOrder(profile.writeOrder.Headers)
+		}
+		if len(profile.writeOrder.Trailers) > 0 {
+			order.Trailers = append([]string(nil), profile.writeOrder.Trailers...)
+		}
+	}
+	return order
+}
+
+func filterRequestHeaderOrder(names []string) []string {
+	result := make([]string, 0, len(names))
+	for _, name := range names {
+		if !strings.HasPrefix(name, ":") {
+			result = append(result, name)
+		}
+	}
+	return result
+}
+
+func requestPseudoHeaderOrder(profile *requestWireProfile) []string {
+	if profile == nil {
+		return nil
+	}
+	names := profile.headerOrder
+	if profile.writeOrder != nil && len(profile.writeOrder.Headers) > 0 {
+		names = profile.writeOrder.Headers
+	}
+	pseudos := make([]string, 0, len(names))
+	for _, name := range names {
+		if strings.HasPrefix(name, ":") {
+			pseudos = append(pseudos, name)
+		}
+	}
+	return pseudos
 }
 
 func withRequestHeaderOrder(req *http.Request) (*http.Request, error) {
@@ -267,6 +308,28 @@ func withRequestHeaderOrder(req *http.Request) (*http.Request, error) {
 }
 
 func responseHeaderOrder(response *http.Response) http.HeaderOrder {
+	var override *http.HeaderOrder
+	if profile, ok := responseWireProfileFor(response); ok {
+		override = profile.writeOrder
+	}
+	var order http.HeaderOrder
+	// Omitted blocks inherit the received order, including trailers that only
+	// become available at EOF. Fully explicit orders need no wire snapshot.
+	if override == nil || len(override.Headers) == 0 || len(override.Trailers) == 0 {
+		order = responseWireHeaderOrder(response)
+	}
+	if override != nil {
+		if len(override.Headers) > 0 {
+			order.Headers = append([]string(nil), override.Headers...)
+		}
+		if len(override.Trailers) > 0 {
+			order.Trailers = append([]string(nil), override.Trailers...)
+		}
+	}
+	return order
+}
+
+func responseWireHeaderOrder(response *http.Response) http.HeaderOrder {
 	if response == nil {
 		return http.HeaderOrder{}
 	}
@@ -300,14 +363,21 @@ func registerResponseWireProfile(response *http.Response, order headerOrderSnaps
 	if order != nil || blocks != nil {
 		key := weak.Make(response)
 		responseWireProfiles.Lock()
-		responseWireProfiles.m[key] = responseWireProfile{order: order, blocks: blocks}
+		profile, registered := responseWireProfiles.m[key]
+		profile.order, profile.blocks = order, blocks
+		responseWireProfiles.m[key] = profile
 		responseWireProfiles.Unlock()
-		runtime.AddCleanup(response, func(key weak.Pointer[http.Response]) {
-			responseWireProfiles.Lock()
-			delete(responseWireProfiles.m, key)
-			responseWireProfiles.Unlock()
-		}, key)
+		if !registered {
+			runtime.AddCleanup(response, removeResponseWireProfile, key)
+		}
+		runtime.KeepAlive(response)
 	}
+}
+
+func removeResponseWireProfile(key weak.Pointer[http.Response]) {
+	responseWireProfiles.Lock()
+	delete(responseWireProfiles.m, key)
+	responseWireProfiles.Unlock()
 }
 
 func unregisterResponseWireProfile(response *http.Response) {
@@ -315,9 +385,7 @@ func unregisterResponseWireProfile(response *http.Response) {
 		return
 	}
 	key := weak.Make(response)
-	responseWireProfiles.Lock()
-	delete(responseWireProfiles.m, key)
-	responseWireProfiles.Unlock()
+	removeResponseWireProfile(key)
 	runtime.KeepAlive(response)
 }
 

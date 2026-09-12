@@ -35,7 +35,19 @@ func main() {
 	}
 
 	httpInterceptor := func(ctx context.Context, req *http.Request, invoker mitmproxy.HTTPDelegatedInvoker) (*http.Response, error) {
-		req.Header.Add("X-MITMPGO-REQ-HEADER", "MITMPGO")
+		// Request header modification: set and remove fields before forwarding.
+		req.Header.Set("X-MITMPGO-REQ-HEADER", "MITMPGO")
+		req.Header.Set("User-Agent", "mitmproxy-go/modify-content")
+		req.Header.Del("Accept-Encoding")
+
+		// Request wire order is configured on the request copy returned by the helper.
+		var err error
+		req, err = mitmproxy.WithRequestHeaderOrder(req, http.HeaderOrder{
+			Headers: []string{"Accept", "x-mitmpgo-req-header", "user-agent"},
+		})
+		if err != nil {
+			return nil, err
+		}
 
 		rsp, err := invoker.Invoke(req)
 		if err != nil {
@@ -47,7 +59,9 @@ func main() {
 			slog.Group("response", slog.String("status", rsp.Status), slog.String("protocol", rsp.Proto)),
 		)
 
-		rsp.Header.Add("X-MITMPGO-RSP-HEADER", "MITMPGO")
+		// Response header modification: set and remove fields before writing downstream.
+		rsp.Header.Set("X-MITMPGO-RSP-HEADER", "MITMPGO")
+		rsp.Header.Set("Cache-Control", "no-store")
 		body := []byte("hello!")
 		_ = rsp.Body.Close()
 		rsp.Body = io.NopCloser(bytes.NewReader(body))
@@ -57,6 +71,12 @@ func main() {
 		rsp.Header.Del("Transfer-Encoding")
 		rsp.TransferEncoding = nil
 		rsp.Trailer = nil
+		// Choose the downstream wire order independently of the upstream response.
+		if err := mitmproxy.SetResponseHeaderOrder(rsp, http.HeaderOrder{
+			Headers: []string{"x-mitmpgo-rsp-header", "content-length"},
+		}); err != nil {
+			return nil, err
+		}
 		return rsp, err
 	}
 

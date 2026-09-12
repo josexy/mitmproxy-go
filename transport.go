@@ -155,7 +155,10 @@ func (t *singleConnTransport) roundTripHTTP2(req *http.Request) (*http.Response,
 		resp, err := clientConn.RoundTrip(preparedReq)
 		t.releaseHTTP2ClientConnLease(preparedReq.Context(), key, clientConn)
 		if err == nil {
-			return prepareHTTP2Response(resp, req), nil
+			if resp != nil {
+				resp.Request = req
+			}
+			return resp, nil
 		}
 
 		var retryReq *http.Request

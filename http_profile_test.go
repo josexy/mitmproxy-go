@@ -62,6 +62,43 @@ func TestWithRequestHeaderOrderWritesHTTP1WireOrder(t *testing.T) {
 	}
 }
 
+func TestWithRequestHeaderOrderOverrideWritesCustomHTTP1Order(t *testing.T) {
+	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(
+		"GET http://example.test/path HTTP/1.1\r\nX-Zeta: one\r\nHost: example.test\r\nx-Alpha: two\r\n\r\n",
+	)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = ensureRequestWireProfile(req)
+	original := RequestWireHeaderOrder(req)
+	req, err = WithRequestHeaderOrder(req, http.HeaderOrder{
+		Headers: []string{"x-alpha", "host", "x-zeta"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.RequestURI = ""
+	req, err = withRequestHeaderOrder(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wire bytes.Buffer
+	if err := req.Write(&wire); err != nil {
+		t.Fatal(err)
+	}
+	header := wire.String()
+	alpha := strings.Index(header, "X-Alpha: two\r\n")
+	host := strings.Index(header, "Host: example.test\r\n")
+	zeta := strings.Index(header, "X-Zeta: one\r\n")
+	if alpha < 0 || host < 0 || zeta < 0 || !(alpha < host && host < zeta) {
+		t.Fatalf("unexpected custom HTTP/1 header order:\n%s", header)
+	}
+	if got := RequestWireHeaderOrder(req); !reflect.DeepEqual(got, original) {
+		t.Fatalf("request wire metadata changed = %#v; want %#v", got, original)
+	}
+}
+
 func TestRequestWireProfileCopiesHTTP2Fingerprint(t *testing.T) {
 	req, err := http.NewRequest(http.MethodGet, "https://example.test/", nil)
 	if err != nil {
@@ -272,7 +309,12 @@ func TestResponseWireProfileRegistryDoesNotRetainResponse(t *testing.T) {
 			default:
 			}
 		}, collected)
-		prepareHTTP2Response(response, nil)
+		registerResponseWireProfile(response, func() http.HeaderOrder {
+			return http.HeaderOrder{}
+		})
+		if err := SetResponseHeaderOrder(response, http.HeaderOrder{Headers: []string{"x-b", "x-a"}}); err != nil {
+			t.Fatal(err)
+		}
 		runtime.KeepAlive(response)
 	}()
 
@@ -293,9 +335,9 @@ func TestResponseWireProfileRegistryDoesNotRetainResponse(t *testing.T) {
 }
 
 func TestResponseWireProfileSurvivesBodyClose(t *testing.T) {
-	response := prepareHTTP2Response(&http.Response{
+	response := &http.Response{
 		Body: io.NopCloser(strings.NewReader("body")),
-	}, nil)
+	}
 	want := http.HeaderOrder{Headers: []string{":status", "x-test"}}
 	registerResponseWireProfile(response, func() http.HeaderOrder {
 		return http.HeaderOrder{Headers: append([]string(nil), want.Headers...)}

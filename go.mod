@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/josexy/websocket v0.0.0-20260820071228-412d0f6b5891
-	github.com/josexy/xhttp v0.0.0-20260820070917-25565553acea
+	github.com/josexy/xhttp v0.0.0-20260912005750-0754351398e8
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
