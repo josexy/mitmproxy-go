@@ -642,6 +642,10 @@ is matched against those final values; deleted/changed fields are not revived,
 and remaining fields follow deterministically. The proxy still sanitizes
 hop-by-hop headers and generates Host/pseudo-headers and framing. Received
 `RequestWireHeaderBlocks` and `ResponseWireHeaderBlocks` remain unchanged.
+These proxy overrides are reconciled ordering preferences; xhttp's exact-block
+APIs instead require a complete, valid wire field sequence and add no automatic
+fields. HTTP/1 name order and occurrence order are applied to one parsed response
+head before serialization; body streaming and late trailer handling are shared.
 HTTP/1 response heads requiring exact reordering are bounded to 64 KiB and fail
 before sending when that bound is exceeded. These APIs affect ordinary HTTP
 interception, not WebSocket or raw TCP relay.

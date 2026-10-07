@@ -1,10 +1,8 @@
 package mitmproxy
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"net/textproto"
 	"runtime"
 	"sort"
 	"strconv"
@@ -15,7 +13,9 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
-// WithRequestHeaderBlock configures the exact outgoing initial-field sequence.
+// WithRequestHeaderBlock configures an occurrence-level initial-field order.
+// Unlike xhttp.WithRequestHeaderBlocks, this is a proxy ordering override, not
+// a complete wire block: current values and transport framing stay authoritative.
 // Fields are matched against the final Header values (case-insensitively by
 // name); removed or changed fields cannot be resurrected. Remaining fields are
 // appended deterministically. Host/pseudo-headers and framing remain owned by
@@ -36,7 +36,7 @@ func WithRequestHeaderBlock(req *http.Request, block http.HeaderBlock) (*http.Re
 	return withRequestWireProfile(req, &profile), nil
 }
 
-// SetResponseHeaderBlock configures the exact outgoing initial-field sequence
+// SetResponseHeaderBlock configures an occurrence-level initial-field order
 // with the same reconciliation rules as WithRequestHeaderBlock. Status, body
 // framing and hop-by-hop sanitization remain authoritative. It does not change
 // ResponseWireHeaderBlocks. Call before returning response from an interceptor;
@@ -276,31 +276,6 @@ func responseSendingBlock(response *http.Response, proto int) (http.HeaderBlock,
 		status = response.StatusCode
 	}
 	return http.HeaderBlock{Kind: http.HeaderBlockInitial, ProtoMajor: proto, StatusCode: status, Fields: orderedSendingFields(fields, profile.writeBlock.Fields, proto)}, true
-}
-
-// Response.Write still owns framing; only reorder its fully sanitized head.
-func exactHTTP1ResponseHeader(head []byte, response *http.Response) []byte {
-	profile, ok := responseWireProfileFor(response)
-	if !ok || profile.writeBlock == nil {
-		return head
-	}
-	lines := bytes.Split(head, []byte("\r\n"))
-	var fields []http.HeaderField
-	for _, line := range lines[1:] {
-		name, value, ok := bytes.Cut(line, []byte(":"))
-		if ok {
-			fields = append(fields, http.HeaderField{Name: string(name), Value: textproto.TrimString(string(value))})
-		}
-	}
-	fields = orderedSendingFields(fields, profile.writeBlock.Fields, 1)
-	var output bytes.Buffer
-	output.Write(lines[0])
-	output.WriteString("\r\n")
-	for _, field := range fields {
-		output.WriteString(field.Name + ": " + field.Value + "\r\n")
-	}
-	output.WriteString("\r\n")
-	return output.Bytes()
 }
 
 func sendingHeaderContains(header http.Header, name string) bool {

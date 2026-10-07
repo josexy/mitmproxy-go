@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/textproto"
 	"slices"
 	"strconv"
 	"strings"
@@ -1756,10 +1757,8 @@ func (w *http1ResponseWriter) Write(data []byte) (int, error) {
 		if w.request != nil {
 			w.chunked = bytes.Contains(bytes.ToLower(pending[:headerEnd]), []byte("\r\ntransfer-encoding: chunked\r\n"))
 		}
-		header := reorderHTTP1ResponseHeader(pending[:headerEnd], index, w.order)
-		if w.response != nil {
-			header = exactHTTP1ResponseHeader(header, w.response)
-		}
+		profile, _ := responseWireProfileFor(w.response)
+		header := reorderHTTP1HeaderBlock(pending[:headerEnd], index, w.order, 1, profile.writeBlock)
 		if err := writeAll(w.dst, header); err != nil {
 			return 0, err
 		}
@@ -1942,77 +1941,87 @@ func (w *http1ResponseWriter) writeAfterHeader(data []byte) error {
 }
 
 func reorderHTTP1ResponseHeader(pending []byte, delimiter int, order []string) []byte {
-	return reorderHTTP1HeaderBlock(pending, delimiter, order, 1)
+	return reorderHTTP1HeaderBlock(pending, delimiter, order, 1, nil)
 }
 
 func reorderHTTP1TrailerBlock(pending []byte, delimiter int, order []string) []byte {
-	return reorderHTTP1HeaderBlock(pending, delimiter, order, 0)
+	return reorderHTTP1HeaderBlock(pending, delimiter, order, 0, nil)
 }
 
-func reorderHTTP1HeaderBlock(pending []byte, delimiter int, order []string, prefixLineCount int) []byte {
-	if delimiter < 0 || len(order) == 0 {
+// Reconcile both ordering modes on the same parsed fields. Response.Write still
+// owns framing; only its sanitized head is reordered. Ordinary name ordering
+// retains the original field whitespace, while an exact override uses logical
+// values for occurrence matching and writes the requested casing.
+func reorderHTTP1HeaderBlock(pending []byte, delimiter int, order []string, prefixLineCount int, override *http.HeaderBlock) []byte {
+	if delimiter < 0 || (len(order) == 0 && override == nil) {
 		return pending
 	}
 	lines := bytes.Split(pending[:delimiter], []byte("\r\n"))
-	if len(lines) < prefixLineCount {
+	if len(lines) <= prefixLineCount {
 		return pending
 	}
-	fieldLines := lines[prefixLineCount:]
-	if len(fieldLines) == 0 {
-		return pending
-	}
-	type headerGroup struct {
-		name  string
-		lines [][]byte
-	}
-	groups := make([]headerGroup, 0, len(fieldLines))
-	groupsByName := make(map[string]int, len(fieldLines))
-	for _, line := range fieldLines {
-		name, _, ok := bytes.Cut(line, []byte(":"))
+	fields := make([]http.HeaderField, 0, len(lines)-prefixLineCount)
+	for _, line := range lines[prefixLineCount:] {
+		name, value, ok := strings.Cut(string(line), ":")
 		if !ok {
 			return pending
 		}
-		lower := strings.ToLower(string(name))
-		index, ok := groupsByName[lower]
-		if !ok {
-			index = len(groups)
-			groupsByName[lower] = index
-			groups = append(groups, headerGroup{name: lower})
+		field := http.HeaderField{Name: name, Value: value}
+		if override != nil {
+			field.Value = textproto.TrimString(field.Value)
 		}
-		groups[index].lines = append(groups[index].lines, line)
+		fields = append(fields, field)
 	}
-	positions := make(map[string]int, len(order))
-	for index, name := range order {
-		name = strings.ToLower(name)
-		if !strings.HasPrefix(name, ":") {
-			positions[name] = index
+	if len(order) > 0 {
+		positions := make(map[string]int, len(order))
+		for index, name := range order {
+			name = strings.ToLower(name)
+			if !strings.HasPrefix(name, ":") {
+				positions[name] = index
+			}
 		}
+		// Resolve each name once instead of allocating lowercase strings on
+		// every comparison. Equal ranks retain duplicate occurrence order.
+		type fieldRank struct {
+			name     string
+			position int
+		}
+		ranks := make(map[string]fieldRank, len(fields))
+		for _, field := range fields {
+			if _, ok := ranks[field.Name]; ok {
+				continue
+			}
+			name := strings.ToLower(field.Name)
+			position, listed := positions[name]
+			if !listed {
+				position = len(order)
+			}
+			ranks[field.Name] = fieldRank{name, position}
+		}
+		slices.SortStableFunc(fields, func(a, b http.HeaderField) int {
+			left, right := ranks[a.Name], ranks[b.Name]
+			if result := cmp.Compare(left.position, right.position); result != 0 {
+				return result
+			}
+			return strings.Compare(left.name, right.name)
+		})
 	}
-	slices.SortStableFunc(groups, func(leftGroup, rightGroup headerGroup) int {
-		left, leftListed := positions[leftGroup.name]
-		right, rightListed := positions[rightGroup.name]
-		switch {
-		case leftListed && rightListed:
-			return cmp.Compare(left, right)
-		case leftListed:
-			return -1
-		case rightListed:
-			return 1
-		default:
-			return strings.Compare(leftGroup.name, rightGroup.name)
-		}
-	})
-
+	if override != nil {
+		fields = orderedSendingFields(fields, override.Fields, 1)
+	}
 	result := make([]byte, 0, len(pending))
 	for _, line := range lines[:prefixLineCount] {
 		result = append(result, line...)
 		result = append(result, "\r\n"...)
 	}
-	for _, group := range groups {
-		for _, line := range group.lines {
-			result = append(result, line...)
-			result = append(result, "\r\n"...)
+	for _, field := range fields {
+		result = append(result, field.Name...)
+		result = append(result, ':')
+		if override != nil {
+			result = append(result, ' ')
 		}
+		result = append(result, field.Value...)
+		result = append(result, "\r\n"...)
 	}
 	result = append(result, "\r\n"...)
 	result = append(result, pending[delimiter+4:]...)
