@@ -618,3 +618,57 @@ gofmt -w <files>
 ## License
 
 This project is available under the MIT License.
+
+### HTTP rewrite controls
+
+HTTP interceptors can call `WithHTTPUpstreamTarget(request, targetURL)` before
+`next.Invoke`. It copies the target's HTTP/HTTPS scheme and authority into a
+request-scoped route while preserving the request path, query and `Host`.
+The original downstream authority is validated before the interceptor runs.
+Same-origin overrides reuse the validated route's transport, retaining
+keep-alive and HTTP/2 multiplexing. Each cross-origin invocation owns its
+upstream transport; concurrent HTTP/2 streams cannot change each other's
+destination. Configured upstream proxies,
+TLS trust/client certificates, captured TLS fingerprints and request
+cancellation still apply. HTTPS uses the target hostname for certificate
+verification and SNI. The private transport closes with the response body.
+
+`WithRequestHeaderBlock(request, block)` and
+`SetResponseHeaderBlock(response, block)` configure an outgoing initial field
+sequence using `xhttp.HeaderBlock`. Unlike `HeaderOrder`, fields retain
+interleaved duplicates and empty values, as well as casing on HTTP/1. Configure
+the final `Header` values before setting the override: each ordered occurrence
+is matched against those final values; deleted/changed fields are not revived,
+and remaining fields follow deterministically. The proxy still sanitizes
+hop-by-hop headers and generates Host/pseudo-headers and framing. Received
+`RequestWireHeaderBlocks` and `ResponseWireHeaderBlocks` remain unchanged.
+HTTP/1 response heads requiring exact reordering are bounded to 64 KiB and fail
+before sending when that bound is exceeded. These APIs affect ordinary HTTP
+interception, not WebSocket or raw TCP relay.
+
+Returning `ErrDropHTTP` (including a wrapped sentinel) closes the HTTP/1
+connection or aborts only the current HTTP/2 stream, without a final HTTP
+response. Return before `Invoke` to prevent an upstream request, or after
+`Invoke` to discard its response. The proxy releases invoked response bodies
+on error. To interrupt a blocked interceptor request-body read, call
+`AbortHTTPRequestRead(request, cause)` and return `ErrDropHTTP`; HTTP/1 cannot
+reuse that connection. Canceling the invoked request context also interrupts
+upstream response reads, including HTTP/1 pipeline bodies.
+
+`SetHTTPResponseSendObserver(response, callback)` reports one terminal
+`HTTPResponseSendResult`: `StartedAt`, `EndedAt`, `BodyBytes`, `HeaderBlock`,
+`Err`, and `Canceled`. `HeaderBlock` describes the final outgoing initial head. Body pre-reading does not complete this observer. HTTP/1 counts
+entity bytes accepted by actual connection writes, excluding framing. HTTP/2
+counts bytes accepted by its response writer and uses `xhttp.FinishResponse`
+to require successful flushing of the terminal END_STREAM and trailer frames
+before reporting success.
+Neither protocol claims peer acknowledgment.
+`EndedAt` is a terminal time even on failure, so only a nil `Err` means completed
+delivery to the connection. Callbacks run synchronously and may run concurrently
+for different streams; keep them brief and synchronize shared state. Configure
+the observer before returning the response, including locally generated ones.
+
+`WithHTTPRequestSendHeaderObserver(request, callback)` observes the final
+sanitized outgoing header block during transport preparation when an explicit
+`WithRequestHeaderBlock` override is present. It includes the selected upstream
+protocol; it is not a per-attempt timing or completion event.

@@ -59,7 +59,12 @@ func removeProxyHeaders(header http.Header) {
 }
 
 func removeHopByHopRequestHeaders(header http.Header) {
-	preserveTrailers := httpguts.HeaderValuesContainsToken(header.Values(HttpHeaderTe), "trailers")
+	preserveTrailers := false
+	for name, values := range header {
+		if strings.EqualFold(name, HttpHeaderTe) && httpguts.HeaderValuesContainsToken(values, "trailers") {
+			preserveTrailers = true
+		}
+	}
 	removeHopByHopHeaders(header)
 	if preserveTrailers {
 		header.Set(HttpHeaderTe, "trailers")
@@ -67,17 +72,28 @@ func removeHopByHopRequestHeaders(header http.Header) {
 }
 
 func removeHopByHopHeaders(header http.Header) {
-	for _, value := range header.Values(HttpHeaderConnection) {
-		for token := range strings.SplitSeq(value, ",") {
-			if token = textproto.TrimString(token); token != "" {
-				header.Del(token)
+	blocked := make(map[string]bool, len(hopByHopHeaders)+1)
+	for _, name := range hopByHopHeaders {
+		blocked[strings.ToLower(name)] = true
+	}
+	blocked[strings.ToLower(HttpHeaderProxyAgent)] = true
+	for name, values := range header {
+		if !strings.EqualFold(name, HttpHeaderConnection) {
+			continue
+		}
+		for _, value := range values {
+			for token := range strings.SplitSeq(value, ",") {
+				if token = textproto.TrimString(token); token != "" {
+					blocked[strings.ToLower(token)] = true
+				}
 			}
 		}
 	}
-	for _, h := range hopByHopHeaders {
-		header.Del(h)
+	for name := range header {
+		if blocked[strings.ToLower(name)] {
+			delete(header, name)
+		}
 	}
-	header.Del(HttpHeaderProxyAgent)
 }
 
 func sanitizeWebsocketUpgradeHeaders(header http.Header) {

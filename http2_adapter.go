@@ -24,7 +24,9 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 		order.Headers = append(requestPseudoHeaderOrder(profile), order.Headers...)
 	}
 	var err error
-	if len(preparedReq.Trailer) > 0 {
+	if profile != nil && profile.writeBlock != nil {
+		// Exact field blocks are mutually exclusive with name-group ordering.
+	} else if len(preparedReq.Trailer) > 0 {
 		headerOrder := order.Headers
 		if profile != nil && profile.fingerprint != nil {
 			pseudoOrder := profile.fingerprint.PseudoHeaderOrder
@@ -55,7 +57,7 @@ func prepareHTTP2Request(req *http.Request) (*http.Request, error) {
 			return nil, fmt.Errorf("apply HTTP/2 fingerprint: %w", err)
 		}
 	}
-	return preparedReq, nil
+	return withExactRequestHeaderBlock(preparedReq, 2)
 }
 
 func upstreamHTTP2Fingerprint(source http.Fingerprint) http.Fingerprint {

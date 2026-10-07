@@ -228,6 +228,16 @@ func hijackedRequestNeedsContinue(req *http.Request) bool {
 	return state != nil && state.sendContinue
 }
 
+// done also closes when a body is aborted. Only EOF authorizes the session
+// reader to consume another request from the shared downstream buffer.
+func hijackedRequestBodyComplete(req *http.Request) bool {
+	if req == nil {
+		return true
+	}
+	state, _ := req.Context().Value(hijackedRequestBodyContextKey{}).(*hijackedRequestBodyState)
+	return state == nil || state.lifecycle.Load() == hijackedBodyComplete
+}
+
 func (b *hijackedRequestBody) copyTrailers() {
 	b.request.Trailer = b.parsedRequest.Trailer
 }
