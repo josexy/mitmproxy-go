@@ -621,58 +621,43 @@ This project is available under the MIT License.
 
 ### HTTP rewrite controls
 
-HTTP interceptors can call `WithHTTPUpstreamTarget(request, targetURL)` before
-`next.Invoke`. It copies the target's HTTP/HTTPS scheme and authority into a
-request-scoped route while preserving the request path, query and `Host`.
-The original downstream authority is validated before the interceptor runs.
-Same-origin overrides reuse the validated route's transport, retaining
-keep-alive and HTTP/2 multiplexing. Each cross-origin invocation owns its
-upstream transport; concurrent HTTP/2 streams cannot change each other's
-destination. Configured upstream proxies,
-TLS trust/client certificates, captured TLS fingerprints and request
-cancellation still apply. HTTPS uses the target hostname for certificate
-verification and SNI. The private transport closes with the response body.
+Call `WithHTTPUpstreamTarget(request, targetURL)` before `Invoke` to override
+the upstream HTTP/HTTPS scheme and authority for one request, preserving its
+path, query and `Host`. The original authority is validated before interception.
+Same-origin overrides retain connection reuse; cross-origin calls use isolated
+transports that close with the response body. Proxy, TLS and cancellation
+settings still apply, including client certificates and captured fingerprints.
+HTTPS verification and SNI use the target hostname.
 
 `WithRequestHeaderBlock(request, block)` and
-`SetResponseHeaderBlock(response, block)` configure an outgoing initial field
-sequence using `xhttp.HeaderBlock`. Unlike `HeaderOrder`, fields retain
-interleaved duplicates and empty values, as well as casing on HTTP/1. Configure
-the final `Header` values before setting the override: each ordered occurrence
-is matched against those final values; deleted/changed fields are not revived,
-and remaining fields follow deterministically. The proxy still sanitizes
-hop-by-hop headers and generates Host/pseudo-headers and framing. Received
-`RequestWireHeaderBlocks` and `ResponseWireHeaderBlocks` remain unchanged.
-These proxy overrides are reconciled ordering preferences; xhttp's exact-block
-APIs instead require a complete, valid wire field sequence and add no automatic
-fields. HTTP/1 name order and occurrence order are applied to one parsed response
-head before serialization; body streaming and late trailer handling are shared.
-HTTP/1 response heads requiring exact reordering are bounded to 64 KiB and fail
-before sending when that bound is exceeded. These APIs affect ordinary HTTP
-interception, not WebSocket or raw TCP relay.
+`SetResponseHeaderBlock(response, block)` set outgoing initial header order via
+`xhttp.HeaderBlock`, preserving interleaved duplicates, empty values and HTTP/1
+casing. Set final `Header` values first: overrides match current values and
+append remaining fields deterministically. Hop-by-hop sanitization,
+Host/pseudo-header generation and framing still apply; received wire metadata,
+body streaming and late trailers are unchanged. HTTP/1 response heads requiring
+exact reordering are limited to 64 KiB; larger heads fail before sending.
+These overrides apply only to ordinary HTTP interception.
 
-Returning `ErrDropHTTP` (including a wrapped sentinel) closes the HTTP/1
-connection or aborts only the current HTTP/2 stream, without a final HTTP
-response. Return before `Invoke` to prevent an upstream request, or after
-`Invoke` to discard its response. The proxy releases invoked response bodies
-on error. To interrupt a blocked interceptor request-body read, call
-`AbortHTTPRequestRead(request, cause)` and return `ErrDropHTTP`; HTTP/1 cannot
-reuse that connection. Canceling the invoked request context also interrupts
-upstream response reads, including HTTP/1 pipeline bodies.
+Return `ErrDropHTTP` (also recognized when wrapped) to close the HTTP/1 connection
+or abort the current HTTP/2 stream without a final response. Return before
+`Invoke` to prevent forwarding, or after it to discard the response; the proxy
+releases invoked response bodies on error. To interrupt blocked request-body
+reads, call `AbortHTTPRequestRead(request, cause)` and return `ErrDropHTTP`.
+Canceling the invoked request context interrupts upstream response reads,
+including HTTP/1 pipeline bodies.
 
-`SetHTTPResponseSendObserver(response, callback)` reports one terminal
-`HTTPResponseSendResult`: `StartedAt`, `EndedAt`, `BodyBytes`, `HeaderBlock`,
-`Err`, and `Canceled`. `HeaderBlock` describes the final outgoing initial head. Body pre-reading does not complete this observer. HTTP/1 counts
-entity bytes accepted by actual connection writes, excluding framing. HTTP/2
-counts bytes accepted by its response writer and uses `xhttp.FinishResponse`
-to require successful flushing of the terminal END_STREAM and trailer frames
-before reporting success.
-Neither protocol claims peer acknowledgment.
-`EndedAt` is a terminal time even on failure, so only a nil `Err` means completed
-delivery to the connection. Callbacks run synchronously and may run concurrently
-for different streams; keep them brief and synchronize shared state. Configure
-the observer before returning the response, including locally generated ones.
+Call `SetHTTPResponseSendObserver(response, callback)` before returning any
+response, including locally generated ones. It reports one terminal
+`HTTPResponseSendResult` with timing, body bytes, the final outgoing initial
+header block, error and cancellation status. Body pre-reading does not trigger
+completion. HTTP/1 counts body bytes written to the connection; HTTP/2 counts
+bytes accepted by its response writer and requires flushing END_STREAM and
+trailers for success. Only a nil `Err` indicates successful sending; neither
+protocol guarantees peer acknowledgment. Callbacks run synchronously and may
+overlap across streams; keep them brief and synchronize shared state.
 
-`WithHTTPRequestSendHeaderObserver(request, callback)` observes the final
-sanitized outgoing header block during transport preparation when an explicit
-`WithRequestHeaderBlock` override is present. It includes the selected upstream
-protocol; it is not a per-attempt timing or completion event.
+`WithHTTPRequestSendHeaderObserver(request, callback)` requires an explicit
+`WithRequestHeaderBlock` override. It reports the final sanitized header block
+and selected upstream protocol during transport preparation, not per-attempt
+timing or send completion.
