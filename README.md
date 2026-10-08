@@ -618,3 +618,46 @@ gofmt -w <files>
 ## License
 
 This project is available under the MIT License.
+
+### HTTP rewrite controls
+
+Call `WithHTTPUpstreamTarget(request, targetURL)` before `Invoke` to override
+the upstream HTTP/HTTPS scheme and authority for one request, preserving its
+path, query and `Host`. The original authority is validated before interception.
+Same-origin overrides retain connection reuse; cross-origin calls use isolated
+transports that close with the response body. Proxy, TLS and cancellation
+settings still apply, including client certificates and captured fingerprints.
+HTTPS verification and SNI use the target hostname.
+
+`WithRequestHeaderBlock(request, block)` and
+`SetResponseHeaderBlock(response, block)` set outgoing initial header order via
+`xhttp.HeaderBlock`, preserving interleaved duplicates, empty values and HTTP/1
+casing. Set final `Header` values first: overrides match current values and
+append remaining fields deterministically. Hop-by-hop sanitization,
+Host/pseudo-header generation and framing still apply; received wire metadata,
+body streaming and late trailers are unchanged. HTTP/1 response heads requiring
+exact reordering are limited to 64 KiB; larger heads fail before sending.
+These overrides apply only to ordinary HTTP interception.
+
+Return `ErrDropHTTP` (also recognized when wrapped) to close the HTTP/1 connection
+or abort the current HTTP/2 stream without a final response. Return before
+`Invoke` to prevent forwarding, or after it to discard the response; the proxy
+releases invoked response bodies on error. To interrupt blocked request-body
+reads, call `AbortHTTPRequestRead(request, cause)` and return `ErrDropHTTP`.
+Canceling the invoked request context interrupts upstream response reads,
+including HTTP/1 pipeline bodies.
+
+Call `SetHTTPResponseSendObserver(response, callback)` before returning any
+response, including locally generated ones. It reports one terminal
+`HTTPResponseSendResult` with timing, body bytes, the final outgoing initial
+header block, error and cancellation status. Body pre-reading does not trigger
+completion. HTTP/1 counts body bytes written to the connection; HTTP/2 counts
+bytes accepted by its response writer and requires flushing END_STREAM and
+trailers for success. Only a nil `Err` indicates successful sending; neither
+protocol guarantees peer acknowledgment. Callbacks run synchronously and may
+overlap across streams; keep them brief and synchronize shared state.
+
+`WithHTTPRequestSendHeaderObserver(request, callback)` requires an explicit
+`WithRequestHeaderBlock` override. It reports the final sanitized header block
+and selected upstream protocol during transport preparation, not per-attempt
+timing or send completion.

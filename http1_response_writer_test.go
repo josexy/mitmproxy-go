@@ -3,6 +3,8 @@ package mitmproxy
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -164,5 +166,60 @@ func TestReorderHTTP1ResponseHeaderPreservesGroupSemantics(t *testing.T) {
 				t.Fatalf("reordered response = %q; want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestHTTP1ResponseWriterCombinesNameAndOccurrenceOrder(t *testing.T) {
+	response := &http.Response{
+		StatusCode: 200, ProtoMajor: 1, ProtoMinor: 1,
+		Header: http.Header{
+			"X-Repeat": {"one", "two", ""},
+			"X-Middle": {"middle"},
+			"X-A":      {"updated"},
+			"X-Z":      {"z"},
+		},
+		Body: io.NopCloser(strings.NewReader("ok")), ContentLength: 2,
+	}
+	if err := SetResponseHeaderOrder(response, http.HeaderOrder{Headers: []string{"x-z", "x-a", "x-repeat", "x-middle"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetResponseHeaderBlock(response, http.HeaderBlock{Kind: http.HeaderBlockInitial, Fields: []http.HeaderField{
+		{Name: "x-rEpEaT", Value: "two"},
+		{Name: "X-Middle", Value: "middle"},
+		{Name: "X-Repeat", Value: "one"},
+		{Name: "content-length", Value: "999"},
+		{Name: "X-A", Value: "stale"},
+		{Name: "X-Deleted", Value: "gone"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	var observed HTTPResponseSendResult
+	if err := SetHTTPResponseSendObserver(response, func(result HTTPResponseSendResult) { observed = result }); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := writeHTTP1Response(&output, response); err != nil {
+		t.Fatal(err)
+	}
+	const want = "HTTP/1.1 200 OK\r\nx-rEpEaT: two\r\nX-Middle: middle\r\nX-Repeat: one\r\ncontent-length: 2\r\nX-Z: z\r\nX-A: updated\r\nX-Repeat: \r\n\r\nok"
+	if output.String() != want {
+		t.Fatalf("wire = %q; want %q", output.String(), want)
+	}
+	wantFields := []http.HeaderField{
+		{Name: "x-rEpEaT", Value: "two"}, {Name: "X-Middle", Value: "middle"},
+		{Name: "X-Repeat", Value: "one"}, {Name: "content-length", Value: "2"},
+		{Name: "X-Z", Value: "z"}, {Name: "X-A", Value: "updated"}, {Name: "X-Repeat", Value: ""},
+	}
+	if observed.Err != nil || observed.BodyBytes != 2 || !reflect.DeepEqual(observed.HeaderBlock.Fields, wantFields) {
+		t.Fatalf("send observation = %+v; want fields %+v and 2 body bytes", observed, wantFields)
+	}
+}
+
+func TestHTTP1ResponseWriterPreservesWhitespaceWithoutExactOverride(t *testing.T) {
+	wire := []byte("HTTP/1.1 200 OK\r\nX-A:\t one \t\r\nx-B:\r\nX-A: two\r\n\r\nbody")
+	got := reorderHTTP1ResponseHeader(wire, bytes.Index(wire, []byte("\r\n\r\n")), []string{"x-b", "x-a"})
+	const want = "HTTP/1.1 200 OK\r\nx-B:\r\nX-A:\t one \t\r\nX-A: two\r\n\r\nbody"
+	if string(got) != want {
+		t.Fatalf("wire = %q; want %q", got, want)
 	}
 }

@@ -279,6 +279,13 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 	tlsRequest, firstRead, canRetarget bool,
 	srcConn net.Conn,
 ) (retErr error) {
+	ctx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
+	if request != nil {
+		request = ensureRequestWireProfile(request)
+		profile := requestWireProfileFromRequest(request)
+		request = withRequestWireProfile(request.WithContext(ctx), profile)
+	}
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	baseReqCtx, _ := FromRequestContext(ctx)
 	started := time.Now()
@@ -313,7 +320,27 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 	stop := make(chan struct{})
 	writerDone := make(chan error, 1)
 	go func() {
-		writerDone <- r.writeHTTP1Session(srcConn, items, slots, stop, readState, connCtx.config.state.idleConnTimeout)
+		err := r.writeHTTP1Session(srcConn, items, slots, stop, readState, connCtx.config.state.idleConnTimeout)
+		if err != nil {
+			cancelSession()
+			readState.terminateRead()
+		}
+		writerDone <- err
+		// Later pipelined requests may already have completed. Release every
+		// response even when an earlier exchange drops or fails downstream.
+		for item := range items {
+			result := <-item.result
+			if result.response != nil {
+				finishUnsentHTTPResponse(result.response, context.Canceled)
+				if result.response.Body != nil {
+					_ = result.response.Body.Close()
+				}
+			}
+			item.ticket.complete()
+			close(item.written)
+			<-slots
+			readState.requestFinished()
+		}
 	}()
 
 	closeItems := sync.OnceFunc(func() { close(items) })
@@ -444,6 +471,11 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 
 		select {
 		case <-hijackedRequestBodyDone(item.request):
+			if !hijackedRequestBodyComplete(item.request) {
+				// Close may interrupt a Read on another goroutine. Do not
+				// race it by starting the next request's header parser.
+				return waitWriter()
+			}
 		case result := <-item.result:
 			item.result <- result
 			// A final response before the original body boundary makes later
@@ -472,6 +504,14 @@ func (r *mitmProxyHandler) writeHTTP1Session(
 	for item := range items {
 		result := <-item.result
 		response := result.response
+		if errors.Is(result.err, ErrDropHTTP) {
+			item.ticket.complete()
+			close(item.written)
+			<-slots
+			readState.requestFinished()
+			readState.terminateRead()
+			return result.err
+		}
 		if result.err != nil || response == nil {
 			info := http1RequestInfo(item.request)
 			logAttrs(item.ctx, loggerFromContext(item.ctx), slog.LevelWarn, "http1 pipeline request failed",
@@ -498,6 +538,7 @@ func (r *mitmProxyHandler) writeHTTP1Session(
 			response.Close = true
 		}
 		if err := prepareHTTP1Response(item.request, response); err != nil {
+			finishUnsentHTTPResponse(response, err)
 			_ = response.Body.Close()
 			item.ticket.complete()
 			close(item.written)

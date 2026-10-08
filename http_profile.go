@@ -23,10 +23,13 @@ type headerOrderSnapshotProvider func() http.HeaderOrder
 type headerBlockSnapshotProvider func() []http.HeaderBlock
 
 type responseWireProfile struct {
-	order  headerOrderSnapshotProvider
-	blocks headerBlockSnapshotProvider
+	sendObserver func(HTTPResponseSendResult)
+	sendContext  context.Context
+	order        headerOrderSnapshotProvider
+	blocks       headerBlockSnapshotProvider
 	// writeOrder is an immutable sending override, separate from received metadata.
 	writeOrder *http.HeaderOrder
+	writeBlock *http.HeaderBlock
 }
 
 var responseWireProfiles = struct {
@@ -50,12 +53,14 @@ func responseWireProfileFor(response *http.Response) (responseWireProfile, bool)
 // request from xhttp's pointer-associated receive blocks. Values remain owned
 // by this profile for the lifetime of one proxied request.
 type requestWireProfile struct {
-	headerOrder  []string
-	trailerOrder []string
-	fingerprint  *http.Fingerprint
-	blocks       headerBlockSnapshotProvider
+	sendHeaderObserver func(http.HeaderBlock)
+	headerOrder        []string
+	trailerOrder       []string
+	fingerprint        *http.Fingerprint
+	blocks             headerBlockSnapshotProvider
 	// writeOrder is an immutable sending override, separate from received metadata.
 	writeOrder *http.HeaderOrder
+	writeBlock *http.HeaderBlock
 }
 
 func ensureRequestWireProfile(req *http.Request) *http.Request {
@@ -300,6 +305,9 @@ func requestPseudoHeaderOrder(profile *requestWireProfile) []string {
 }
 
 func withRequestHeaderOrder(req *http.Request) (*http.Request, error) {
+	if profile := requestWireProfileFromRequest(req); profile != nil && profile.writeBlock != nil {
+		return withExactRequestHeaderBlock(req, 1)
+	}
 	order := requestHeaderOrder(req)
 	if len(order.Headers) == 0 && len(order.Trailers) == 0 {
 		return req, nil

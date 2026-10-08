@@ -53,12 +53,16 @@ type http1PipelineExchange struct {
 
 	pipeline    *http1PipelineConn
 	releaseOnce sync.Once
+	stopCancel  func() bool
 	queuedAt    time.Time
 	info        http1PipelineRequestInfo
 }
 
 func (e *http1PipelineExchange) release() {
 	e.releaseOnce.Do(func() {
+		if e.stopCancel != nil {
+			e.stopCancel()
+		}
 		<-e.pipeline.slots
 		e.pipeline.endActivity()
 	})
@@ -130,6 +134,7 @@ func (p *http1PipelineConn) RoundTrip(req *http.Request) (*http.Response, error)
 		queuedAt: time.Now(),
 		info:     http1RequestInfo(req),
 	}
+	exchange.stopCancel = context.AfterFunc(ctx, func() { p.closeWithError(context.Cause(ctx)) })
 	select {
 	case p.writeQueue <- exchange:
 		notifyHTTP1PipelineQueued(req)

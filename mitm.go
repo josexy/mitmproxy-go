@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/textproto"
 	"slices"
 	"strconv"
 	"strings"
@@ -211,6 +212,8 @@ type biConnContext struct {
 	config *runtimeConfig
 
 	baseMetadata connectionMetadataRecorder
+	// Immutable after downstream TLS negotiation, before any HTTP streams start.
+	clientHello  *capturedClientHello
 	remoteDialMu sync.Mutex
 	remoteDialFn func(context.Context, string, string) (net.Conn, error)
 
@@ -1087,6 +1090,7 @@ func certificateCacheKey(serverName, host string) string {
 }
 
 func (r *mitmProxyHandler) setTLSRemoteDialer(connCtx *biConnContext, hostport string, firstConn net.Conn, hello capturedClientHello) {
+	connCtx.clientHello = &hello
 	var mu sync.Mutex
 	initialConn := firstConn
 	initialConnConsumed := false
@@ -1692,7 +1696,12 @@ func http1ResponseBodyAllowed(req *http.Request, statusCode int) bool {
 // write. [http.Response.Write] emits four writes per header field, which on a
 // raw connection is four syscalls and on a TLS connection four TLS records. The
 // body is streamed straight through so responses that trickle are not delayed.
-func writeHTTP1Response(dst io.Writer, response *http.Response) error {
+func writeHTTP1Response(dst io.Writer, response *http.Response) (err error) {
+	send := newHTTPResponseSend(response)
+	defer func() { send.finish(err) }()
+	if send.observer != nil {
+		dst = &http1ObservedWriter{dst: dst, send: send, bodyAllowed: http1ResponseBodyAllowed(response.Request, response.StatusCode)}
+	}
 	order := responseHeaderOrder(response)
 	writer := &http1ResponseWriter{
 		dst:      dst,
@@ -1700,9 +1709,9 @@ func writeHTTP1Response(dst io.Writer, response *http.Response) error {
 		response: response,
 		chunked:  chunkedTransferEncoding(response.TransferEncoding) && len(response.Trailer) > 0,
 	}
-	err := response.Write(writer)
-	if flushErr := writer.flush(); err == nil {
-		err = flushErr
+	err = response.Write(writer)
+	if err == nil {
+		err = writer.flush()
 	}
 	return err
 }
@@ -1748,7 +1757,8 @@ func (w *http1ResponseWriter) Write(data []byte) (int, error) {
 		if w.request != nil {
 			w.chunked = bytes.Contains(bytes.ToLower(pending[:headerEnd]), []byte("\r\ntransfer-encoding: chunked\r\n"))
 		}
-		header := reorderHTTP1ResponseHeader(pending[:headerEnd], index, w.order)
+		profile, _ := responseWireProfileFor(w.response)
+		header := reorderHTTP1HeaderBlock(pending[:headerEnd], index, w.order, 1, profile.writeBlock)
 		if err := writeAll(w.dst, header); err != nil {
 			return 0, err
 		}
@@ -1758,6 +1768,9 @@ func (w *http1ResponseWriter) Write(data []byte) (int, error) {
 		return len(data), nil
 	}
 	if len(w.buf) >= maxBufferedResponseHeaderBytes {
+		if profile, ok := responseWireProfileFor(w.response); ok && profile.writeBlock != nil {
+			return 0, errors.New("mitmproxy: exact response header exceeds buffering limit")
+		}
 		if err := w.flush(); err != nil {
 			return 0, err
 		}
@@ -1928,77 +1941,87 @@ func (w *http1ResponseWriter) writeAfterHeader(data []byte) error {
 }
 
 func reorderHTTP1ResponseHeader(pending []byte, delimiter int, order []string) []byte {
-	return reorderHTTP1HeaderBlock(pending, delimiter, order, 1)
+	return reorderHTTP1HeaderBlock(pending, delimiter, order, 1, nil)
 }
 
 func reorderHTTP1TrailerBlock(pending []byte, delimiter int, order []string) []byte {
-	return reorderHTTP1HeaderBlock(pending, delimiter, order, 0)
+	return reorderHTTP1HeaderBlock(pending, delimiter, order, 0, nil)
 }
 
-func reorderHTTP1HeaderBlock(pending []byte, delimiter int, order []string, prefixLineCount int) []byte {
-	if delimiter < 0 || len(order) == 0 {
+// Reconcile both ordering modes on the same parsed fields. Response.Write still
+// owns framing; only its sanitized head is reordered. Ordinary name ordering
+// retains the original field whitespace, while an exact override uses logical
+// values for occurrence matching and writes the requested casing.
+func reorderHTTP1HeaderBlock(pending []byte, delimiter int, order []string, prefixLineCount int, override *http.HeaderBlock) []byte {
+	if delimiter < 0 || (len(order) == 0 && override == nil) {
 		return pending
 	}
 	lines := bytes.Split(pending[:delimiter], []byte("\r\n"))
-	if len(lines) < prefixLineCount {
+	if len(lines) <= prefixLineCount {
 		return pending
 	}
-	fieldLines := lines[prefixLineCount:]
-	if len(fieldLines) == 0 {
-		return pending
-	}
-	type headerGroup struct {
-		name  string
-		lines [][]byte
-	}
-	groups := make([]headerGroup, 0, len(fieldLines))
-	groupsByName := make(map[string]int, len(fieldLines))
-	for _, line := range fieldLines {
-		name, _, ok := bytes.Cut(line, []byte(":"))
+	fields := make([]http.HeaderField, 0, len(lines)-prefixLineCount)
+	for _, line := range lines[prefixLineCount:] {
+		name, value, ok := strings.Cut(string(line), ":")
 		if !ok {
 			return pending
 		}
-		lower := strings.ToLower(string(name))
-		index, ok := groupsByName[lower]
-		if !ok {
-			index = len(groups)
-			groupsByName[lower] = index
-			groups = append(groups, headerGroup{name: lower})
+		field := http.HeaderField{Name: name, Value: value}
+		if override != nil {
+			field.Value = textproto.TrimString(field.Value)
 		}
-		groups[index].lines = append(groups[index].lines, line)
+		fields = append(fields, field)
 	}
-	positions := make(map[string]int, len(order))
-	for index, name := range order {
-		name = strings.ToLower(name)
-		if !strings.HasPrefix(name, ":") {
-			positions[name] = index
+	if len(order) > 0 {
+		positions := make(map[string]int, len(order))
+		for index, name := range order {
+			name = strings.ToLower(name)
+			if !strings.HasPrefix(name, ":") {
+				positions[name] = index
+			}
 		}
+		// Resolve each name once instead of allocating lowercase strings on
+		// every comparison. Equal ranks retain duplicate occurrence order.
+		type fieldRank struct {
+			name     string
+			position int
+		}
+		ranks := make(map[string]fieldRank, len(fields))
+		for _, field := range fields {
+			if _, ok := ranks[field.Name]; ok {
+				continue
+			}
+			name := strings.ToLower(field.Name)
+			position, listed := positions[name]
+			if !listed {
+				position = len(order)
+			}
+			ranks[field.Name] = fieldRank{name, position}
+		}
+		slices.SortStableFunc(fields, func(a, b http.HeaderField) int {
+			left, right := ranks[a.Name], ranks[b.Name]
+			if result := cmp.Compare(left.position, right.position); result != 0 {
+				return result
+			}
+			return strings.Compare(left.name, right.name)
+		})
 	}
-	slices.SortStableFunc(groups, func(leftGroup, rightGroup headerGroup) int {
-		left, leftListed := positions[leftGroup.name]
-		right, rightListed := positions[rightGroup.name]
-		switch {
-		case leftListed && rightListed:
-			return cmp.Compare(left, right)
-		case leftListed:
-			return -1
-		case rightListed:
-			return 1
-		default:
-			return strings.Compare(leftGroup.name, rightGroup.name)
-		}
-	})
-
+	if override != nil {
+		fields = orderedSendingFields(fields, override.Fields, 1)
+	}
 	result := make([]byte, 0, len(pending))
 	for _, line := range lines[:prefixLineCount] {
 		result = append(result, line...)
 		result = append(result, "\r\n"...)
 	}
-	for _, group := range groups {
-		for _, line := range group.lines {
-			result = append(result, line...)
-			result = append(result, "\r\n"...)
+	for _, field := range fields {
+		result = append(result, field.Name...)
+		result = append(result, ':')
+		if override != nil {
+			result = append(result, ' ')
 		}
+		result = append(result, field.Value...)
+		result = append(result, "\r\n"...)
 	}
 	result = append(result, "\r\n"...)
 	result = append(result, pending[delimiter+4:]...)
@@ -2619,6 +2642,7 @@ func (r *mitmProxyHandler) relayConnForHTTP(ctx context.Context, srcConn net.Con
 		response.Close = true
 	}
 	if err = prepareHTTP1Response(reqCtx.Request, response); err != nil {
+		finishUnsentHTTPResponse(response, err)
 		return nil, err
 	}
 	// A client that stops reading must not pin this goroutine and the upstream
@@ -2679,17 +2703,41 @@ func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.R
 	req = req.WithContext(context.WithValue(ctx, connContextKey, connCtx))
 	start := time.Now()
 	profile := requestWireProfileFromRequest(req)
+	// Capture the validated route before an interceptor mutates URL or Host.
+	originalTarget := httpUpstreamTarget{scheme: req.URL.Scheme, address: reqCtx.Hostport}
+	var invocationMu sync.Mutex
+	var invocationBodies []*httpInvocationBody
 	profiledInvoker := HTTPDelegatedInvokerFunc(func(nextReq *http.Request) (*http.Response, error) {
 		if nextReq != nil && requestWireProfileFromRequest(nextReq) == nil {
 			nextReq = withRequestWireProfile(nextReq, profile)
 		}
-		if exchangeTiming == nil || nextReq == nil {
-			return invoker.Invoke(nextReq)
+		if nextReq == nil {
+			return nil, errors.New("mitmproxy: nil request")
 		}
-		tracedRequest, attempt := exchangeTiming.traceRequest(nextReq)
-		response, invokeErr := invoker.Invoke(tracedRequest)
-		exchangeTiming.observeResult(tracedRequest, response, invokeErr, attempt)
-		return response, invokeErr
+		invokeCtx, cancel := context.WithCancel(nextReq.Context())
+		nextReq = nextReq.WithContext(invokeCtx)
+		var response *http.Response
+		var invokeErr error
+		if exchangeTiming == nil {
+			response, invokeErr = r.invokeHTTPUpstream(nextReq, invoker, originalTarget)
+		} else {
+			tracedRequest, attempt := exchangeTiming.traceRequest(nextReq)
+			response, invokeErr = r.invokeHTTPUpstream(tracedRequest, invoker, originalTarget)
+			exchangeTiming.observeResult(tracedRequest, response, invokeErr, attempt)
+		}
+		if invokeErr != nil || response == nil {
+			cancel()
+			return response, invokeErr
+		}
+		if response.Body == nil {
+			response.Body = http.NoBody
+		}
+		body := &httpInvocationBody{ReadCloser: response.Body, cancel: cancel}
+		response.Body = body
+		invocationMu.Lock()
+		invocationBodies = append(invocationBodies, body)
+		invocationMu.Unlock()
+		return response, nil
 	})
 	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http request",
 		slog.String("hostport", reqCtx.Hostport),
@@ -2704,6 +2752,21 @@ func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.R
 		response, err = profiledInvoker.Invoke(req)
 	}
 	if err != nil {
+		invocationMu.Lock()
+		bodies := append([]*httpInvocationBody(nil), invocationBodies...)
+		invocationMu.Unlock()
+		for _, body := range bodies {
+			_ = body.Close()
+		}
+		if response != nil {
+			finishUnsentHTTPResponse(response, err)
+		}
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if errors.Is(err, ErrDropHTTP) {
+			closeRequestBody(req)
+		}
 		err = fmt.Errorf("transport RoundTrip %s failed: %w", reqCtx.Hostport, err)
 		logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http request failed",
 			slog.String("hostport", reqCtx.Hostport),
@@ -2721,6 +2784,7 @@ func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.R
 	if response.Body == nil {
 		response.Body = http.NoBody
 	}
+	updateResponseProfile(response, func(profile *responseWireProfile) { profile.sendContext = req.Context() })
 	logConfigAttrs(ctx, connCtx.config, slog.LevelDebug, "http response",
 		slog.String("hostport", reqCtx.Hostport),
 		slog.String("method", requestMethod(req)),
@@ -2775,6 +2839,9 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 			req.GetBody = func() (io.ReadCloser, error) { return http.NoBody, nil }
 		}
 		response, err := r.roundTripWithContext(streamCtx, req)
+		if errors.Is(err, ErrDropHTTP) {
+			panic(http.ErrAbortHandler)
+		}
 		if err != nil {
 			handleErrorWithConfig(connCtx.config, ErrorContext{
 				Hostport:   reqCtx.Hostport,
@@ -2793,10 +2860,18 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 			http.Error(rw, http.StatusText(status), status)
 			return
 		}
+		defer response.Body.Close()
+		if response.Request == nil {
+			response.Request = req
+		}
+		send := newHTTPResponseSend(response)
+		defer func() { send.finish(err) }()
+		rw = &http2ObservedWriter{ResponseWriter: rw, send: send, bodyAllowed: http1ResponseBodyAllowed(req, response.StatusCode)}
 		removeHopByHopHeaders(response.Header)
 		order := responseHeaderOrder(response)
-		if len(order.Headers) > 0 || len(order.Trailers) > 0 {
-			if err := http.SetResponseHeaderOrder(rw, order); err != nil {
+		_, exactResponse := responseSendingBlock(response, 2)
+		if !exactResponse && (len(order.Headers) > 0 || len(order.Trailers) > 0) {
+			if err = http.SetResponseHeaderOrder(rw, order); err != nil {
 				handleErrorWithConfig(connCtx.config, ErrorContext{
 					Hostport:   reqCtx.Hostport,
 					RemoteAddr: req.RemoteAddr,
@@ -2811,10 +2886,17 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 				rw.Header().Add(k, v)
 			}
 		}
-		rw.WriteHeader(response.StatusCode)
+		if block, exact := responseSendingBlock(response, 2); exact {
+			send.result.HeaderBlock = cloneSendingBlock(block)
+			send.start()
+			if err = http.WriteResponseHeaderBlock(rw, block); err != nil {
+				panic(http.ErrAbortHandler)
+			}
+		} else {
+			rw.WriteHeader(response.StatusCode)
+		}
 		body := response.Body
 		if body != nil {
-			defer body.Close()
 			// CAN NOT use response.Write(rw) because it is used for HTTP1
 			if err = r.forwardStreamBody(rw, body, shouldFlushHTTP2Response(response)); err != nil {
 				handleErrorWithConfig(connCtx.config, ErrorContext{
@@ -2822,7 +2904,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 					RemoteAddr: req.RemoteAddr,
 					Error:      fmt.Errorf("write http2 body failed: %s", err),
 				})
-				return
+				panic(http.ErrAbortHandler)
 			}
 		}
 
@@ -2830,13 +2912,20 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 		// EOF, so configure their exact order at this late boundary.
 		trailerBlock := responseTrailerHeaderBlock(response)
 		if len(trailerBlock.Fields) > 0 {
-			if err := http.SetResponseTrailerBlock(rw, trailerBlock); err != nil {
+			if err = http.SetResponseTrailerBlock(rw, trailerBlock); err != nil {
 				handleErrorWithConfig(connCtx.config, ErrorContext{
 					Hostport:   reqCtx.Hostport,
 					RemoteAddr: req.RemoteAddr,
 					Error:      fmt.Errorf("set http2 response trailer block: %w", err),
 				})
 			}
+		}
+		if err == nil {
+			err = http.FinishResponse(rw)
+			send.completed = err == nil
+		}
+		if err != nil {
+			panic(http.ErrAbortHandler)
 		}
 	})
 }
@@ -2850,7 +2939,7 @@ func shouldFlushHTTP2Response(response *http.Response) bool {
 }
 
 func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Reader, flushEachWrite bool) error {
-	flusher, ok := rw.(http.Flusher)
+	_, ok := rw.(http.Flusher)
 	if !ok {
 		// This should never happen for http2
 		return iocopy.IoCopy(rw, body)
@@ -2861,17 +2950,19 @@ func (r *mitmProxyHandler) forwardStreamBody(rw http.ResponseWriter, body io.Rea
 		n, err := body.Read(buffer)
 		if n > 0 {
 			if _, writeErr := rw.Write(buffer[:n]); writeErr != nil {
-				return fmt.Errorf("write to http.ResponseWriter failed: %s", writeErr)
+				return fmt.Errorf("write to http.ResponseWriter failed: %w", writeErr)
 			}
 			if flushEachWrite {
-				flusher.Flush()
+				if err := http.NewResponseController(rw).Flush(); err != nil {
+					return err
+				}
 			}
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("read from response body failed: %s", err)
+			return fmt.Errorf("read from response body failed: %w", err)
 		}
 	}
 	return nil
