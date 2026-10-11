@@ -19,6 +19,11 @@ An easy-to-use and flexible MITM proxy library for Go. It can intercept and insp
 - Request metadata for TLS, timing, and connection details
 - Optional structured internal logging through `log/slog`
 - Runtime config updates for new connections
+- Injectable local IP resolution and context dialing for application-owned DNS caches
+
+Applications can supply `WithIPResolver` for the destination lookup performed before an upstream-proxy tunnel, and `WithContextDialer` for direct connections and proxy endpoints. Pair both with the same resolver/cache to share local results. Direct connections resolve through the context dialer; this option does not change which destinations are resolved locally. Implementations must be concurrency-safe, respect cancellation, and emit `github.com/josexy/xhttp/httptrace` DNS/connection hooks for connection timing. The configured `WithDialer` still bounds the operation timeout/deadline; a custom context dialer owns its socket options. Without these options, existing `WithDialer` behavior is unchanged. Hooks are retained when runtime proxy configuration is rebuilt, and applications own their lifetime and cache invalidation.
+
+To report a successful application-cache hit as zero DNS duration, a resolver can call `ReportDNSCacheHit(ctx)` before returning its cached result; a context dialer calls it before its `DNSDone` hook. Only completed cache entries qualify; concurrent callers waiting for an active lookup retain their measured duration. TCP/TLS timestamps remain unchanged, and proxy-endpoint cache hits do not overwrite destination DNS timing.
 
 ## Installation
 
@@ -188,6 +193,11 @@ happen after the interceptor has returned, and callbacks can arrive from
 different goroutines, so observers must be concurrency-safe and return quickly.
 The dumper example shows how to aggregate the four timestamps and derive request,
 wait, response, and total durations.
+
+Connection DNS, TCP, TLS, and upstream exchange timestamps share a timing clock
+for each intercepted connection. Windows uses QueryPerformanceCounter to retain
+short intervals within a coarse system-clock tick; other platforms use Go's
+system clock. Metadata and timing events continue to expose `time.Time` values.
 
 ### WebSocket Interceptor
 

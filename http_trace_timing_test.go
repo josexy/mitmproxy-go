@@ -280,6 +280,8 @@ func TestRoundTripWithInvokerUpstreamHTTPTraceIsOptIn(t *testing.T) {
 			connCtx := &biConnContext{config: config}
 			ctx := context.WithValue(context.Background(), connContextKey, connCtx)
 			ctx = AppendToRequestContext(ctx, ReqContext{Hostport: "example.test:80"})
+			clock := connectionTestClock(4)
+			ctx = withTimingClock(ctx, clock)
 			request := &http.Request{
 				Method: http.MethodGet,
 				URL:    &url.URL{Scheme: "http", Host: "example.test", Path: "/"},
@@ -288,6 +290,9 @@ func TestRoundTripWithInvokerUpstreamHTTPTraceIsOptIn(t *testing.T) {
 				Body:   http.NoBody,
 			}
 			invoker := HTTPDelegatedInvokerFunc(func(request *http.Request) (*http.Response, error) {
+				if timingClockFromContext(request.Context()) != clock {
+					t.Fatal("request context lost the connection timing clock")
+				}
 				trace := httptrace.ContextClientTrace(request.Context())
 				if test.enabled {
 					if trace == nil {
@@ -333,6 +338,9 @@ func TestRoundTripWithInvokerUpstreamHTTPTraceIsOptIn(t *testing.T) {
 			got := make([]HTTPExchangeTimingPhase, len(events))
 			for index := range events {
 				got[index] = events[index].Phase
+				if !events[index].Timestamp.Equal(clock.timestamps[index]) {
+					t.Fatalf("exchange event did not use the connection clock: %+v", events[index])
+				}
 			}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("phases = %v, want %v", got, want)

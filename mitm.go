@@ -254,6 +254,8 @@ func (c *biConnContext) setRemoteDialer(dialFn func(context.Context, string, str
 }
 
 func (c *biConnContext) dialTCPWithMetadata(ctx context.Context, hostport string) (net.Conn, error) {
+	clock := timingClockFromContext(ctx)
+	ctx = withTimingClock(ctx, clock)
 	recorder := connectionMetadataRecorderForContext(ctx, c.baseMetadata)
 	start := time.Now()
 	logConfigAttrs(ctx, c.config, slog.LevelDebug, "upstream tcp dial started",
@@ -293,7 +295,7 @@ func (c *biConnContext) dialTCPWithMetadata(ctx context.Context, hostport string
 		slog.String("addr", hostport),
 		slog.Duration("duration", time.Since(start)),
 	)
-	setRemoteConnectionMetadata(recorder, conn, time.Now())
+	setRemoteConnectionMetadata(recorder, conn, clock.Now())
 	return conn, nil
 }
 
@@ -577,7 +579,9 @@ func (r *mitmProxyHandler) serveWithConfig(ctx context.Context, conn net.Conn, c
 			})
 		}
 	}()
-	localConnEstTs := time.Now()
+	clock := timingClockFromContext(ctx)
+	ctx = withTimingClock(ctx, clock)
+	localConnEstTs := clock.Now()
 	md := metadata.NewMD()
 	md.SetLocalConnectionEstablishedTs(localConnEstTs)
 	md.SetRequestReceivedTs(localConnEstTs)
@@ -606,7 +610,7 @@ func (r *mitmProxyHandler) serveWithConfig(ctx context.Context, conn net.Conn, c
 		slog.String("addr", reqCtx.Hostport),
 		slog.Duration("duration", time.Since(dialStart)),
 	)
-	remoteConnEstTs := time.Now()
+	remoteConnEstTs := clock.Now()
 	if reqCtx.Socks5Connect {
 		if err = writeSocks5Reply(conn, socks5ReplySucceeded, dstConn.LocalAddr()); err != nil {
 			conn.Close()
@@ -987,14 +991,15 @@ func (r *mitmProxyHandler) initiateSSLHandshakeWithClientHello(ctx context.Conte
 		return nil, nil, fmt.Errorf("apply client hello fingerprint: %w", err)
 	}
 	// send client hello and do tls handshake
-	md.SetSSLHandshakeStartTs(time.Now())
+	clock := timingClockFromContext(ctx)
+	md.SetSSLHandshakeStartTs(clock.Now())
 	clearHandshakeDeadline := setDeadlineForTimeout(conn, cfg.state.handshakeTimeout)
 	err = tlsClientConn.HandshakeContext(ctx)
 	clearHandshakeDeadline()
 	if err != nil {
 		return nil, nil, fmt.Errorf("upstream tls handshake: %w", err)
 	}
-	tlsConnEstTs := time.Now()
+	tlsConnEstTs := clock.Now()
 	cs := tlsClientConn.ConnectionState()
 	var downstreamNextProtos []string
 	if cs.NegotiatedProtocol != "" {
@@ -1559,7 +1564,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		}
 		nextCtx = cloneMetadataContext(nextCtx)
 		if md, ok := metadata.FromContext(nextCtx); ok {
-			md.SetRequestReceivedTs(time.Now())
+			md.SetRequestReceivedTs(timingClockFromContext(nextCtx).Now())
 			md.SetRequestHostport(nextReqCtx.Hostport)
 		}
 		passthrough, passthroughReason := shouldPassthroughRequest(connCtx.config, nextReqCtx.Hostport)
@@ -2461,7 +2466,7 @@ func (r *mitmProxyHandler) relayConnForWS(ctx context.Context, srcConn, dstConn 
 	var handshakeClock timingClock
 	var handshakeTiming WebsocketHandshakeTiming
 	if cfg.state.upstreamHTTPTrace {
-		handshakeClock = newTimingClock()
+		handshakeClock = timingClockFromContext(ctx)
 		handshakeTiming.RequestStartedAt = handshakeClock.Now()
 		trace := &httptrace.ClientTrace{
 			WroteRequest: func(httptrace.WroteRequestInfo) {
@@ -2694,10 +2699,12 @@ func (r *mitmProxyHandler) roundTripWithInvoker(ctx context.Context, req *http.R
 	md, _ := metadata.FromContext(ctx)
 
 	reqCtx.Request = req
+	clock := timingClockFromContext(ctx)
 	ctx = metadata.AppendToContext(AppendToRequestContext(req.Context(), reqCtx), md)
+	ctx = withTimingClock(ctx, clock)
 	var exchangeTiming *httpExchangeTiming
 	if connCtx.config.state.upstreamHTTPTrace {
-		exchangeTiming = newHTTPExchangeTiming(newTimingClock())
+		exchangeTiming = newHTTPExchangeTiming(clock)
 		ctx = withHTTPExchangeTiming(ctx, exchangeTiming)
 	}
 	req = req.WithContext(context.WithValue(ctx, connContextKey, connCtx))
@@ -2807,7 +2814,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 		req = ensureRequestWireProfile(req)
 		streamCtx := cloneMetadataContext(ctx)
 		md, _ := metadata.FromContext(streamCtx)
-		md.SetRequestReceivedTs(time.Now())
+		md.SetRequestReceivedTs(timingClockFromContext(streamCtx).Now())
 		if !requestMatchesHostport(req, reqCtx.Hostport) {
 			err := fmt.Errorf("http2 authority %q does not match connection target %q", req.Host, reqCtx.Hostport)
 			handleErrorWithConfig(connCtx.config, ErrorContext{

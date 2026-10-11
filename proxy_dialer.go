@@ -17,6 +17,7 @@ import (
 	"time"
 
 	http "github.com/josexy/xhttp"
+	"github.com/josexy/xhttp/httptrace"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/proxy"
 )
@@ -190,9 +191,11 @@ func (c *addrConn) RemoteAddr() net.Addr {
 }
 
 type proxyDialer struct {
-	proxyURL  *url.URL
-	dialer    *net.Dialer
-	proxyFunc func(*url.URL) (*url.URL, error)
+	proxyURL      *url.URL
+	dialer        *net.Dialer
+	proxyFunc     func(*url.URL) (*url.URL, error)
+	ipResolver    IPResolver
+	contextDialer ContextDialer
 }
 
 type dialTimestampRecorder interface {
@@ -252,11 +255,14 @@ func (d *proxyDialer) dial(ctx context.Context, network, addr string) (net.Conn,
 }
 
 func (d *proxyDialer) dialWithMetadata(ctx context.Context, network, addr string, md dialTimestampRecorder) (net.Conn, error) {
+	if md != nil {
+		ctx = withTimingClock(ctx, timingClockFromContext(ctx))
+	}
 	proxyURL, err := d.proxyURLForAddress(addr)
 	if err != nil {
 		return nil, err
 	}
-	forward := &contextNetDialer{dialer: d.dialer, md: md}
+	forward := &contextNetDialer{dialer: d.dialer, contextDialer: d.contextDialer, md: md}
 	if proxyURL == nil {
 		return forward.DialContext(ctx, network, addr)
 	}
@@ -315,12 +321,23 @@ func (d *proxyDialer) resolveTCPAddr(ctx context.Context, network, addr string, 
 	}
 
 	if md != nil {
-		md.SetDNSLookupStartTs(time.Now())
+		clock := timingClockFromContext(ctx)
+		start := clock.Now()
+		md.SetDNSLookupStartTs(start)
+		var cacheHit *atomic.Bool
+		ctx, cacheHit = withDNSCacheHit(ctx)
 		defer func() {
-			md.SetDNSLookupCompletedTs(time.Now())
+			end := clock.Now()
+			if cacheHit.Load() {
+				end = start
+			}
+			md.SetDNSLookupCompletedTs(end)
 		}()
 	}
-	resolver := d.dialer.Resolver
+	resolver := d.ipResolver
+	if resolver == nil && d.dialer.Resolver != nil {
+		resolver = d.dialer.Resolver
+	}
 	if resolver == nil {
 		resolver = net.DefaultResolver
 	}
@@ -349,6 +366,7 @@ func (d *proxyDialer) proxyURLForAddress(addr string) (*url.URL, error) {
 
 type contextNetDialer struct {
 	dialer          *net.Dialer
+	contextDialer   ContextDialer
 	md              dialTimestampRecorder
 	skipDNSMetadata bool
 }
@@ -358,9 +376,19 @@ func (d *contextNetDialer) Dial(network, addr string) (net.Conn, error) {
 }
 
 func (d *contextNetDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	var clock timingClock = systemTimingClock{}
+	if d.md != nil {
+		clock = timingClockFromContext(ctx)
+		ctx = withTimingClock(ctx, clock)
+	}
 	recordDNS := d.md != nil && !d.skipDNSMetadata && shouldRecordDNSLookup(addr)
+	var dnsStart time.Time
 	if recordDNS {
-		d.md.SetDNSLookupStartTs(time.Now())
+		dnsStart = clock.Now()
+		d.md.SetDNSLookupStartTs(dnsStart)
+	}
+	if d.contextDialer != nil {
+		return d.dialCustom(ctx, network, addr, recordDNS, dnsStart)
 	}
 	dialer := *d.dialer
 	originalControlContext := dialer.ControlContext
@@ -371,7 +399,7 @@ func (d *contextNetDialer) DialContext(ctx context.Context, network, addr string
 	dialer.ControlContext = func(ctx context.Context, network, address string, rawConn syscall.RawConn) error {
 		connectStartOnce.Do(func() {
 			connectStarted.Store(true)
-			now := time.Now()
+			now := clock.Now()
 			if recordDNS {
 				d.md.SetDNSLookupCompletedTs(now)
 			}
@@ -388,13 +416,86 @@ func (d *contextNetDialer) DialContext(ctx context.Context, network, addr string
 		return nil
 	}
 	conn, err := dialer.DialContext(ctx, network, addr)
-	now := time.Now()
+	now := clock.Now()
 	if recordDNS && !connectStarted.Load() {
 		d.md.SetDNSLookupCompletedTs(now)
 	}
 	if d.md != nil && connectStarted.Load() {
 		d.md.SetSocketConnectCompletedTs(now)
 	}
+	return conn, err
+}
+
+func (d *contextNetDialer) dialCustom(ctx context.Context, network, addr string, recordDNS bool, dnsStart time.Time) (net.Conn, error) {
+	deadline := d.dialer.Deadline
+	if d.dialer.Timeout > 0 {
+		timeout := time.Now().Add(d.dialer.Timeout)
+		if deadline.IsZero() || timeout.Before(deadline) {
+			deadline = timeout
+		}
+	}
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	if d.dialer.Cancel != nil { //nolint:staticcheck // Preserve WithDialer's legacy cancellation behavior.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		go func(cancelCtx context.Context) {
+			select {
+			case <-d.dialer.Cancel: //nolint:staticcheck // Preserve WithDialer's legacy cancellation behavior.
+				cancel()
+			case <-cancelCtx.Done():
+			}
+		}(ctx)
+	}
+	if d.md == nil {
+		return d.contextDialer.DialContext(ctx, network, addr)
+	}
+	clock := timingClockFromContext(ctx)
+	var cacheHit *atomic.Bool
+	if recordDNS {
+		ctx, cacheHit = withDNSCacheHit(ctx)
+	}
+	// A dual-stack dial can finish while its losing candidate is still unwinding.
+	// Do not allow that candidate's trace to modify an already-published attempt.
+	var mu sync.Mutex
+	active, started, completed := true, false, false
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			mu.Lock()
+			defer mu.Unlock()
+			if active && recordDNS && info.Err == nil {
+				end := clock.Now()
+				if cacheHit.Load() {
+					end = dnsStart
+				}
+				d.md.SetDNSLookupCompletedTs(end)
+			}
+		},
+		ConnectStart: func(_, _ string) {
+			mu.Lock()
+			defer mu.Unlock()
+			if active && !started {
+				started = true
+				d.md.SetSocketConnectStartTs(clock.Now())
+			}
+		},
+		ConnectDone: func(_, _ string, err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if active && !completed && err == nil {
+				completed = true
+				d.md.SetSocketConnectCompletedTs(clock.Now())
+			}
+		},
+	})
+	conn, err := d.contextDialer.DialContext(ctx, network, addr)
+	mu.Lock()
+	active = false
+	mu.Unlock()
 	return conn, err
 }
 

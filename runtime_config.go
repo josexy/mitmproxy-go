@@ -78,6 +78,8 @@ type runtimeConfigState struct {
 	excludeHosts      []string
 	rootCAs           []string
 	dialer            *net.Dialer
+	ipResolver        IPResolver
+	contextDialer     ContextDialer
 	logger            *slog.Logger
 
 	idleConnTimeout       time.Duration
@@ -122,6 +124,8 @@ func newRuntimeConfigStateFromOptions(opts *options) runtimeConfigState {
 		excludeHosts:          slices.Clone(opts.excludeHosts),
 		rootCAs:               slices.Clone(opts.rootCAs),
 		dialer:                opts.dialer,
+		ipResolver:            opts.ipResolver,
+		contextDialer:         opts.contextDialer,
 		logger:                opts.logger,
 		idleConnTimeout:       opts.idleConnTimeout,
 		handshakeTimeout:      opts.handshakeTimeout,
@@ -206,6 +210,8 @@ func buildRuntimeConfig(state runtimeConfigState) (*runtimeConfig, error) {
 		httpInt:        buildHTTPInterceptorChain(state.httpInt, state.chainHttpInts),
 	}
 	cfg.domainMatcher.include = includeMatcher
+	cfg.proxyDialer.ipResolver = state.ipResolver
+	cfg.proxyDialer.contextDialer = state.contextDialer
 	cfg.domainMatcher.exclude = excludeMatcher
 	return cfg, nil
 }

@@ -49,6 +49,8 @@ type options struct {
 	excludeHosts      []string    // Blacklist of hosts to exclude from interception (supports wildcards)
 	rootCAs           []string    // Paths to additional root CA certificate files
 	dialer            *net.Dialer // Custom dialer for outbound connections
+	ipResolver        IPResolver
+	contextDialer     ContextDialer
 	logger            *slog.Logger
 
 	idleConnTimeout    time.Duration // Idle timeout for connections
@@ -254,6 +256,34 @@ func WithDialer(dialer *net.Dialer) Option {
 	return OptionFunc(func(o *options) {
 		o.dialer = dialer
 	})
+}
+
+// IPResolver resolves locally looked-up hosts, including the destination
+// pre-resolution performed when forwarding through an upstream proxy.
+// Implementations must be safe for concurrent use.
+type IPResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+// ContextDialer establishes outbound connections. Implementations must support
+// cancellation, concurrent use, and httptrace hooks to retain connection timing.
+type ContextDialer interface {
+	DialContext(context.Context, string, string) (net.Conn, error)
+}
+
+// WithIPResolver overrides local destination resolution for upstream proxies.
+// Direct connections resolve through WithContextDialer or the configured net.Dialer.
+// A nil resolver retains the configured net.Dialer's resolver.
+func WithIPResolver(resolver IPResolver) Option {
+	return OptionFunc(func(o *options) { o.ipResolver = resolver })
+}
+
+// WithContextDialer overrides direct and proxy-endpoint dialing. The configured
+// net.Dialer still supplies the overall timeout/deadline/cancellation; the implementation
+// owns socket options and emits httptrace DNS/connection hooks. A nil dialer
+// retains WithDialer's behavior. Pair with WithIPResolver for shared resolution.
+func WithContextDialer(dialer ContextDialer) Option {
+	return OptionFunc(func(o *options) { o.contextDialer = dialer })
 }
 
 // WithIdleConnTimeout sets the idle timeout for connections.
