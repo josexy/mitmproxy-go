@@ -401,7 +401,7 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 		nextCtx = AppendToRequestContext(nextCtx, nextReqCtx)
 		nextCtx = cloneMetadataContext(nextCtx)
 		if md, ok := metadata.FromContext(nextCtx); ok {
-			md.SetRequestReceivedTs(time.Now())
+			md.SetRequestReceivedTs(timingClockFromContext(nextCtx).Now())
 			md.SetRequestHostport(hostport)
 		}
 

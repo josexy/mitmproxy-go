@@ -329,6 +329,8 @@ func rebuildRuntimeConfig(oldCfg *runtimeConfig, state runtimeConfigState, parts
 			return nil, err
 		}
 		cfg.proxyDialer = newConfiguredProxyDialer(proxyURL, state.dialer, !state.disableProxy && state.proxy == "")
+		cfg.proxyDialer.ipResolver = state.ipResolver
+		cfg.proxyDialer.contextDialer = state.contextDialer
 	}
 	if parts.rootCAs {
 		rootPool, err := loadRootCAPool(state.rootCAs)

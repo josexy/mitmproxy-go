@@ -808,4 +808,9 @@ func TestHTTPSConnectionTimestamps(t *testing.T) {
 	if md.SSLHandshakeCompletedTs.Before(md.SSLHandshakeStartTs) {
 		t.Fatalf("SSL handshake completed before it started: %#v", md)
 	}
+	if md.RemoteConnectionEstablishedTs.Before(md.SocketConnectCompletedTs) ||
+		md.SSLHandshakeStartTs.Before(md.RemoteConnectionEstablishedTs) ||
+		!md.SSLHandshakeCompletedTs.After(md.SSLHandshakeStartTs) {
+		t.Fatalf("connection phases are not ordered on the same clock: %#v", md)
+	}
 }

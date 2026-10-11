@@ -38,6 +38,12 @@ func main() {
 		mitmproxy.WithLogger(logger),
 		mitmproxy.WithHTTPInterceptor(tagInterceptor("initial")),
 		mitmproxy.WithIdleConnTimeout(30*time.Second),
+		// Applications can replace these two implementations with shared
+		// cached resolution/dialing. Direct dialing owns its DNS lookup.
+		// Cached implementations can call ReportDNSCacheHit(ctx) on a hit
+		// to report zero DNS duration in the connection metadata.
+		mitmproxy.WithIPResolver(net.DefaultResolver),
+		mitmproxy.WithContextDialer(&net.Dialer{Timeout: 15 * time.Second}),
 		mitmproxy.WithErrorHandler(func(ec mitmproxy.ErrorContext) {
 			slog.Error("mitm proxy error",
 				slog.String("remote_addr", ec.RemoteAddr),
