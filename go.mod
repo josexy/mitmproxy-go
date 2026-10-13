@@ -1,10 +1,10 @@
 module github.com/josexy/mitmproxy-go/v2
 
-go 1.27.0
+go 1.27.2
 
 require (
 	github.com/josexy/websocket v0.0.0-20260820071228-412d0f6b5891
-	github.com/josexy/xhttp v0.0.0-20261008063219-ca8ba626def8
+	github.com/josexy/xhttp v0.0.0-20261013115735-180c3ba43222
 	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
