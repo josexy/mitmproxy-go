@@ -27,7 +27,7 @@ To report a successful application-cache hit as zero DNS duration, a resolver ca
 
 ## Installation
 
-Requires Go 1.27.2 or later.
+Requires Go 1.27.3 or later.
 
 ```bash
 go get github.com/josexy/mitmproxy-go/v2

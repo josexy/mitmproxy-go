@@ -2,7 +2,7 @@
 
 ## 项目与代码导航
 
-Go 1.27.2+ 的 MITM 代理库，模块路径为 `github.com/josexy/mitmproxy-go/v2`；支持 HTTP、HTTPS、HTTP/2、h2c、WebSocket 和 SOCKS5。
+Go 1.27.3+ 的 MITM 代理库，模块路径为 `github.com/josexy/mitmproxy-go/v2`；支持 HTTP、HTTPS、HTTP/2、h2c、WebSocket 和 SOCKS5。
 
 - `mitm.go`、`socks5.go`：代理入口、协议分流与转发。
 - `transport.go`、`http1_*`、`http2_*`、`h2c.go`：上游连接、HTTP 会话、流水线与协议适配。

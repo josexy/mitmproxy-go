@@ -2,8 +2,8 @@ github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtn
 github.com/andybalholm/brotli v1.2.2/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/josexy/websocket v0.0.0-20260820071228-412d0f6b5891 h1:nPBBheHXDAwthl/Eatf8WXNzrqMnqIqFm5tU8uMT47o=
 github.com/josexy/websocket v0.0.0-20260820071228-412d0f6b5891/go.mod h1:e/m0+ie/tpugMyeeitiYrJTsa8gal1Xu7WNq6VMqqUQ=
-github.com/josexy/xhttp v0.0.0-20261013115735-180c3ba43222 h1:OVcvFOHQ9F0ePwwi35dtHhsg/U7Gx0HdFKJ8UnLn1AA=
-github.com/josexy/xhttp v0.0.0-20261013115735-180c3ba43222/go.mod h1:2qn23M+8izQ4Pb887U2GZtKkav5HBMV844hA+FUiGfo=
+github.com/josexy/xhttp v0.0.0-20261024062155-5f478641bbf0 h1:lxEXfxW4kjs0wyqjeWHdVsanqHtCJ8RTgH74S4weHHY=
+github.com/josexy/xhttp v0.0.0-20261024062155-5f478641bbf0/go.mod h1:PjM6Z2gWOgFByjUuj8KGJK1/viSN1FT5NHbTXygIsb8=
 github.com/klauspost/compress v1.19.0 h1:sXLILfc9jV2QYWkzFOPWStmcUVH2RHEB1JCdY2oVvCQ=
 github.com/klauspost/compress v1.19.0/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/refraction-networking/utls v1.8.2 h1:j4Q1gJj0xngdeH+Ox/qND11aEfhpgoEvV+S9iJ2IdQo=
