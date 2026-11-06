@@ -112,6 +112,11 @@ type (
 	HTTPDelegatedInvokerFunc      func(*http.Request) (*http.Response, error)
 	WebsocketDelegatedInvokerFunc func(int, *buf.Buffer) error
 
+	// HTTPInterceptor handles one HTTP exchange. It may invoke upstream more
+	// than once and should close the body of every invoked response it does
+	// not return; any it leaves open are released once the returned response
+	// finishes. On HTTP/1, an invocation made while an earlier response body of
+	// the same exchange is still open uses a separate upstream connection.
 	HTTPInterceptor      func(context.Context, *http.Request, HTTPDelegatedInvoker) (*http.Response, error)
 	WebsocketInterceptor func(context.Context, *http.Request, *http.Response, WebsocketFramesWatcher)
 	// RawTCPInterceptor observes classified raw TCP tunnels. It is called synchronously

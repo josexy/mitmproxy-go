@@ -293,9 +293,10 @@ func WithContextDialer(dialer ContextDialer) Option {
 // This helps to free up resources and prevent hanging connections.
 //
 // It also bounds how long an idle HTTP keep-alive connection, and the upstream
-// connection pinned to it, are kept around. Defaults to 90 seconds. Pass 0 to
-// disable it, at the cost of idle clients holding a goroutine and an upstream
-// connection indefinitely.
+// connection pinned to it, are kept around, and how long the remaining
+// direction of a half-closed tunnel may stay idle. Defaults to 90 seconds. Pass
+// 0 to disable it, at the cost of idle clients holding a goroutine and an
+// upstream connection indefinitely.
 //
 // Example:
 //
@@ -308,7 +309,8 @@ func WithIdleConnTimeout(timeout time.Duration) Option {
 	})
 }
 
-// WithHandshakeTimeout limits protocol sniffing and TLS/SOCKS handshakes.
+// WithHandshakeTimeout limits protocol sniffing, TLS and SOCKS handshakes, and
+// each side of a WebSocket opening handshake.
 func WithHandshakeTimeout(timeout time.Duration) Option {
 	return OptionFunc(func(o *options) {
 		o.handshakeTimeout = timeout
@@ -489,6 +491,9 @@ func WithIncludeHosts(hosts ...string) Option {
 
 // WithExcludeHosts specifies a blacklist of hosts that should NOT be intercepted.
 // Traffic to these hosts will pass through without interception (passthrough mode).
+// Tunnels are relayed without terminating TLS. Requests on a plain proxy
+// connection, which may address any origin, are still routed one by one and
+// skip the HTTP and WebSocket interceptors.
 //
 // Supports wildcard patterns:
 //   - "cdn.example.com" - exact match

@@ -14,7 +14,19 @@ import (
 	"github.com/josexy/xhttp/httptrace"
 )
 
-var errHTTP1PipelineClosed = errors.New("HTTP/1 pipeline connection closed")
+var (
+	errHTTP1PipelineClosed       = errors.New("HTTP/1 pipeline connection closed")
+	errHTTP1ResponseNotDrained   = errors.New("HTTP/1 response closed before EOF with too much remaining to drain")
+	errHTTP1ResponseCloseConcurs = errors.New("HTTP/1 response closed during a read")
+)
+
+// An early-closed response is drained up to this bound, which keeps its
+// pipelined connection, and the requests queued behind it, usable. A longer or
+// slower remainder closes the connection instead.
+const (
+	http1MaxResponseDrainBytes = 256 << 10
+	http1MaxResponseDrainTime  = time.Second
+)
 
 type http1PipelineQueuedHookKey struct{}
 
@@ -361,6 +373,12 @@ type http1PipelineResponseBody struct {
 	body     io.ReadCloser
 	done     chan struct{}
 
+	// readMu guards reading and closed, so Close never drains concurrently
+	// with a caller's Read on the shared connection reader.
+	readMu  sync.Mutex
+	reading int
+	closed  bool
+
 	finishOnce sync.Once
 	closeOnce  sync.Once
 	closeErr   error
@@ -383,35 +401,75 @@ func newHTTP1PipelineResponseBody(p *http1PipelineConn, exchange *http1PipelineE
 }
 
 func (b *http1PipelineResponseBody) Read(data []byte) (int, error) {
+	b.readMu.Lock()
+	if b.closed {
+		b.readMu.Unlock()
+		return 0, http.ErrBodyReadAfterClose
+	}
+	b.reading++
+	b.readMu.Unlock()
 	n, err := b.body.Read(data)
+	b.readMu.Lock()
+	b.reading--
+	b.readMu.Unlock()
 	if err == io.EOF {
 		b.finish()
 	}
 	return n, err
 }
 
+// streamDone reports whether the response no longer occupies the connection,
+// which is already true for a bodyless response nobody has read.
+func (b *http1PipelineResponseBody) streamDone() bool {
+	select {
+	case <-b.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close keeps the connection reusable when the unread remainder is short:
+// HTTP/1 cannot skip a response, so it drains a bounded amount and otherwise
+// closes the connection. Only an error closing the body itself is returned.
 func (b *http1PipelineResponseBody) Close() error {
 	b.closeOnce.Do(func() {
-		select {
-		case <-b.done:
+		b.readMu.Lock()
+		b.closed = true
+		reading := b.reading > 0
+		b.readMu.Unlock()
+		if b.streamDone() {
 			b.closeErr = b.body.Close()
 			return
-		default:
+		}
+		// Closing a parsed body that has not reached EOF reads all of its
+		// remainder, so every path that abandons the remainder closes the
+		// connection first; the body then fails fast and its error is moot.
+		if reading {
+			// Draining would race the blocked Read. Closing the connection
+			// also interrupts that Read.
+			b.pipeline.closeWithError(errHTTP1ResponseCloseConcurs)
+			_ = b.body.Close()
+			b.finish()
+			return
 		}
 
-		if b.pipeline.idleTimeout > 0 {
-			_ = b.pipeline.conn.SetReadDeadline(time.Now().Add(b.pipeline.idleTimeout))
+		_ = b.pipeline.conn.SetReadDeadline(time.Now().Add(http1MaxResponseDrainTime))
+		n, drainErr := io.CopyN(io.Discard, b.body, http1MaxResponseDrainBytes+1)
+		_ = b.pipeline.conn.SetReadDeadline(time.Time{})
+		switch {
+		case drainErr == io.EOF:
+			drainErr = nil
+		case drainErr == nil && n > http1MaxResponseDrainBytes:
+			drainErr = errHTTP1ResponseNotDrained
 		}
-		_, copyErr := io.Copy(io.Discard, b.body)
-		if b.pipeline.idleTimeout > 0 {
-			_ = b.pipeline.conn.SetReadDeadline(time.Time{})
+		if drainErr != nil {
+			b.pipeline.closeWithError(drainErr)
+			_ = b.body.Close()
+		} else {
+			b.closeErr = b.body.Close()
 		}
-		closeErr := b.body.Close()
-		b.closeErr = errors.Join(copyErr, closeErr)
 		b.finish()
-		if b.closeErr != nil {
-			b.pipeline.closeWithError(b.closeErr)
-		}
 	})
 	return b.closeErr
 }

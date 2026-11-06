@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	mathrand "math/rand"
 	"net"
@@ -32,6 +33,38 @@ type singleConnTransport struct {
 	retired        []*http.ClientConn
 	negotiatedALPN string
 	closed         bool
+	// dedicated holds one-off HTTP/1 connections; see roundTripHTTP1Dedicated.
+	dedicated map[*http1PipelineConn]struct{}
+
+	// lifetime is canceled by Close. Dials run under mu, so merging it into
+	// their context lets Close interrupt a dial instead of waiting it out.
+	lifetimeOnce sync.Once
+	lifetime     context.Context
+	endLifetime  context.CancelFunc
+}
+
+// http1DedicatedConnKey marks a request that must not share the pipelined
+// HTTP/1 connection; see roundTripHTTP1Dedicated.
+type http1DedicatedConnKey struct{}
+
+func (t *singleConnTransport) lifetimeContext() (context.Context, context.CancelFunc) {
+	t.lifetimeOnce.Do(func() {
+		t.lifetime, t.endLifetime = context.WithCancel(context.Background())
+	})
+	return t.lifetime, t.endLifetime
+}
+
+// dialContext extends ctx to end when the transport closes. Call the returned
+// function once the dial finishes; established connections do not depend on
+// the dial context.
+func (t *singleConnTransport) dialContext(ctx context.Context) (context.Context, func()) {
+	lifetime, _ := t.lifetimeContext()
+	dialCtx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(lifetime, func() { cancel(net.ErrClosed) })
+	return dialCtx, func() {
+		stop()
+		cancel(nil)
+	}
 }
 
 func newTransport(
@@ -66,17 +99,22 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return nil, fmt.Errorf("apply request header order: %w", err)
 	}
 	if t.shouldUseHTTP1Pipeline(req) {
+		if dedicated, _ := req.Context().Value(http1DedicatedConnKey{}).(bool); dedicated {
+			return t.roundTripHTTP1Dedicated(req)
+		}
 		return t.roundTripHTTP1(req)
 	}
 	logger := loggerFromContext(req.Context())
 	for attempt := 0; ; attempt++ {
 		start := time.Now()
-		logAttrs(req.Context(), logger, slog.LevelDebug, "transport round trip started",
-			slog.String("hostport", t.hostport),
-			slog.String("method", requestMethod(req)),
-			slog.String("url", requestURL(req)),
-			slog.Int("attempt", attempt),
-		)
+		if logEnabled(req.Context(), logger, slog.LevelDebug) {
+			logAttrs(req.Context(), logger, slog.LevelDebug, "transport round trip started",
+				slog.String("hostport", t.hostport),
+				slog.String("method", requestMethod(req)),
+				slog.String("url", requestURL(req)),
+				slog.Int("attempt", attempt),
+			)
+		}
 		clientConn, err := t.getClientConn(req.Context(), req)
 		if err != nil {
 			logAttrs(req.Context(), logger, slog.LevelWarn, "transport client connection failed",
@@ -91,14 +129,16 @@ func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 		resp, err := clientConn.RoundTrip(req)
 		if err == nil {
-			logAttrs(req.Context(), logger, slog.LevelDebug, "transport round trip completed",
-				slog.String("hostport", t.hostport),
-				slog.String("method", requestMethod(req)),
-				slog.String("url", requestURL(req)),
-				slog.Int("attempt", attempt),
-				slog.Int("status_code", resp.StatusCode),
-				slog.Duration("duration", time.Since(start)),
-			)
+			if logEnabled(req.Context(), logger, slog.LevelDebug) {
+				logAttrs(req.Context(), logger, slog.LevelDebug, "transport round trip completed",
+					slog.String("hostport", t.hostport),
+					slog.String("method", requestMethod(req)),
+					slog.String("url", requestURL(req)),
+					slog.Int("attempt", attempt),
+					slog.Int("status_code", resp.StatusCode),
+					slog.Duration("duration", time.Since(start)),
+				)
+			}
 			return resp, nil
 		}
 		discard := shouldDiscardClientConnAfterRoundTripError(req.Context(), clientConn, err)
@@ -245,7 +285,9 @@ func (t *singleConnTransport) getHTTP2ClientConn(ctx context.Context, req *http.
 			IdleConnTimeout:    t.idleTimeout,
 			Protocols:          protocols,
 		}
-		clientConn, err := baseTransport.NewClientConn(ctx, connScheme, t.hostport)
+		dialCtx, stopDial := t.dialContext(ctx)
+		clientConn, err := baseTransport.NewClientConn(dialCtx, connScheme, t.hostport)
+		stopDial()
 		if err != nil {
 			t.mu.Unlock()
 			return nil, key, err
@@ -330,6 +372,64 @@ func (t *singleConnTransport) roundTripHTTP1(req *http.Request) (*http.Response,
 	}
 }
 
+// roundTripHTTP1Dedicated sends req on a connection of its own that closes
+// with the response body. An interceptor that invokes upstream again while an
+// earlier response body of the same exchange is still open would otherwise
+// queue behind that body on the shared pipeline and never get a response. This
+// matches a client whose pool opens another connection while one is busy.
+func (t *singleConnTransport) roundTripHTTP1Dedicated(req *http.Request) (*http.Response, error) {
+	dialCtx, stopDial := t.dialContext(req.Context())
+	conn, err := t.dialFn(dialCtx, "tcp", t.hostport)
+	stopDial()
+	if err != nil {
+		closeRequestBody(req)
+		return nil, err
+	}
+	pipeline := newHTTP1PipelineConn(conn, 1, t.idleTimeout)
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		_ = pipeline.Close()
+		closeRequestBody(req)
+		return nil, net.ErrClosed
+	}
+	if t.dedicated == nil {
+		t.dedicated = make(map[*http1PipelineConn]struct{})
+	}
+	t.dedicated[pipeline] = struct{}{}
+	t.mu.Unlock()
+	release := func() {
+		t.mu.Lock()
+		delete(t.dedicated, pipeline)
+		t.mu.Unlock()
+		_ = pipeline.Close()
+	}
+	logAttrs(req.Context(), loggerFromContext(req.Context()), slog.LevelDebug, "http1 dedicated upstream connection created",
+		slog.String("hostport", t.hostport),
+	)
+	response, err := pipeline.RoundTrip(req)
+	if err != nil {
+		release()
+		closeRequestBody(req)
+		return nil, err
+	}
+	response.Body = &closeHookBody{ReadCloser: response.Body, onClose: release}
+	return response, nil
+}
+
+// closeHookBody runs onClose once after closing the wrapped body.
+type closeHookBody struct {
+	io.ReadCloser
+	once    sync.Once
+	onClose func()
+}
+
+func (b *closeHookBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.onClose)
+	return err
+}
+
 func (t *singleConnTransport) getHTTP1PipelineConn(ctx context.Context) (*http1PipelineConn, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -344,7 +444,9 @@ func (t *singleConnTransport) getHTTP1PipelineConn(ctx context.Context) (*http1P
 		t.http1Conn = nil
 	}
 
-	conn, err := t.dialFn(ctx, "tcp", t.hostport)
+	dialCtx, stopDial := t.dialContext(ctx)
+	conn, err := t.dialFn(dialCtx, "tcp", t.hostport)
+	stopDial()
 	if err != nil {
 		return nil, err
 	}
@@ -487,6 +589,9 @@ func shouldCloseDiscardedClientConn(clientConn *http.ClientConn, err error) bool
 }
 
 func (t *singleConnTransport) Close() error {
+	// A dial in progress holds mu; interrupt it before waiting for the lock.
+	_, endLifetime := t.lifetimeContext()
+	endLifetime()
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -505,6 +610,11 @@ func (t *singleConnTransport) Close() error {
 	t.http2Leases = nil
 	retired := t.retired
 	t.retired = nil
+	dedicated := make([]*http1PipelineConn, 0, len(t.dedicated))
+	for conn := range t.dedicated {
+		dedicated = append(dedicated, conn)
+	}
+	t.dedicated = nil
 	t.mu.Unlock()
 
 	if clientConn != nil {
@@ -517,6 +627,9 @@ func (t *singleConnTransport) Close() error {
 		_ = conn.Close()
 	}
 	for _, conn := range retired {
+		_ = conn.Close()
+	}
+	for _, conn := range dedicated {
 		_ = conn.Close()
 	}
 	return nil
@@ -759,11 +872,13 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 		// body can no longer be replayed. Check before handing it out.
 		reason := unusableClientConnReason(t.clientConn)
 		if reason == "" {
-			logAttrs(ctx, loggerFromContext(ctx), slog.LevelDebug, "transport client connection reused",
-				slog.String("hostport", t.hostport),
-				slog.String("method", requestMethod(req)),
-				slog.String("url", requestURL(req)),
-			)
+			if logger := loggerFromContext(ctx); logEnabled(ctx, logger, slog.LevelDebug) {
+				logAttrs(ctx, logger, slog.LevelDebug, "transport client connection reused",
+					slog.String("hostport", t.hostport),
+					slog.String("method", requestMethod(req)),
+					slog.String("url", requestURL(req)),
+				)
+			}
 			return t.clientConn, nil
 		}
 		stale := t.clientConn
@@ -792,7 +907,9 @@ func (t *singleConnTransport) getClientConn(ctx context.Context, req *http.Reque
 		IdleConnTimeout:    t.idleTimeout,
 		Protocols:          protos,
 	}
-	clientConn, err := baseTransport.NewClientConn(ctx, connScheme, t.hostport)
+	dialCtx, stopDial := t.dialContext(ctx)
+	clientConn, err := baseTransport.NewClientConn(dialCtx, connScheme, t.hostport)
+	stopDial()
 	if err != nil {
 		return nil, err
 	}
