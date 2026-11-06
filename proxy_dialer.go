@@ -190,6 +190,8 @@ func (c *addrConn) RemoteAddr() net.Addr {
 	return c.raddr
 }
 
+func (c *addrConn) CloseWrite() error { return closeWriteConn(c.Conn) }
+
 type proxyDialer struct {
 	proxyURL      *url.URL
 	dialer        *net.Dialer

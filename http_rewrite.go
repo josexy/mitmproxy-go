@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	http "github.com/josexy/xhttp"
@@ -211,17 +212,97 @@ type HTTPResponseSendResult struct {
 	Canceled    bool
 }
 
-// Invocation cancellation interrupts HTTP/1 draining reads and resets only the
-// corresponding upstream HTTP/2 stream. It also releases dropped responses an
-// interceptor did not return to the proxy.
+// httpInvocationBody owns the context of one delegated invocation. Closing it
+// closes the response body first, which lets a pipelined HTTP/1 body drain a
+// short remainder and keep its connection, and then cancels the invocation,
+// which resets the corresponding upstream HTTP/2 stream. The proxy also uses
+// it to release responses an interceptor did not return.
 type httpInvocationBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc
 	once   sync.Once
 	err    error
+	ended  atomic.Bool
+}
+
+func newHTTPInvocationBody(body io.ReadCloser, cancel context.CancelFunc) *httpInvocationBody {
+	b := &httpInvocationBody{ReadCloser: body, cancel: cancel}
+	if body == http.NoBody {
+		b.ended.Store(true)
+	}
+	return b
+}
+
+func (b *httpInvocationBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.ended.Store(true)
+	}
+	return n, err
 }
 
 func (b *httpInvocationBody) Close() error {
-	b.once.Do(func() { b.cancel(); b.err = b.ReadCloser.Close() })
+	b.once.Do(func() {
+		b.err = b.ReadCloser.Close()
+		b.ended.Store(true)
+		b.cancel()
+	})
 	return b.err
+}
+
+// responseStreamDoner is implemented by bodies that know their upstream stream
+// is finished before EOF is read, such as a bodyless pipelined response.
+type responseStreamDoner interface {
+	streamDone() bool
+}
+
+// pending reports whether the body may still occupy its upstream connection.
+func (b *httpInvocationBody) pending() bool {
+	if b.ended.Load() {
+		return false
+	}
+	if body, ok := b.ReadCloser.(responseStreamDoner); ok && body.streamDone() {
+		return false
+	}
+	return true
+}
+
+// unreturnedInvocationBodies closes, once the response returned to the proxy
+// is closed, every invoked response body an interceptor did not return.
+type unreturnedInvocationBodies struct {
+	io.ReadCloser
+	once   sync.Once
+	others []*httpInvocationBody
+}
+
+func (b *unreturnedInvocationBodies) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(func() {
+		for _, body := range b.others {
+			_ = body.Close()
+		}
+	})
+	return err
+}
+
+// releaseUnreturnedInvocationBodies arranges for invoked bodies other than
+// body itself to be closed with it. A returned body may wrap one of them, so
+// they are only closed after the returned body.
+func releaseUnreturnedInvocationBodies(body io.ReadCloser, invoked []*httpInvocationBody) io.ReadCloser {
+	others := make([]*httpInvocationBody, 0, len(invoked))
+	for _, candidate := range invoked {
+		if io.ReadCloser(candidate) != body {
+			others = append(others, candidate)
+		}
+	}
+	if len(others) == 0 {
+		return body
+	}
+	if body == nil || body == http.NoBody {
+		for _, other := range others {
+			_ = other.Close()
+		}
+		return body
+	}
+	return &unreturnedInvocationBodies{ReadCloser: body, others: others}
 }

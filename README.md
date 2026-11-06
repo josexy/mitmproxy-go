@@ -334,7 +334,9 @@ mitmproxy.WithDisableHTTP2()
 mitmproxy.WithSkipVerifySSLFromServer()
 ```
 
-`WithIdleConnTimeout` defaults to 90 seconds and bounds how long an idle HTTP keep-alive connection, together with the upstream connection pinned to it, is kept around. Pass `0` to disable it.
+`WithIdleConnTimeout` defaults to 90 seconds and bounds how long an idle HTTP keep-alive connection, together with the upstream connection pinned to it, is kept around. It also bounds how long the remaining direction of a half-closed tunnel may stay idle. Pass `0` to disable it.
+
+Raw TCP tunnels forward half-closes: when one peer shuts down its sending side, the other peer observes EOF while data keeps flowing in the opposite direction. A client that disconnects while its HTTP/1 requests are still waiting for upstream cancels those exchanges.
 
 `WithHTTP1PipelineDepth` defaults to 8 and bounds the number of HTTP/1 requests on one client connection that have not completed writing back. Requests for the same origin are pipelined on one upstream HTTP/1.1 connection; requests for different origins use separate upstream connections and may run concurrently. Responses are always returned in the client's original request order. Set the depth to 1 to retain keep-alive while disabling pipelining. `Expect: 100-continue`, protocol upgrades, and connection-closing requests remain ordering barriers.
 
@@ -383,6 +385,10 @@ When both `WithHTTPInterceptor` and `WithChainHTTPInterceptor` are configured, t
 
 HTTP interceptors may be called concurrently for pipelined requests from the same HTTP/1.1 client connection, just as they may be for HTTP/2 streams and independent clients. Interceptors that share mutable state must synchronize it.
 
+Close the body of any invoked response the interceptor does not return; any left open are released once the returned response finishes. On HTTP/1, invoking again while an earlier response body of the same exchange is still open sends the new request on a separate upstream connection, because the earlier response would otherwise block it on the shared pipelined connection.
+
+For WebSocket upgrades, an upstream response other than `101 Switching Protocols` is forwarded to the client with its body, and the client connection is then closed; the WebSocket interceptor does not run. `WithHandshakeTimeout` bounds both sides of the opening handshake.
+
 For WebSocket frames received from `WebsocketFramesWatcher`, call either `frame.Invoke()` to forward the frame or `frame.Release()` to drop it and release the backing buffer. `frame.Invoke()` releases the backing buffer after forwarding.
 
 `RawTCPInterceptor` is an observation-only callback invoked synchronously once for each classified raw TCP tunnel immediately before relay. The event contains the target `Hostport`, downstream `Source`, and a `TLS` flag.
@@ -413,6 +419,11 @@ are rejected with `ErrInvalidHostFilter` when the handler is built.
 
 Host filters select interception versus passthrough; they are not access-control
 rules and never block unmatched traffic.
+
+Passthrough for HTTPS, SOCKS5 and transparent tunnels relays the connection
+without terminating TLS. A plain proxy connection can carry requests for any
+origin, so its requests are still parsed and routed one by one: requests to a
+passthrough host are forwarded without HTTP or WebSocket interceptors.
 
 ## Dynamic Runtime Config
 

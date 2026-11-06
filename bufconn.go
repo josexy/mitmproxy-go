@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/josexy/mitmproxy-go/v2/buf"
+	"github.com/josexy/mitmproxy-go/v2/internal/iocopy"
 	"github.com/josexy/websocket"
 	http "github.com/josexy/xhttp"
 )
@@ -24,6 +26,18 @@ func newBufConn(c net.Conn) *bufConn { return &bufConn{Conn: c, r: bufio.NewRead
 func (c *bufConn) Peek(n int) ([]byte, error) { return c.r.Peek(n) }
 
 func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+func (c *bufConn) CloseWrite() error { return closeWriteConn(c.Conn) }
+
+// closeWriteConn shuts down the sending side of conn when it supports
+// half-close. Wrappers forward CloseWrite through this helper so a relay can
+// reach the innermost *net.TCPConn or TLS connection.
+func closeWriteConn(conn net.Conn) error {
+	if conn, ok := conn.(iocopy.CloseWriter); ok {
+		return conn.CloseWrite()
+	}
+	return errors.ErrUnsupported
+}
 
 type boundedHTTPHeaderConn struct {
 	net.Conn
@@ -185,15 +199,19 @@ func readBoundedHTTPResponse(reader *bufio.Reader, request *http.Request, maxHea
 }
 
 var (
-	wsBufferPool        = buf.New(512)
-	socksBufferPool     = buf.New(515)
-	http2BodyBufferPool = buf.NewV1(32 * 1024)
+	wsBufferPool    = buf.New(512)
+	socksBufferPool = buf.New(515)
+	// Pooling slice pointers keeps Put from allocating a slice header each time.
+	http2BodyBufferPool = sync.Pool{New: func() any {
+		buffer := make([]byte, 32*1024)
+		return &buffer
+	}}
 )
 
 func acquireBuffer() *buf.Buffer            { return wsBufferPool.Get() }
 func releaseBuffer(buffer *buf.Buffer)      { wsBufferPool.Put(buffer) }
-func acquireHTTP2BodyBuffer() []byte        { return http2BodyBufferPool.Get() }
-func releaseHTTP2BodyBuffer(buffer []byte)  { http2BodyBufferPool.Put(buffer) }
+func acquireHTTP2BodyBuffer() *[]byte       { return http2BodyBufferPool.Get().(*[]byte) }
+func releaseHTTP2BodyBuffer(buffer *[]byte) { http2BodyBufferPool.Put(buffer) }
 func acquireSocksBuffer() *buf.Buffer       { return socksBufferPool.Get() }
 func releaseSocksBuffer(buffer *buf.Buffer) { socksBufferPool.Put(buffer) }
 

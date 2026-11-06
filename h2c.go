@@ -81,3 +81,5 @@ func (c *bufConnExt) Read(p []byte) (int, error) {
 	}
 	return c.Reader.Read(p)
 }
+
+func (c *bufConnExt) CloseWrite() error { return closeWriteConn(c.Conn) }

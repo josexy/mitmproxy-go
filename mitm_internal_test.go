@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,10 +157,9 @@ func TestPassthroughTunnelRequiresInitialActivity(t *testing.T) {
 	remote, upstream := net.Pipe()
 	defer client.Close()
 	defer upstream.Close()
-	ctx := AppendToRequestContext(context.Background(), ReqContext{})
 	done := make(chan error, 1)
 	go func() {
-		done <- (&mitmProxyHandler{}).passthroughTunnel(ctx, local, remote, 30*time.Millisecond)
+		done <- (&mitmProxyHandler{}).passthroughTunnel(local, remote, 30*time.Millisecond, 0)
 	}()
 	select {
 	case <-done:
@@ -759,10 +759,9 @@ func TestPassthroughTunnelClearsDeadlineAfterActivity(t *testing.T) {
 	remote, upstream := net.Pipe()
 	defer client.Close()
 	defer upstream.Close()
-	ctx := AppendToRequestContext(context.Background(), ReqContext{})
 	done := make(chan error, 1)
 	go func() {
-		done <- (&mitmProxyHandler{}).passthroughTunnel(ctx, local, remote, 30*time.Millisecond)
+		done <- (&mitmProxyHandler{}).passthroughTunnel(local, remote, 30*time.Millisecond, 0)
 	}()
 
 	go func() { _, _ = client.Write([]byte("ping")) }()
@@ -965,4 +964,44 @@ func writeTestCA(t *testing.T) (certPath, keyPath string) {
 		t.Fatal(err)
 	}
 	return certPath, keyPath
+}
+
+func TestPrepareHTTP1ResponseClosesReplacedEmptyBody(t *testing.T) {
+	body := &closeTrackingBody{Reader: strings.NewReader("")}
+	response := &http.Response{StatusCode: http.StatusOK, ProtoMajor: 1, ProtoMinor: 1, Header: make(http.Header), Body: body}
+	request := &http.Request{Method: http.MethodGet, ProtoMajor: 1, ProtoMinor: 1}
+	if err := prepareHTTP1Response(request, response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Body != http.NoBody || !body.closed {
+		t.Fatalf("body replaced=%t closed=%t; want the empty body closed and replaced", response.Body == http.NoBody, body.closed)
+	}
+}
+
+func TestReleaseUnreturnedInvocationBodies(t *testing.T) {
+	var canceled atomic.Int32
+	cancel := func() { canceled.Add(1) }
+	first := newHTTPInvocationBody(io.NopCloser(strings.NewReader("first")), cancel)
+	second := newHTTPInvocationBody(io.NopCloser(strings.NewReader("second")), cancel)
+	returned := releaseUnreturnedInvocationBodies(second, []*httpInvocationBody{first, second})
+	if !first.pending() || canceled.Load() != 0 {
+		t.Fatal("unreturned body released before the returned body was closed")
+	}
+	if err := returned.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if first.pending() || second.pending() || canceled.Load() != 2 {
+		t.Fatalf("after close: first pending=%t second pending=%t canceled=%d", first.pending(), second.pending(), canceled.Load())
+	}
+
+	third := newHTTPInvocationBody(io.NopCloser(strings.NewReader("third")), cancel)
+	if got := releaseUnreturnedInvocationBodies(http.NoBody, []*httpInvocationBody{third}); got != http.NoBody || third.pending() {
+		t.Fatal("bodyless response did not release the unreturned body immediately")
+	}
+	if !newHTTPInvocationBody(io.NopCloser(strings.NewReader("x")), cancel).pending() {
+		t.Fatal("unread body reported as finished")
+	}
+	if newHTTPInvocationBody(http.NoBody, cancel).pending() {
+		t.Fatal("bodyless response reported as pending")
+	}
 }

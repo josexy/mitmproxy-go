@@ -1930,3 +1930,29 @@ func readHTTP2ClientPreface(conn net.Conn) (*http2.Framer, error) {
 		}
 	}
 }
+
+// Close must interrupt a dial in progress rather than wait for it, so
+// Cleanup is not held up by unreachable upstreams.
+func TestSingleConnTransportCloseInterruptsDial(t *testing.T) {
+	dialStarted := make(chan struct{})
+	transport := newTransport("blocked.test:80", func(ctx context.Context, _, _ string) (net.Conn, error) {
+		close(dialStarted)
+		<-ctx.Done()
+		return nil, context.Cause(ctx)
+	}, time.Minute, true, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := transport.RoundTrip(newTransportTestRequest("blocked.test:80", "/"))
+		errCh <- err
+	}()
+	receiveRegressionValue(t, dialStarted)
+	closed := make(chan struct{})
+	go func() {
+		_ = transport.Close()
+		close(closed)
+	}()
+	receiveRegressionValue(t, closed)
+	if err := receiveRegressionValue(t, errCh); err == nil {
+		t.Fatal("round trip succeeded after Close interrupted its dial")
+	}
+}

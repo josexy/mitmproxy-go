@@ -3,6 +3,7 @@ package mitmproxy
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/url"
@@ -394,4 +395,100 @@ func readPipelineTestBody(t *testing.T, response *http.Response) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// Closing a response before EOF drains a short remainder, so the response
+// pipelined behind it still arrives on the same connection.
+func TestHTTP1PipelineEarlyCloseDrainsShortRemainder(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	pipeline := newHTTP1PipelineConn(client, 2, time.Second)
+	t.Cleanup(func() { _ = pipeline.Close() })
+
+	requestRead := make(chan struct{}, 2)
+	go func() {
+		reader := bufio.NewReader(server)
+		for range 2 {
+			req, err := http.ReadRequest(reader)
+			if err != nil {
+				return
+			}
+			_ = req.Body.Close()
+			requestRead <- struct{}{}
+		}
+		_, _ = io.WriteString(server,
+			"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst"+
+				"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+	}()
+
+	firstCh := make(chan *http.Response, 1)
+	secondCh := make(chan *http.Response, 1)
+	go func() {
+		response, _ := pipeline.RoundTrip(newPipelineTestRequest("/one"))
+		firstCh <- response
+	}()
+	receiveRegressionValue(t, requestRead)
+	go func() {
+		response, _ := pipeline.RoundTrip(newPipelineTestRequest("/two"))
+		secondCh <- response
+	}()
+
+	first := receiveRegressionValue(t, firstCh)
+	if first == nil {
+		t.Fatal("first response is nil")
+	}
+	if err := first.Body.Close(); err != nil {
+		t.Fatalf("early close = %v; want nil", err)
+	}
+	second := receiveRegressionValue(t, secondCh)
+	if second == nil {
+		t.Fatal("second response is nil")
+	}
+	if body := readPipelineTestBody(t, second); body != "second" {
+		t.Fatalf("second body = %q; want second", body)
+	}
+	if err := pipeline.Err(); err != nil {
+		t.Fatalf("pipeline closed after draining a short remainder: %v", err)
+	}
+}
+
+// A long remainder is not drained: Close returns promptly and the connection
+// is dropped instead.
+func TestHTTP1PipelineEarlyCloseAbandonsLongRemainder(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	pipeline := newHTTP1PipelineConn(client, 1, time.Second)
+	t.Cleanup(func() { _ = pipeline.Close() })
+	go func() {
+		reader := bufio.NewReader(server)
+		req, err := http.ReadRequest(reader)
+		if err != nil {
+			return
+		}
+		_ = req.Body.Close()
+		if _, err := fmt.Fprintf(server, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", 1<<30); err != nil {
+			return
+		}
+		chunk := make([]byte, 32<<10)
+		for {
+			if _, err := server.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+
+	response, err := pipeline.RoundTrip(newPipelineTestRequest("/large"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := response.Body.Close(); err != nil {
+		t.Fatalf("early close = %v; want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("early close took %v draining a long remainder", elapsed)
+	}
+	if pipeline.Err() == nil {
+		t.Fatal("connection kept after abandoning a long remainder")
+	}
 }
