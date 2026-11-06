@@ -1,43 +1,43 @@
 # AGENTS.md
 
-## 项目与代码导航
+## Project and Navigation
 
-Go 1.27.3+ 的 MITM 代理库，模块路径为 `github.com/josexy/mitmproxy-go/v2`；支持 HTTP、HTTPS、HTTP/2、h2c、WebSocket 和 SOCKS5。
+`github.com/josexy/mitmproxy-go/v2` is an embeddable MITM proxy library supporting HTTP, HTTPS, HTTP/2, h2c, WebSocket, SOCKS5, and raw TCP relay. Applications own listeners; the library handles interception, forwarding, and observation. Use `go.mod` for toolchain/dependency versions and `README.md` for public usage.
 
-- `mitm.go`、`socks5.go`：代理入口、协议分流与转发。
-- `transport.go`、`http1_*`、`http2_*`、`h2c.go`：上游连接、HTTP 会话、流水线与协议适配。
-- `tls_fingerprint.go`、`proxy_dialer.go`、`keycert_pool.go`：TLS 指纹、上游代理拨号与证书缓存。
-- `option.go`、`runtime_config*.go`、`interceptor.go`：配置、动态更新与公开拦截器接口。
-- `http_profile.go`、`http_trace_timing.go`、`metadata/`：线序元数据、交换计时与连接元数据。
-- `buf/`、`internal/`：缓冲区、缓存、证书和流复制；`examples/`：调用示例，`examples/dumper/` 用于流量观察。
+- Entry points and routing: `mitm.go`, `socks5.go`, `domain_tree.go`.
+- Protocol sessions and adaptation: `http1_*`, `http2_*`, `h2c.go`, `websocket_handshake.go`.
+- Upstream transport, proxy dialing, and TLS: `transport.go`, `proxy_dialer.go`, `tls_fingerprint.go`.
+- Public configuration and interception: `option.go`, `runtime_config*.go`, `interceptor.go`.
+- Wire metadata, timing, and observation: `http_profile.go`, `http_trace_timing.go`, `http_response_send.go`, `metadata/`.
+- Certificates, buffers, and helpers: `keycert_pool.go`, `buf/`, `internal/`. Usage examples and traffic inspection: `examples/`, `examples/dumper/`.
 
-## 修改约定
+## Change Guidelines
 
-- 先检查工作区和相关测试；只改任务相关内容，保留已有修改，不顺带做无关重构。
-- 代理相关 HTTP 类型统一使用 `github.com/josexy/xhttp`，不可与 `net/http` 类型混用；自身包引用必须包含 `/v2`。
-- 公开 API 或默认行为改变时，同步相关示例、测试和 README；新增注释说明约束与原因。
-- 对改动的 Go 文件运行 `gofmt`，沿用现有命名与组织方式；依赖升级仅限任务需要。
-- 未经明确要求，不暂存、提交、推送、打标签或修改相邻仓库。
+- Inspect workspace changes, implementation, and relevant tests first. Preserve existing modifications and keep changes focused.
+- Trace shared changes across `ServeHTTP`, `ServeSOCKS5`, and `Serve`, including response delivery and cleanup. Keep protocol mechanics in sessions/transports and application behavior in interceptors/examples.
+- Use `github.com/josexy/xhttp`, including its `httptest` and `httptrace` packages, for proxy HTTP code; do not mix `net/http` types. Module imports must include `/v2`.
+- Preserve public APIs and defaults unless requested otherwise. Update configuration validation, tests, examples, and README together when applicable. Follow existing organization, explain non-obvious constraints, and run `gofmt` on modified Go files.
+- Check local `go.work` before Go commands; it may select sibling checkouts. Use `GOWORK=off` for standalone module validation and restore the previous environment afterward. Upgrade dependencies only when required.
+- Do not stage, commit, push, tag, or modify neighboring repositories unless explicitly requested.
 
-## 关键行为约束
+## Core Invariants
 
-- 保持 Body 流式转发，不为保序而整包缓存；检查 EOF、取消、提前 Close 和错误路径中的 Body、连接、goroutine 及池化缓冲区释放。
-- 线序元数据描述收到的流量，不能绕过逐跳头清理或覆盖拦截器修改；WebSocket 握手也遵循此规则。
-- Trailer 的实际顺序在 Body EOF 后才能确定；首次 Hijack 后重新解析的 Body 也必须关联正确的 Trailer 元数据。
-- HTTP/1 流水线保持响应顺序；HTTP/2 stream ID 属于各自连接，不直接重放跨连接的非根优先级依赖。
-- 重试计时从退避、重连和写请求之前开始；写头前失败也算新尝试，旧尝试的回调不能污染新尝试。
-- 动态配置以不可变快照发布，只影响新连接；拦截器与观察回调可能并发执行，共享状态必须同步。
-- 核心日志不输出凭据、请求/响应正文、WebSocket 载荷或证书私钥；测试使用临时证书与本地服务。
+- Keep bodies streaming with bounded buffering. Release bodies, connections, goroutines, timers, and pooled buffers on EOF, cancellation, early Close, errors, and shutdown. Preserve connection ownership and `Cleanup()` behavior.
+- Keep routing, host filtering, and passthrough consistent across entry points. Upstream rewrites must preserve configured proxy/TLS policy, request semantics, and cancellation.
+- Preserve HTTP/1 pipeline response order and message boundaries. HTTP/2 stream IDs and priority dependencies are connection-local; do not replay non-root dependencies across connections. Canceling one stream must leave sibling streams usable.
+- Received wire metadata must not overwrite interceptor changes, restore removed headers, or bypass hop-by-hop sanitization, including WebSocket handshakes. Actual trailer order is available only after Body EOF; bodies reparsed after the first Hijack must retain the correct trailer metadata.
+- Retry only when request semantics and body replayability permit it. Start attempt timing before backoff, reconnection, and writes; failures before headers still count as attempts. Ignore callbacks from previous attempts.
+- Validate configuration before publishing immutable snapshots for new connections. Failed updates retain the previous configuration; existing connections retain their snapshot. Synchronize callback state and avoid invoking application callbacks under internal locks.
+- Preserve deadlines, limits, and cancellation through dialing, TLS, forwarding, and observation. Shutdown must unblock pending I/O. Keep connection, attempt, and downstream-send timing distinct; report completion only when it occurs.
+- Core logs must exclude credentials, sensitive headers/queries, bodies, WebSocket payloads, and private keys. Keep traffic dumping in the explicit dumper example.
 
-## 验证
+## Validation
 
-先跑相关回归测试，再按改动范围验证全库。协议与生命周期修复优先使用真实本地连接测试，覆盖受影响的流式、复用、取消或重试路径。
+Run affected regressions first, then broaden checks to shared paths. For protocol and lifecycle changes, prefer real loopback connections covering streaming, reuse, cancellation, retries, and cleanup. Use temporary certificates, bounded waits, and explicit cleanup.
 
-需要应用 Go 的自动修复时，先用 `go fix --diff ./...` 审阅建议差异，再运行 `go fix ./...` 应用修复；应用后重新执行 `gofmt` 和受影响的测试。
+Run checks appropriate to the change from the repository root:
 
 ```bash
-go fix --diff ./...
-go fix ./...
 go test ./...
 go test -race ./...
 go vet ./...
@@ -46,4 +46,6 @@ go mod tidy -diff
 git diff --check
 ```
 
-纯文档改动检查内容、路径引用与差异即可，无需重跑 Go 测试。交付时说明修改、已验证项和未验证项；本地通过不等于远程 CI 已通过。
+When automatic fixes are needed, review `go fix --diff ./...` before `go fix ./...`, then rerun `gofmt` and affected tests.
+
+Documentation-only changes need content, path, and diff checks; Go tests are unnecessary. Report what changed, checks performed, and unverified areas, including workspace/standalone dependency mode for Go checks. Local results do not establish remote CI success.
