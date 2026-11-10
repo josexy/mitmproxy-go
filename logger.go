@@ -50,6 +50,17 @@ func logAttrs(ctx context.Context, logger *slog.Logger, level slog.Level, msg st
 	}
 }
 
+// logEnabled reports whether logger emits level. Check it before building
+// attributes that allocate on hot paths, such as a request URL: arguments are
+// evaluated even when logging is disabled, which is the default.
+func logEnabled(ctx context.Context, logger *slog.Logger, level slog.Level) bool {
+	return normalizeLogger(logger).Enabled(ctx, level)
+}
+
+func logConfigEnabled(ctx context.Context, cfg *runtimeConfig, level slog.Level) bool {
+	return logEnabled(ctx, loggerFromConfig(cfg), level)
+}
+
 func logMessage(msg string) string {
 	return logMessagePrefix + msg
 }

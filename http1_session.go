@@ -1,6 +1,7 @@
 package mitmproxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -110,6 +111,85 @@ func (s *http1SessionReadState) setReadDeadlineLocked(timeout time.Duration) {
 		return
 	}
 	_ = s.conn.SetReadDeadline(time.Now().Add(timeout))
+}
+
+var errDownstreamWatchSkipped = errors.New("request body did not complete")
+
+// downstreamCloseWatch notices a client that disconnects while the session is
+// not parsing a request, so the exchanges it is waiting for can be canceled
+// instead of pinning goroutines and upstream connections until upstream
+// answers. It peeks one byte through the request reader, which leaves the
+// start of a pipelined request buffered for the parser.
+//
+// The pending peek is never interrupted. On a connection hijacked from xhttp,
+// any read error, including an expired deadline, cancels the connection
+// context that every later request inherits. Callers wait for the peek
+// instead, with the read deadline the next request read would have used.
+type downstreamCloseWatch struct {
+	quit     chan struct{}
+	quitOnce sync.Once
+	done     chan struct{}
+	err      error
+}
+
+// startDownstreamCloseWatch starts watching once req's body, which shares the
+// reader, has been consumed. A nil req has no body to wait for.
+func startDownstreamCloseWatch(reader *bufio.Reader, req *http.Request, onClose func(error)) *downstreamCloseWatch {
+	w := &downstreamCloseWatch{quit: make(chan struct{}), done: make(chan struct{})}
+	bodyDone := hijackedRequestBodyDone(req)
+	go func() {
+		defer close(w.done)
+		select {
+		case <-bodyDone:
+		case <-w.quit:
+			select {
+			case <-bodyDone:
+			default:
+				w.err = errDownstreamWatchSkipped
+				return
+			}
+		}
+		if !hijackedRequestBodyComplete(req) {
+			w.err = errDownstreamWatchSkipped
+			return
+		}
+		_, w.err = reader.Peek(1)
+		if isDownstreamClosedError(w.err) {
+			onClose(w.err)
+		}
+	}()
+	return w
+}
+
+// abandon stops a watch that has not started peeking. A peek in progress ends
+// when data arrives, its deadline expires, or the connection closes.
+func (w *downstreamCloseWatch) abandon() {
+	w.quitOnce.Do(func() { close(w.quit) })
+}
+
+// wait ends the watch before the next request is parsed. beginRead arms the
+// deadline for the pending peek and returns the function that clears it.
+func (w *downstreamCloseWatch) wait(beginRead func() func()) error {
+	w.abandon()
+	clearDeadline := beginRead()
+	<-w.done
+	clearDeadline()
+	return w.err
+}
+
+// isDownstreamClosedError reports a client that closed or reset its
+// connection. A half-close looks the same on the wire, so a client that only
+// shuts down its sending side is treated as gone too. Expired deadlines are
+// excluded: they come from the proxy itself.
+func isDownstreamClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	return isExpectedIdleReadClose(err)
 }
 
 type http1TargetEntry struct {
@@ -357,14 +437,38 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 		case slots <- struct{}{}:
 		case <-stop:
 			return waitWriter()
+		default:
+			// Every slot is in flight, so nothing reads the client until one
+			// frees. Watch it meanwhile; the last queued request body is
+			// complete, so the request reader is idle.
+			watch := startDownstreamCloseWatch(fakerw.requestReader.reader, nil, func(error) { cancelSession() })
+			select {
+			case slots <- struct{}{}:
+			case <-stop:
+				watch.abandon()
+				return waitWriter()
+			}
+			if err := watch.wait(func() func() { return readState.beginRead(false) }); err != nil {
+				<-slots
+				writerErr := waitWriter()
+				if isExpectedIdleReadClose(err) {
+					return writerErr
+				}
+				return errors.Join(err, writerErr)
+			}
 		}
 
 		parseCtx := context.WithValue(ctx, http1PriorResponsesDoneKey{}, (<-chan struct{})(priorWritten))
 		parseCtx = context.WithValue(parseCtx, http1H2CUpgradeClosePoolKey{}, (func())(pool.Close))
 		parseCtx = context.WithValue(parseCtx, http1SessionReadStateKey{}, readState)
-		nextCtx, earlyDone, wsUpgrade, err := r.distinguishHTTPRequest(parseCtx, fakerw, request, tlsRequest, firstRead)
+		nextCtx, earlyDone, upgrade, err := r.distinguishHTTPRequest(parseCtx, fakerw, request, tlsRequest, firstRead)
 		if err != nil || earlyDone {
 			<-slots
+			if isDownstreamClosedError(err) {
+				// The client is gone, so no queued response can be delivered.
+				// Cancel the exchanges rather than wait for upstream to answer.
+				cancelSession()
+			}
 			writerErr := waitWriter()
 			if earlyDone && err == nil {
 				return writerErr
@@ -405,9 +509,15 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 			md.SetRequestHostport(hostport)
 		}
 
-		if wsUpgrade {
+		passthrough, _ := shouldPassthroughRequest(connCtx.config, hostport)
+		opaqueUpgrade := passthrough && upgrade.opaqueHeader != nil
+		if upgrade.websocket || opaqueUpgrade {
+			protocol := "websocket"
+			if opaqueUpgrade {
+				protocol = upgrade.opaqueHeader.Get(HttpHeaderUpgrade)
+			}
 			logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "http1 pipeline upgrade barrier",
-				slog.String("upgrade", "websocket"),
+				slog.String("upgrade", protocol),
 				slog.String("hostport", hostport),
 				slog.Int("in_flight", len(slots)-1),
 			)
@@ -416,14 +526,22 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 				return err
 			}
 			pool.Close()
+			if opaqueUpgrade {
+				logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "upgrade passthrough",
+					slog.String("hostport", hostport),
+					slog.String("upgrade", protocol),
+					slog.String("method", requestMethod(nextReqCtx.Request)),
+					slog.String("url", requestURL(nextReqCtx.Request)),
+				)
+				return r.passthroughUpgrade(nextCtx, fakerw, nextReqCtx.Request, upgrade.opaqueHeader)
+			}
 			wsConn, err := connCtx.dialRemote(nextCtx, "tcp", hostport)
 			if err != nil {
 				return err
 			}
-			return r.relayConnForWS(nextCtx, newBufConnExt(srcConn, fakerw.bufRW), wsConn)
+			return r.relayConnForWS(nextCtx, newBufConnExt(srcConn, fakerw.bufRW), wsConn, !passthrough)
 		}
 
-		passthrough, _ := shouldPassthroughRequest(connCtx.config, hostport)
 		scheme := nextReqCtx.Request.URL.Scheme
 		target := scheme + "://" + hostport
 		ticket := pool.register(nextCtx, target, hostport)

@@ -11,7 +11,47 @@ import (
 	"github.com/josexy/mitmproxy-go/v2/internal/cert"
 )
 
-var errNoPriKey = errors.New("no available private key")
+var (
+	errNoPriKey                 = errors.New("no available private key")
+	errCertGenerationIncomplete = errors.New("server certificate generation did not complete")
+)
+
+// certFlight collapses concurrent generations of the same leaf certificate, so
+// parallel handshakes to a new host sign it once instead of once per handshake.
+type certFlight struct {
+	mu    sync.Mutex
+	calls map[string]*certFlightCall
+}
+
+type certFlightCall struct {
+	done        chan struct{}
+	certificate tls.Certificate
+	err         error
+}
+
+func (g *certFlight) do(key string, generate func() (tls.Certificate, error)) (tls.Certificate, error) {
+	g.mu.Lock()
+	if call, ok := g.calls[key]; ok {
+		g.mu.Unlock()
+		<-call.done
+		return call.certificate, call.err
+	}
+	if g.calls == nil {
+		g.calls = make(map[string]*certFlightCall)
+	}
+	call := &certFlightCall{done: make(chan struct{}), err: errCertGenerationIncomplete}
+	g.calls[key] = call
+	g.mu.Unlock()
+
+	defer func() {
+		g.mu.Lock()
+		delete(g.calls, key)
+		g.mu.Unlock()
+		close(call.done)
+	}()
+	call.certificate, call.err = generate()
+	return call.certificate, call.err
+}
 
 type priKeyPool struct {
 	once sync.Once

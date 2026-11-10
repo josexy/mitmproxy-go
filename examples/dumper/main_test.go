@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"io"
+	"runtime"
 	"testing"
 	"time"
 
@@ -91,5 +95,108 @@ func TestInitialHeaderFieldsSize(t *testing.T) {
 				t.Fatalf("initialHeaderFieldsSize() = %d; want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func gzipBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
+type closeRecorder struct {
+	io.Reader
+	closed bool
+}
+
+func (r *closeRecorder) Close() error {
+	r.closed = true
+	return nil
+}
+
+// A body whose encoding breaks part way through must still be proxied in full.
+func TestBodyDecoderPassesThroughCorruptEncoding(t *testing.T) {
+	payload := bytes.Repeat([]byte("abcdefgh"), 64<<10)
+	corrupt := gzipBytes(t, payload)
+	for i := 200; i < 400; i++ {
+		corrupt[i] ^= 0xff
+	}
+	corrupt = append(corrupt, make([]byte, 256<<10)...)
+	body, err := newBodyDecoder(io.NopCloser(bytes.NewReader(corrupt)), "gzip", CHUNK_TYPE_RSP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		n   int64
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := io.Copy(io.Discard, body)
+		done <- result{n, err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil || got.n != int64(len(corrupt)) {
+			t.Fatalf("proxied %d bytes, err %v; want %d bytes", got.n, got.err, len(corrupt))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("proxied body blocked behind a failed decoder")
+	}
+}
+
+// Closing a body before EOF must release the decoder goroutine and the
+// original body.
+func TestBodyDecoderCloseBeforeEOFReleasesResources(t *testing.T) {
+	compressed := gzipBytes(t, bytes.Repeat([]byte("x"), 1<<20))
+	before := runtime.NumGoroutine()
+	var originals []*closeRecorder
+	for range 20 {
+		original := &closeRecorder{Reader: bytes.NewReader(compressed)}
+		originals = append(originals, original)
+		body, err := newBodyDecoder(original, "gzip", CHUNK_TYPE_RSP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := body.Read(make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		if err := body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, original := range originals {
+		if !original.closed {
+			t.Fatal("original body was not closed")
+		}
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > before {
+		t.Fatalf("goroutines = %d after early closes; want at most %d", got, before)
+	}
+}
+
+func TestBodySizeReaderDoesNotLimitReads(t *testing.T) {
+	payload := bytes.Repeat([]byte("y"), 64<<10)
+	reader := newBodySizeReader(io.NopCloser(bytes.NewReader(payload)), CHUNK_TYPE_RSP).(*bodySizeReader)
+	n, err := reader.Read(make([]byte, 32<<10))
+	if err != nil || n != 32<<10 {
+		t.Fatalf("first read = %d, %v; want %d", n, err, 32<<10)
+	}
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatal(err)
+	}
+	if reader.size != int64(len(payload)) {
+		t.Fatalf("size = %d; want %d", reader.size, len(payload))
 	}
 }

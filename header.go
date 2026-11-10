@@ -127,3 +127,11 @@ func isWSUpgrade(h http.Header) bool {
 	return httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Upgrade")], "websocket") &&
 		httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Connection")], "Upgrade")
 }
+
+// isOpaqueUpgrade reports a request to switch to a protocol other than
+// WebSocket, such as `Upgrade: tcp`, which the proxy can relay only as bytes.
+func isOpaqueUpgrade(h http.Header) bool {
+	return len(h[textproto.CanonicalMIMEHeaderKey("Upgrade")]) > 0 &&
+		httpguts.HeaderValuesContainsToken(h[textproto.CanonicalMIMEHeaderKey("Connection")], "Upgrade") &&
+		!isWSUpgrade(h)
+}

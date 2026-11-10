@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
@@ -24,8 +23,6 @@ import (
 	http "github.com/josexy/xhttp"
 	"github.com/josexy/xhttp/httputil"
 )
-
-const CHUNK_SIZE = 512
 
 const (
 	CHUNK_TYPE_REQ = 1 << iota
@@ -228,9 +225,14 @@ func (r *observedReadCloser) Close() error {
 	return r.ReadCloser.Close()
 }
 
+// bodyDecoder passes the original body through unchanged while a goroutine
+// decodes a copy for the dump. Dumping is best effort: a decoder that fails or
+// stops early never blocks or fails the proxied body.
 type bodyDecoder struct {
-	reader io.ReadCloser
-	pw     *io.PipeWriter
+	io.ReadCloser
+	tee  io.Reader
+	pw   *io.PipeWriter
+	once sync.Once
 }
 
 func newBodyDecoder(r io.ReadCloser, encoding string, chunkType int) (io.ReadCloser, error) {
@@ -238,73 +240,63 @@ func newBodyDecoder(r io.ReadCloser, encoding string, chunkType int) (io.ReadClo
 		return r, nil
 	}
 	if encoding == "" {
-		return newChunkBodyReader(r, CHUNK_SIZE, chunkType), nil
+		return newBodySizeReader(r, chunkType), nil
 	}
 
 	pr, pw := io.Pipe()
-	teeReader := io.TeeReader(r, pw)
 	go func() {
+		// Keep consuming the pipe until the proxied body ends, so its writes
+		// never wait on a decoder that failed or returned early.
+		defer func() { _, _ = io.Copy(io.Discard, pr) }()
 		decodedReader, err := getDecodedReader(pr, encoding)
 		if err != nil {
-			// if the decoder creation fails, we need to read pr to avoid pw blocking
-			io.Copy(io.Discard, pr)
 			return
 		}
-		decodedReader = newChunkBodyReader(decodedReader, CHUNK_SIZE, chunkType)
-		defer decodedReader.Close()
-		// need to read all data to avoid pw blocking, but we don't care about the decoded data here, so just discard it
-		io.Copy(io.Discard, decodedReader)
+		sized := newBodySizeReader(decodedReader, chunkType)
+		_, _ = io.Copy(io.Discard, sized)
+		_ = sized.Close()
 	}()
-	return &bodyDecoder{
-		reader: io.NopCloser(teeReader),
-		pw:     pw,
-	}, nil
+	return &bodyDecoder{ReadCloser: r, tee: io.TeeReader(r, pw), pw: pw}, nil
 }
 
-func (b *bodyDecoder) Close() error {
-	return b.reader.Close()
-}
-
-func (b *bodyDecoder) Read(p []byte) (n int, err error) {
-	n, err = b.reader.Read(p)
-	if err == io.EOF {
-		// when reader is closed or reaches EOF, we should also close the pipe writer to avoid goroutine leak
-		b.pw.CloseWithError(err)
+func (b *bodyDecoder) Read(p []byte) (int, error) {
+	n, err := b.tee.Read(p)
+	if err != nil {
+		b.finish(err)
 	}
-	return
+	return n, err
 }
 
-type chunkBodyReader struct {
+// Close stops the decoder and closes the original body, which may be closed
+// before EOF when the client goes away.
+func (b *bodyDecoder) Close() error {
+	b.finish(io.ErrClosedPipe)
+	return b.ReadCloser.Close()
+}
+
+func (b *bodyDecoder) finish(err error) {
+	b.once.Do(func() { _ = b.pw.CloseWithError(err) })
+}
+
+// bodySizeReader reports the size of a body once it reaches EOF without
+// retaining its content or limiting the size of each read.
+type bodySizeReader struct {
 	io.ReadCloser
-	N         int64
-	buf       bytes.Buffer // or use buf pool?
+	size      int64
 	chunkType int
 }
 
-func newChunkBodyReader(r io.ReadCloser, chunkBodySize int64, chunkType int) io.ReadCloser {
-	return &chunkBodyReader{
-		N:          chunkBodySize,
-		ReadCloser: r,
-		chunkType:  chunkType,
-	}
+func newBodySizeReader(r io.ReadCloser, chunkType int) io.ReadCloser {
+	return &bodySizeReader{ReadCloser: r, chunkType: chunkType}
 }
 
-func (r *chunkBodyReader) Read(p []byte) (n int, err error) {
-	if r.N <= 0 {
-		return 0, io.EOF
-	}
-	if int64(len(p)) > r.N {
-		p = p[0:r.N]
-	}
-	n, err = r.ReadCloser.Read(p)
-	if n > 0 {
-		r.buf.Write(p[:n])
-		// fmt.Printf("--> hex dump(chunk size/data size: %d/%d):\n%s\n", r.N, n, hex.Dump(p[:n]))
-	}
+func (r *bodySizeReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.size += int64(n)
 	if err == io.EOF {
-		fmt.Printf("<<-- [%d]full data dump (%d bytes):\n", r.chunkType, r.buf.Len())
+		fmt.Printf("<<-- [%d]full data dump (%d bytes):\n", r.chunkType, r.size)
 	}
-	return
+	return n, err
 }
 
 func main() {
