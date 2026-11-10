@@ -187,16 +187,18 @@ func dialHTTPRewriteTarget(req *http.Request, connCtx *biConnContext, target htt
 	return conn, conn.ConnectionState().NegotiatedProtocol, nil
 }
 
+// httpRewriteBody owns the transport that carried its response alone.
 type httpRewriteBody struct {
 	io.ReadCloser
 	transport *singleConnTransport
 	once      sync.Once
 }
 
+// Close closes the transport first, so an unread remainder is dropped with
+// the connection rather than drained to keep a connection nothing reuses.
 func (b *httpRewriteBody) Close() error {
-	err := b.ReadCloser.Close()
 	b.once.Do(func() { _ = b.transport.Close() })
-	return err
+	return b.ReadCloser.Close()
 }
 
 // HTTPResponseSendResult describes the downstream send, not the upstream read.

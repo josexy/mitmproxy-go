@@ -178,7 +178,9 @@ func (w *downstreamCloseWatch) wait(beginRead func() func()) error {
 }
 
 // isDownstreamClosedError reports a client that closed or reset its
-// connection. Expired deadlines are excluded: they come from the proxy itself.
+// connection. A half-close looks the same on the wire, so a client that only
+// shuts down its sending side is treated as gone too. Expired deadlines are
+// excluded: they come from the proxy itself.
 func isDownstreamClosedError(err error) bool {
 	if err == nil {
 		return false
@@ -459,7 +461,7 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 		parseCtx := context.WithValue(ctx, http1PriorResponsesDoneKey{}, (<-chan struct{})(priorWritten))
 		parseCtx = context.WithValue(parseCtx, http1H2CUpgradeClosePoolKey{}, (func())(pool.Close))
 		parseCtx = context.WithValue(parseCtx, http1SessionReadStateKey{}, readState)
-		nextCtx, earlyDone, wsUpgrade, err := r.distinguishHTTPRequest(parseCtx, fakerw, request, tlsRequest, firstRead)
+		nextCtx, earlyDone, upgrade, err := r.distinguishHTTPRequest(parseCtx, fakerw, request, tlsRequest, firstRead)
 		if err != nil || earlyDone {
 			<-slots
 			if isDownstreamClosedError(err) {
@@ -508,9 +510,14 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 		}
 
 		passthrough, _ := shouldPassthroughRequest(connCtx.config, hostport)
-		if wsUpgrade {
+		opaqueUpgrade := passthrough && upgrade.opaqueHeader != nil
+		if upgrade.websocket || opaqueUpgrade {
+			protocol := "websocket"
+			if opaqueUpgrade {
+				protocol = upgrade.opaqueHeader.Get(HttpHeaderUpgrade)
+			}
 			logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "http1 pipeline upgrade barrier",
-				slog.String("upgrade", "websocket"),
+				slog.String("upgrade", protocol),
 				slog.String("hostport", hostport),
 				slog.Int("in_flight", len(slots)-1),
 			)
@@ -519,6 +526,15 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 				return err
 			}
 			pool.Close()
+			if opaqueUpgrade {
+				logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "upgrade passthrough",
+					slog.String("hostport", hostport),
+					slog.String("upgrade", protocol),
+					slog.String("method", requestMethod(nextReqCtx.Request)),
+					slog.String("url", requestURL(nextReqCtx.Request)),
+				)
+				return r.passthroughUpgrade(nextCtx, fakerw, nextReqCtx.Request, upgrade.opaqueHeader)
+			}
 			wsConn, err := connCtx.dialRemote(nextCtx, "tcp", hostport)
 			if err != nil {
 				return err

@@ -208,8 +208,7 @@ func (c *remoteClientConn) Close() error {
 
 // CloseWrite half-closes only the wrapped connection; unlike Close it leaves
 // the peer connection and connection tracking untouched.
-func (c *localClientConn) CloseWrite() error  { return closeWriteConn(c.Conn) }
-func (c *remoteClientConn) CloseWrite() error { return closeWriteConn(c.Conn) }
+func (c *localClientConn) CloseWrite() error { return closeWriteConn(c.Conn) }
 
 type biConnContext struct {
 	local  *localClientConn
@@ -1545,7 +1544,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	tunnelCtx := ctx
 	for {
 		reqCtx, _ := FromRequestContext(ctx)
-		nextCtx, earlyDone, isWsUpgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest, firstRead)
+		nextCtx, earlyDone, upgrade, err := r.distinguishHTTPRequest(ctx, fakerw, request, tlsRequest, firstRead)
 		if err != nil || earlyDone {
 			if request == nil && isExpectedIdleReadClose(err) {
 				return nil
@@ -1592,7 +1591,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 			slog.String("reason", passthroughReason),
 		)
 
-		if isWsUpgrade {
+		if upgrade.websocket {
 			// Take the upstream connection from the dialer rather than reusing
 			// the one established with the tunnel: on a keep-alive connection
 			// an earlier request may already have handed it to the transport,
@@ -1603,6 +1602,15 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 				return err
 			}
 			return r.relayConnForWS(nextCtx, newBufConnExt(srcConn, fakerw.bufRW), wsConn, !passthrough)
+		}
+		if passthrough && upgrade.opaqueHeader != nil {
+			logConfigAttrs(nextCtx, connCtx.config, slog.LevelDebug, "upgrade passthrough",
+				slog.String("hostport", nextReqCtx.Hostport),
+				slog.String("upgrade", upgrade.opaqueHeader.Get(HttpHeaderUpgrade)),
+				slog.String("method", requestMethod(nextReqCtx.Request)),
+				slog.String("url", requestURL(nextReqCtx.Request)),
+			)
+			return r.passthroughUpgrade(nextCtx, fakerw, nextReqCtx.Request, upgrade.opaqueHeader)
 		}
 		// Nothing reads the client while this exchange is relayed. Watch it so
 		// a client that disconnects cancels the exchange.
@@ -2197,14 +2205,15 @@ func (r *mitmProxyHandler) handlePrefaceOrH2CRequest(ctx context.Context, rw htt
 			slog.String("method", requestMethod(req)),
 			slog.String("url", requestURL(req)),
 		)
-		return true, r.passthroughH2CUpgrade(ctx, rw, req)
+		return true, r.passthroughUpgrade(ctx, rw, req, req.Header)
 	}
 	return false, nil
 }
 
-// passthroughH2CUpgrade forwards the HTTP/1.1 h2c upgrade handshake to the
-// upstream and then tunnels the upgraded HTTP/2 bytes in both directions.
-func (r *mitmProxyHandler) passthroughH2CUpgrade(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
+// passthroughUpgrade forwards an HTTP/1.1 upgrade handshake to the upstream
+// with header and then tunnels the upgraded bytes in both directions without
+// parsing them. It serves h2c, and any upgrade a passthrough host is offered.
+func (r *mitmProxyHandler) passthroughUpgrade(ctx context.Context, rw http.ResponseWriter, req *http.Request, header http.Header) error {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
 	srcConn, rwc, err := http.NewResponseController(rw).Hijack()
@@ -2222,7 +2231,7 @@ func (r *mitmProxyHandler) passthroughH2CUpgrade(ctx context.Context, rw http.Re
 	if err != nil {
 		return err
 	}
-	if err := writeH2CUpgradeRequestHeaders(dstConn, req); err != nil {
+	if err := writeUpgradeRequestHeaders(dstConn, req, header); err != nil {
 		// A freshly dialed connection is owned by nothing else.
 		_ = dstConn.Close()
 		return err
@@ -2230,7 +2239,10 @@ func (r *mitmProxyHandler) passthroughH2CUpgrade(ctx context.Context, rw http.Re
 	return iocopy.IoCopyBidirectionalHalfClose(dstConn, srcConn, connCtx.config.state.idleConnTimeout)
 }
 
-func writeH2CUpgradeRequestHeaders(dst io.Writer, req *http.Request) error {
+// writeUpgradeRequestHeaders writes the request line and header of req with
+// the fields of header, minus proxy credentials. The body, if any, follows in
+// the relayed client stream.
+func writeUpgradeRequestHeaders(dst io.Writer, req *http.Request, header http.Header) error {
 	bw := bufio.NewWriter(dst)
 	method := req.Method
 	if method == "" {
@@ -2256,7 +2268,7 @@ func writeH2CUpgradeRequestHeaders(dst io.Writer, req *http.Request) error {
 		}
 	}
 
-	header := req.Header.Clone()
+	header = header.Clone()
 	removeProxyHeaders(header)
 	header.Del("Host")
 	header.Del(HttpHeaderContentLength)
@@ -2281,7 +2293,16 @@ func writeH2CUpgradeRequestHeaders(dst io.Writer, req *http.Request) error {
 	return bw.Flush()
 }
 
-func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *fakeHttpResponseWriter, request *http.Request, tlsRequest, firstRead bool) (newCtx context.Context, earlyDone bool, upgrade bool, retErr error) {
+// requestUpgrade describes the protocol upgrade a request asks for, if any.
+type requestUpgrade struct {
+	websocket bool
+	// opaqueHeader is the request header as received when the request asks for
+	// another protocol. Only a passthrough host is offered such an upgrade; the
+	// request reaches any other host without its hop-by-hop upgrade headers.
+	opaqueHeader http.Header
+}
+
+func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *fakeHttpResponseWriter, request *http.Request, tlsRequest, firstRead bool) (newCtx context.Context, earlyDone bool, upgrade requestUpgrade, retErr error) {
 	connCtx := ctx.Value(connContextKey).(*biConnContext)
 	reqCtx, _ := FromRequestContext(ctx)
 
@@ -2333,7 +2354,7 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 	}
 	request.URL.Host = request.Host
 
-	if upgrade = isWSUpgrade(request.Header); upgrade {
+	if upgrade.websocket = isWSUpgrade(request.Header); upgrade.websocket {
 		if tlsRequest {
 			request.URL.Scheme = "wss"
 		} else {
@@ -2346,13 +2367,18 @@ func (r *mitmProxyHandler) distinguishHTTPRequest(ctx context.Context, fakerw *f
 			slog.String("method", requestMethod(request)),
 			slog.String("url", requestURL(request)),
 			slog.String("proto", requestProto(request)),
-			slog.Bool("websocket_upgrade", upgrade),
+			slog.Bool("websocket_upgrade", upgrade.websocket),
 		)
 	}
 
-	if upgrade {
+	if upgrade.websocket {
 		sanitizeWebsocketUpgradeHeaders(request.Header)
 	} else {
+		if isOpaqueUpgrade(request.Header) {
+			// The route is not known yet; keep the headers in case it is a
+			// passthrough host.
+			upgrade.opaqueHeader = request.Header.Clone()
+		}
 		removeHopByHopRequestHeaders(request.Header)
 	}
 	// patch the new request to the request context

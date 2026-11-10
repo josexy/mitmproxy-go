@@ -409,9 +409,9 @@ To report a cache hit as zero DNS duration, a resolver calls `ReportDNSCacheHit(
 
 ### Connections and upstreams
 
-`WithIdleConnTimeout` bounds how long an idle HTTP keep-alive connection, together with the upstream connection pinned to it, is kept around. It also bounds how long the remaining direction of a half-closed tunnel may stay idle.
+`WithIdleConnTimeout` bounds how long an idle HTTP keep-alive connection, together with the upstream connection pinned to it, is kept around. It also bounds how long a client may stay idle once the upstream side of a raw TCP tunnel has shut down its sending side.
 
-Raw TCP tunnels forward half-closes: when one peer shuts down its sending side, the other observes EOF while data keeps flowing in the opposite direction. A client that disconnects while its HTTP/1 requests are still waiting for upstream cancels those exchanges.
+A client that closes, half-closes, or resets its connection ends everything pending on it at once; a close and a half-close look the same to the proxy. HTTP/1 exchanges still waiting for upstream are canceled and their responses are not delivered, and a raw TCP tunnel closes its upstream connection. An upstream server that shuts down its sending side is relayed gracefully instead: the client reads every byte and then EOF, while its own data keeps flowing until it closes.
 
 `WithHTTP1PipelineDepth` bounds the HTTP/1 requests on one client connection that have not finished writing back. Requests for the same origin are pipelined on one upstream HTTP/1.1 connection; requests for different origins use separate upstream connections and may run concurrently. Responses are always returned in the client's request order. `Expect: 100-continue`, protocol upgrades, and connection-closing requests remain ordering barriers.
 
@@ -446,7 +446,7 @@ Host filters choose between interception and passthrough. They are not access-co
 - Names are matched case-insensitively and normalized with IDNA. IPv4 and IPv6 literals are supported, and one trailing root dot is accepted.
 - Empty labels, partial-label wildcards such as `api*.example.com`, ports, and malformed names are rejected with `ErrInvalidHostFilter` when the handler is built.
 
-Passthrough for HTTPS, SOCKS5, and transparent tunnels relays the connection without terminating TLS. A plain proxy connection can carry requests for any origin, so its requests are still parsed and routed one by one; requests to a passthrough host are forwarded without HTTP or WebSocket interceptors.
+Passthrough for HTTPS, SOCKS5, and transparent tunnels relays the connection without terminating TLS. A plain proxy connection can carry requests for any origin, so its requests are still parsed and routed one by one; requests to a passthrough host are forwarded without HTTP or WebSocket interceptors. A request to a passthrough host that upgrades to a protocol other than WebSocket is forwarded as sent, minus proxy credentials, and the connection is relayed raw from then on.
 
 ## Runtime Configuration
 

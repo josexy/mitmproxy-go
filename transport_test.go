@@ -1956,3 +1956,85 @@ func TestSingleConnTransportCloseInterruptsDial(t *testing.T) {
 		t.Fatal("round trip succeeded after Close interrupted its dial")
 	}
 }
+
+// startTricklingOrigin answers every request with a long body sent one byte at
+// a time, so draining the remainder of a response can only stop at the drain
+// time limit.
+func startTricklingOrigin(t *testing.T) string {
+	t.Helper()
+	listener := listenLoopback(t)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+					return
+				}
+				if _, err := io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n"); err != nil {
+					return
+				}
+				for {
+					if _, err := conn.Write([]byte("x")); err != nil {
+						return
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+// A response on a connection used for it alone is discarded with that
+// connection when closed early. Draining its remainder first would only delay
+// Close, by up to the drain time limit for a slow response.
+func TestOneOffResponseEarlyCloseSkipsDrain(t *testing.T) {
+	origin := startTricklingOrigin(t)
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, network, addr)
+	}
+	for _, test := range []struct {
+		name string
+		open func(t *testing.T) io.ReadCloser
+	}{
+		{"dedicated connection", func(t *testing.T) io.ReadCloser {
+			transport := newTransport(origin, dial, time.Minute, true, 8)
+			t.Cleanup(func() { _ = transport.Close() })
+			request := newTransportTestRequest(origin, "/")
+			request = request.WithContext(context.WithValue(request.Context(), http1DedicatedConnKey{}, true))
+			response, err := transport.RoundTrip(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return response.Body
+		}},
+		{"rewrite transport", func(t *testing.T) io.ReadCloser {
+			transport := newTransport(origin, dial, time.Minute, true, 1)
+			t.Cleanup(func() { _ = transport.Close() })
+			response, err := transport.RoundTrip(newTransportTestRequest(origin, "/"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return &httpRewriteBody{ReadCloser: response.Body, transport: transport}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := test.open(t)
+			if _, err := body.Read(make([]byte, 1)); err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now()
+			if err := body.Close(); err != nil {
+				t.Fatalf("early close = %v; want nil", err)
+			}
+			if elapsed := time.Since(start); elapsed >= http1MaxResponseDrainTime/2 {
+				t.Fatalf("early close took %v draining a response whose connection is discarded", elapsed)
+			}
+		})
+	}
+}

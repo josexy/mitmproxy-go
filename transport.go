@@ -417,7 +417,10 @@ func (t *singleConnTransport) roundTripHTTP1Dedicated(req *http.Request) (*http.
 	return response, nil
 }
 
-// closeHookBody runs onClose once after closing the wrapped body.
+// closeHookBody runs onClose once when the body is closed. onClose discards
+// the connection, so it runs before the wrapped body closes: an unread
+// remainder is then dropped with the connection rather than drained to keep a
+// connection that will not be reused.
 type closeHookBody struct {
 	io.ReadCloser
 	once    sync.Once
@@ -425,9 +428,8 @@ type closeHookBody struct {
 }
 
 func (b *closeHookBody) Close() error {
-	err := b.ReadCloser.Close()
 	b.once.Do(b.onClose)
-	return err
+	return b.ReadCloser.Close()
 }
 
 func (t *singleConnTransport) getHTTP1PipelineConn(ctx context.Context) (*http1PipelineConn, error) {
