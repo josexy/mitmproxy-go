@@ -3,7 +3,6 @@ package mitmproxy
 import (
 	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -1975,9 +1974,13 @@ func (w *http1ResponseWriter) writeAfterHeader(data []byte) error {
 				}
 				return nil
 			}
-			order := responseHeaderOrder(w.response).Trailers
+			// Late trailers are known only now; the effective order keeps an
+			// interceptor override ahead of the received trailer order.
+			var order []string
 			if w.request != nil {
-				order = RequestWireHeaderOrder(w.request).Trailers
+				order = requestHeaderOrder(w.request).Trailers
+			} else {
+				order = responseHeaderOrder(w.response).Trailers
 			}
 			trailers := reorderHTTP1TrailerBlock(w.chunkBuf, index, order)
 			w.chunkBuf = nil
@@ -2021,38 +2024,7 @@ func reorderHTTP1HeaderBlock(pending []byte, delimiter int, order []string, pref
 		fields = append(fields, field)
 	}
 	if len(order) > 0 {
-		positions := make(map[string]int, len(order))
-		for index, name := range order {
-			name = strings.ToLower(name)
-			if !strings.HasPrefix(name, ":") {
-				positions[name] = index
-			}
-		}
-		// Resolve each name once instead of allocating lowercase strings on
-		// every comparison. Equal ranks retain duplicate occurrence order.
-		type fieldRank struct {
-			name     string
-			position int
-		}
-		ranks := make(map[string]fieldRank, len(fields))
-		for _, field := range fields {
-			if _, ok := ranks[field.Name]; ok {
-				continue
-			}
-			name := strings.ToLower(field.Name)
-			position, listed := positions[name]
-			if !listed {
-				position = len(order)
-			}
-			ranks[field.Name] = fieldRank{name, position}
-		}
-		slices.SortStableFunc(fields, func(a, b http.HeaderField) int {
-			left, right := ranks[a.Name], ranks[b.Name]
-			if result := cmp.Compare(left.position, right.position); result != 0 {
-				return result
-			}
-			return strings.Compare(left.name, right.name)
-		})
+		sortSendingFields(fields, order)
 	}
 	if override != nil {
 		fields = orderedSendingFields(fields, override.Fields, 1)

@@ -201,14 +201,16 @@ func TestHTTP1ResponseWriterCombinesNameAndOccurrenceOrder(t *testing.T) {
 	if err := writeHTTP1Response(&output, response); err != nil {
 		t.Fatal(err)
 	}
-	const want = "HTTP/1.1 200 OK\r\nx-rEpEaT: two\r\nX-Middle: middle\r\nX-Repeat: one\r\ncontent-length: 2\r\nX-Z: z\r\nX-A: updated\r\nX-Repeat: \r\n\r\nok"
+	// The edited X-A value keeps its layout position; X-Z and the unplaced
+	// third X-Repeat follow in name order.
+	const want = "HTTP/1.1 200 OK\r\nx-rEpEaT: two\r\nX-Middle: middle\r\nX-Repeat: one\r\ncontent-length: 2\r\nX-A: updated\r\nX-Z: z\r\nX-Repeat: \r\n\r\nok"
 	if output.String() != want {
 		t.Fatalf("wire = %q; want %q", output.String(), want)
 	}
 	wantFields := []http.HeaderField{
 		{Name: "x-rEpEaT", Value: "two"}, {Name: "X-Middle", Value: "middle"},
 		{Name: "X-Repeat", Value: "one"}, {Name: "content-length", Value: "2"},
-		{Name: "X-Z", Value: "z"}, {Name: "X-A", Value: "updated"}, {Name: "X-Repeat", Value: ""},
+		{Name: "X-A", Value: "updated"}, {Name: "X-Z", Value: "z"}, {Name: "X-Repeat", Value: ""},
 	}
 	if observed.Err != nil || observed.BodyBytes != 2 || !reflect.DeepEqual(observed.HeaderBlock.Fields, wantFields) {
 		t.Fatalf("send observation = %+v; want fields %+v and 2 body bytes", observed, wantFields)

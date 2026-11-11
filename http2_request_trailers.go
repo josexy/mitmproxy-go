@@ -19,7 +19,7 @@ func withHTTP2RequestTrailers(req *http.Request, order []string) (*http.Request,
 		return nil, err
 	}
 	return http.WithRequestHeaderBlocks(req, initial, func() (http.HeaderBlock, error) {
-		return trailerHeaderBlock(req.Trailer, RequestWireHeaderOrder(req).Trailers), nil
+		return trailerHeaderBlock(req.Trailer, requestHeaderOrder(req).Trailers), nil
 	})
 }
 

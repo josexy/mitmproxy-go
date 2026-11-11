@@ -64,6 +64,10 @@ func (r *mitmProxyHandler) invokeHTTPUpstream(req *http.Request, fallback HTTPDe
 	if req == nil {
 		return nil, errors.New("mitmproxy: nil request")
 	}
+	if hasXHTTPRequestHeaderBlocks(req) {
+		closeRequestBody(req)
+		return nil, errXHTTPRequestHeaderBlocks
+	}
 	// Interceptors cannot reintroduce connection-scoped headers on either path.
 	removeHopByHopRequestHeaders(req.Header)
 	target, override := req.Context().Value(httpUpstreamTargetKey{}).(httpUpstreamTarget)
@@ -137,6 +141,19 @@ func (r *mitmProxyHandler) invokeHTTPUpstream(req *http.Request, fallback HTTPDe
 	}
 	response.Body = &httpRewriteBody{ReadCloser: response.Body, transport: transport}
 	return response, nil
+}
+
+var errXHTTPRequestHeaderBlocks = errors.New("mitmproxy: xhttp.WithRequestHeaderBlocks is not supported in an interceptor; use WithRequestHeaderBlock")
+
+// hasXHTTPRequestHeaderBlocks reports whether an interceptor configured xhttp
+// exact request blocks. Those are written verbatim and would bypass hop-by-hop
+// sanitization and the proxy's Host and framing generation. xhttp exposes no
+// accessor, but WithRequestHeaderOrder deterministically rejects a non-empty
+// header order exactly when an exact initial block is configured for either
+// protocol; a trailer provider always comes with an initial block.
+func hasXHTTPRequestHeaderBlocks(req *http.Request) bool {
+	_, err := http.WithRequestHeaderOrder(req, http.HeaderOrder{Headers: []string{"host"}})
+	return err != nil
 }
 
 func dialHTTPRewriteTarget(req *http.Request, connCtx *biConnContext, target httpUpstreamTarget) (net.Conn, string, error) {

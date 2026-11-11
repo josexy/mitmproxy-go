@@ -122,6 +122,7 @@ func (a *httpTraceAttempt) traceRequest(request *http.Request) *http.Request {
 // writes. Each trace captures its own attempt ID, so late callbacks from an
 // earlier connection cannot be attributed to the replacement request.
 func traceHTTPRetry(request *http.Request, previousErr error) *http.Request {
+	resetRequestSendHeaderObservation(request)
 	state, _ := request.Context().Value(httpTraceAttemptContextKey{}).(*httpTraceAttempt)
 	if state == nil {
 		return request

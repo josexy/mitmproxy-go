@@ -185,6 +185,10 @@ func RequestWireHeaderOrder(req *http.Request) http.HeaderOrder {
 	if profile == nil {
 		profile = captureRequestWireProfile(req)
 	}
+	return requestWireHeaderOrder(req, profile)
+}
+
+func requestWireHeaderOrder(req *http.Request, profile *requestWireProfile) http.HeaderOrder {
 	if profile == nil {
 		return http.HeaderOrder{}
 	}
@@ -250,57 +254,37 @@ func ResponseWireHeaderBlocks(response *http.Response) []http.HeaderBlock {
 	return http.ResponseHeaderBlocks(response)
 }
 
+// requestHeaderOrder returns the effective upstream order of regular header
+// names and trailer names: the interceptor override first, then the remaining
+// received names in received order. Trailers include those received at EOF.
 func requestHeaderOrder(req *http.Request) http.HeaderOrder {
 	profile := requestWireProfileFromRequest(req)
 	if profile == nil {
-		return http.HeaderOrder{}
+		profile = captureRequestWireProfile(req)
 	}
-	wireOrder := RequestWireHeaderOrder(req)
-	headers := make([]string, 0, len(profile.headerOrder))
-	for _, name := range profile.headerOrder {
-		if !strings.HasPrefix(name, ":") {
-			headers = append(headers, name)
-		}
+	wire := requestWireHeaderOrder(req, profile)
+	var override http.HeaderOrder
+	if profile != nil && profile.writeOrder != nil {
+		override = *profile.writeOrder
 	}
-	order := http.HeaderOrder{
+	_, headers := splitPseudoHeaderNames(mergeSendingOrder(override.Headers, wire.Headers))
+	return http.HeaderOrder{
 		Headers:  headers,
-		Trailers: wireOrder.Trailers,
+		Trailers: mergeSendingOrder(override.Trailers, wire.Trailers),
 	}
-	if profile.writeOrder != nil {
-		if len(profile.writeOrder.Headers) > 0 {
-			order.Headers = filterRequestHeaderOrder(profile.writeOrder.Headers)
-		}
-		if len(profile.writeOrder.Trailers) > 0 {
-			order.Trailers = append([]string(nil), profile.writeOrder.Trailers...)
-		}
-	}
-	return order
 }
 
-func filterRequestHeaderOrder(names []string) []string {
-	result := make([]string, 0, len(names))
-	for _, name := range names {
-		if !strings.HasPrefix(name, ":") {
-			result = append(result, name)
-		}
-	}
-	return result
-}
-
+// requestPseudoHeaderOrder returns the effective HTTP/2 pseudo-header order,
+// merged the same way as regular names.
 func requestPseudoHeaderOrder(profile *requestWireProfile) []string {
 	if profile == nil {
 		return nil
 	}
-	names := profile.headerOrder
-	if profile.writeOrder != nil && len(profile.writeOrder.Headers) > 0 {
-		names = profile.writeOrder.Headers
+	var override []string
+	if profile.writeOrder != nil {
+		override = profile.writeOrder.Headers
 	}
-	pseudos := make([]string, 0, len(names))
-	for _, name := range names {
-		if strings.HasPrefix(name, ":") {
-			pseudos = append(pseudos, name)
-		}
-	}
+	pseudos, _ := splitPseudoHeaderNames(mergeSendingOrder(override, profile.headerOrder))
 	return pseudos
 }
 
@@ -315,26 +299,19 @@ func withRequestHeaderOrder(req *http.Request) (*http.Request, error) {
 	return http.WithRequestHeaderOrder(req, order)
 }
 
+// responseHeaderOrder returns the effective downstream order: the interceptor
+// override first, then the remaining received names in received order,
+// including trailers that only become available at EOF.
 func responseHeaderOrder(response *http.Response) http.HeaderOrder {
-	var override *http.HeaderOrder
-	if profile, ok := responseWireProfileFor(response); ok {
-		override = profile.writeOrder
+	var override http.HeaderOrder
+	if profile, ok := responseWireProfileFor(response); ok && profile.writeOrder != nil {
+		override = *profile.writeOrder
 	}
-	var order http.HeaderOrder
-	// Omitted blocks inherit the received order, including trailers that only
-	// become available at EOF. Fully explicit orders need no wire snapshot.
-	if override == nil || len(override.Headers) == 0 || len(override.Trailers) == 0 {
-		order = responseWireHeaderOrder(response)
+	wire := responseWireHeaderOrder(response)
+	return http.HeaderOrder{
+		Headers:  mergeSendingOrder(override.Headers, wire.Headers),
+		Trailers: mergeSendingOrder(override.Trailers, wire.Trailers),
 	}
-	if override != nil {
-		if len(override.Headers) > 0 {
-			order.Headers = append([]string(nil), override.Headers...)
-		}
-		if len(override.Trailers) > 0 {
-			order.Trailers = append([]string(nil), override.Trailers...)
-		}
-	}
-	return order
 }
 
 func responseWireHeaderOrder(response *http.Response) http.HeaderOrder {

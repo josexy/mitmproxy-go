@@ -40,7 +40,8 @@ func main() {
 		req.Header.Set("User-Agent", "mitmproxy-go/modify-content")
 		req.Header.Del("Accept-Encoding")
 
-		// Request wire order is configured on the request copy returned by the helper.
+		// Request wire order is configured on the request copy returned by the
+		// helper. Listed names come first; other received fields keep their order.
 		var err error
 		req, err = mitmproxy.WithRequestHeaderOrder(req, http.HeaderOrder{
 			Headers: []string{"Accept", "x-mitmpgo-req-header", "user-agent"},
@@ -72,6 +73,7 @@ func main() {
 		rsp.TransferEncoding = nil
 		rsp.Trailer = nil
 		// Choose the downstream wire order independently of the upstream response.
+		// Unlisted fields keep the upstream order after the listed ones.
 		if err := mitmproxy.SetResponseHeaderOrder(rsp, http.HeaderOrder{
 			Headers: []string{"x-mitmpgo-rsp-header", "content-length"},
 		}); err != nil {

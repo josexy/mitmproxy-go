@@ -4,11 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
-	"strings"
 	"weak"
 
 	http "github.com/josexy/xhttp"
-	"golang.org/x/net/http/httpguts"
 )
 
 // SetResponseHeaderOrder configures the header and trailer order used when the
@@ -16,13 +14,16 @@ import (
 // in an HTTPInterceptor before returning the response. It also works on locally
 // constructed responses; no ResponseWriter is required.
 //
-// Each non-empty slice overrides the received order for that block. Empty
-// slices inherit the received order, including trailers arriving at Body EOF.
-// Each call replaces the previous override; an empty HeaderOrder clears it.
-// Matching is case-insensitive, missing names are ignored, repeated values stay
-// grouped, and unlisted fields follow in lowercase lexical order. An optional
-// :status may appear first in Headers; HTTP/1 ignores it. No other pseudo-header
-// is allowed, and Trailers must contain valid trailer field names.
+// Names listed in a non-empty slice are written first, in that order. Other
+// received fields keep their received relative order, including trailers that
+// arrive at Body EOF, and fields that were not received follow in lowercase
+// lexical order. An empty slice keeps the received order for that block. Each
+// call replaces the previous override; an empty HeaderOrder clears it.
+// Matching is case-insensitive, missing names are ignored, and repeated values
+// stay grouped. An optional :status may appear first in Headers; HTTP/1
+// ignores it. No other pseudo-header is allowed, and Trailers must contain
+// valid trailer field names. SetResponseHeaderBlock may be combined with this
+// order, as described there.
 //
 // The order is validated and copied before publication; errors leave any prior
 // configuration unchanged. Header values, Body, framing and hop-by-hop filtering
@@ -38,17 +39,9 @@ func SetResponseHeaderOrder(response *http.Response, order http.HeaderOrder) err
 	if response == nil {
 		return errors.New("mitmproxy: nil response")
 	}
-	headers, err := normalizeResponseOrderNames(order.Headers, false)
+	override, err := normalizeSendingOrder(order, responseOrderPseudoHeaders)
 	if err != nil {
-		return fmt.Errorf("mitmproxy: invalid response header order: %w", err)
-	}
-	trailers, err := normalizeResponseOrderNames(order.Trailers, true)
-	if err != nil {
-		return fmt.Errorf("mitmproxy: invalid response trailer order: %w", err)
-	}
-	var override *http.HeaderOrder
-	if len(headers) > 0 || len(trailers) > 0 {
-		override = &http.HeaderOrder{Headers: headers, Trailers: trailers}
+		return fmt.Errorf("mitmproxy: invalid response %w", err)
 	}
 	key := weak.Make(response)
 	responseWireProfiles.Lock()
@@ -65,30 +58,4 @@ func SetResponseHeaderOrder(response *http.Response, order http.HeaderOrder) err
 	}
 	runtime.KeepAlive(response)
 	return nil
-}
-
-func normalizeResponseOrderNames(names []string, trailers bool) ([]string, error) {
-	if len(names) == 0 {
-		return nil, nil
-	}
-	result := make([]string, len(names))
-	seen := make(map[string]bool, len(names))
-	for i, name := range names {
-		// Validate ASCII token syntax before lowercasing, so non-ASCII input
-		// cannot become valid through Unicode case folding.
-		if strings.HasPrefix(name, ":") {
-			if trailers || i != 0 || strings.ToLower(name) != ":status" {
-				return nil, fmt.Errorf("invalid pseudo-header %q", name)
-			}
-		} else if !httpguts.ValidHeaderFieldName(name) || (trailers && !httpguts.ValidTrailerHeader(name)) {
-			return nil, fmt.Errorf("invalid field name %q", name)
-		}
-		name = strings.ToLower(name)
-		if seen[name] {
-			return nil, fmt.Errorf("duplicate field name %q", name)
-		}
-		seen[name] = true
-		result[i] = name
-	}
-	return result, nil
 }
