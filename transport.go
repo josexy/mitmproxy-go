@@ -90,8 +90,9 @@ func newTransport(
 func (t *singleConnTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = ensureRequestWireProfile(req)
 	if t.shouldUseHTTP2(req) {
-		return t.roundTripHTTP2(req)
+		return t.roundTripHTTP2(observeRequestSendHeaders(req, 2))
 	}
+	req = observeRequestSendHeaders(req, 1)
 	var err error
 	req, err = withRequestHeaderOrder(req)
 	if err != nil {

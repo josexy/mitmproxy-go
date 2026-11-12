@@ -254,7 +254,9 @@ Only traffic that protocol detection explicitly classifies as non-HTTP raw TCP i
 
 ### Header and trailer order
 
-An interceptor can set the downstream response wire order before returning a response. Non-empty `Headers` and `Trailers` slices override the corresponding block; an empty slice keeps the received order, including trailers that arrive after the response body reaches EOF:
+By default the proxy keeps the received header and trailer order. Changing a value with `Header.Set` keeps the field in place, and fields an interceptor adds follow the received ones in lowercase alphabetical order.
+
+To reorder, pass an `http.HeaderOrder`. Names listed in a non-empty `Headers` or `Trailers` slice are written first, in that order; other received fields keep their received order, and fields that were not received follow alphabetically. An empty slice keeps the received order for that block, an empty `HeaderOrder` clears an override, and names match case-insensitively. `Headers` may start with HTTP/2 pseudo-headers, which HTTP/1 ignores. Configure a response in place before the interceptor returns it:
 
 ```go
 if err := mitmproxy.SetResponseHeaderOrder(resp, http.HeaderOrder{
@@ -265,7 +267,7 @@ if err := mitmproxy.SetResponseHeaderOrder(resp, http.HeaderOrder{
 }
 ```
 
-The request side returns a request copy. Apply header changes first, then pass the returned request to the invoker:
+The request side returns a request copy; pass that copy to the invoker:
 
 ```go
 req.Header.Set("X-Debug", "1")
@@ -278,13 +280,26 @@ if err != nil {
 resp, err := invoker.Invoke(req)
 ```
 
+A request override travels in the request context, so derive later contexts from the returned request. A response override belongs to that response pointer, so configure a replacement response again. In interceptors, use these functions rather than xhttp's `WithRequestHeaderOrder` and `WithRequestHeaderBlocks`. The proxy computes the upstream order itself, so an xhttp order has no effect. The invoker rejects xhttp exact blocks because they would bypass header sanitization.
+
 Request trailer order is resolved after the streaming body reaches EOF, not from the earlier `Trailer` declaration. Declare request trailer names in the initial headers so the upstream writer can send them after the body. Before EOF, `RequestWireHeaderOrder` reports only the declaration order; after EOF, `RequestWireHeaderOrder` and `RequestWireHeaderBlocks` expose the trailer block actually received. These snapshots retain inbound metadata even when an interceptor edits the outgoing headers.
 
-### Exact header blocks
+### Header block layouts
 
-`WithRequestHeaderBlock(request, block)` and `SetResponseHeaderBlock(response, block)` set the outgoing initial header block via `xhttp.HeaderBlock`, preserving interleaved duplicates, empty values, and HTTP/1 casing. Set final `Header` values first: overrides match current values and append remaining fields deterministically. Hop-by-hop sanitization, Host and pseudo-header generation, and framing still apply; received wire metadata, body streaming, and late trailers are unchanged. HTTP/1 response heads that require exact reordering are limited to 64 KiB, and larger heads fail before sending. These overrides apply only to ordinary HTTP interception.
+HTTP/1 field names are written with the spelling of their `Header` key. `WithRequestHeaderBlock(request, block)` and `SetResponseHeaderBlock(response, block)` lay out the initial header block occurrence by occurrence instead, preserving interleaved duplicates, empty values, HTTP/1 casing, and HTTP/2 `Sensitive` flags. A block captured from either protocol with `RequestWireHeaderBlocks` or `ResponseWireHeaderBlocks` can be reused.
 
-`WithHTTPRequestSendHeaderObserver(request, callback)` requires an explicit `WithRequestHeaderBlock` override. It reports the final sanitized header block and the selected upstream protocol during transport preparation, not per-attempt timing or send completion.
+`Header` remains the source of values:
+
+- A value equal to a block field takes that position.
+- An edited value takes the next free position for its name.
+- A removed field is not restored.
+- Fields without a position follow the header order rules above.
+
+A layout can be combined with `WithRequestHeaderOrder` or `SetResponseHeaderOrder`. Hop-by-hop sanitization, Host and pseudo-header generation, and framing still apply. Received wire metadata, body streaming, and late trailers are unchanged.
+
+HTTP/1 response heads are reordered within a 64 KiB buffer. A larger head fails before sending if it has a layout; with only a header order, it is sent in serialization order. These overrides apply only to ordinary HTTP interception.
+
+`WithHTTPRequestSendHeaderObserver(request, callback)` reports every initial header block written upstream, with or without overrides. It runs once per write attempt, after the headers and before the body. Each report contains the sanitized fields as written and the selected protocol.
 
 ### TLS and HTTP/2 fingerprints
 

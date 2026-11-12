@@ -28,7 +28,8 @@ func TestSetResponseHeaderOrderPreservesWireMetadataAndLateTrailers(t *testing.T
 		t.Fatal(err)
 	}
 	requested.Headers[0], requested.Trailers[0] = "mutated", "mutated"
-	want := http.HeaderOrder{Headers: []string{"x-b", "x-a"}, Trailers: []string{"x-end-a", "x-end-b"}}
+	// Unlisted received names follow the override in received order.
+	want := http.HeaderOrder{Headers: []string{"x-b", "x-a", "transfer-encoding", "trailer"}, Trailers: []string{"x-end-a", "x-end-b"}}
 	if got := responseHeaderOrder(resp); !reflect.DeepEqual(got, want) {
 		t.Fatalf("outgoing order = %v; want %v", got, want)
 	}
@@ -50,7 +51,7 @@ func TestSetResponseHeaderOrderPreservesWireMetadataAndLateTrailers(t *testing.T
 	if err != nil || string(body) != "ok" {
 		t.Fatalf("body = %q, %v", body, err)
 	}
-	if got := responseHeaderOrder(resp); !slices.Equal(got.Headers, []string{"x-b"}) || !slices.Equal(got.Trailers, []string{"x-end-b", "x-end-a"}) {
+	if got := responseHeaderOrder(resp); !slices.Equal(got.Headers, []string{"x-b", "x-a", "transfer-encoding", "trailer"}) || !slices.Equal(got.Trailers, []string{"x-end-b", "x-end-a"}) {
 		t.Fatalf("order after EOF = %v", got)
 	}
 	wireOrder.Trailers = []string{"x-end-b", "x-end-a"}
@@ -60,7 +61,7 @@ func TestSetResponseHeaderOrderPreservesWireMetadataAndLateTrailers(t *testing.T
 	if err := SetResponseHeaderOrder(resp, http.HeaderOrder{Trailers: []string{"x-end-a"}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := responseHeaderOrder(resp); !slices.Equal(got.Headers, wireOrder.Headers) || !slices.Equal(got.Trailers, []string{"x-end-a"}) {
+	if got := responseHeaderOrder(resp); !slices.Equal(got.Headers, wireOrder.Headers) || !slices.Equal(got.Trailers, []string{"x-end-a", "x-end-b"}) {
 		t.Fatalf("trailer-only override = %v", got)
 	}
 	if err := SetResponseHeaderOrder(resp, http.HeaderOrder{}); err != nil {
