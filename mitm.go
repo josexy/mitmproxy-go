@@ -220,6 +220,11 @@ type biConnContext struct {
 	remoteDialMu sync.Mutex
 	remoteDialFn func(context.Context, string, string) (net.Conn, error)
 
+	// An IP tunnel without SNI learns one domain authority from its first
+	// accepted domain request. HTTP/2 streams may race to establish it.
+	tunnelAuthorityMu sync.Mutex
+	tunnelAuthority   string
+
 	// transport is replaced when a plain proxy connection is reused for a new
 	// origin, and it is read by Cleanup from another goroutine.
 	transport atomic.Pointer[singleConnTransport]
@@ -1534,8 +1539,8 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 	// Only a plain proxy connection carries absolute-URI requests that the
 	// client may point at any origin. A CONNECT tunnel, a SOCKS5 connection and
 	// a transparent connection are all pinned to the target their client
-	// selected out of band, so for those a changing authority is a request
-	// smuggling attempt rather than ordinary connection reuse.
+	// selected out of band. An IP target may have a domain authority, but that
+	// alias must not change the dial target or permit arbitrary origin changes.
 	canRetarget := consumedRequest && !reqCtx.HttpConnectMethod && !reqCtx.Socks5Connect
 	if connCtx.config.state.http1PipelineDepth > 1 {
 		return r.serveHTTP1Pipeline(ctx, fakerw, request, tlsRequest, firstRead, canRetarget, srcConn)
@@ -1557,7 +1562,7 @@ func (r *mitmProxyHandler) handleTunnelRequest(ctx context.Context, consumedRequ
 		firstRead = false
 
 		nextReqCtx, _ := FromRequestContext(nextCtx)
-		if !requestMatchesHostport(nextReqCtx.Request, reqCtx.Hostport) {
+		if !connCtx.requestMatchesTarget(nextReqCtx.Request, reqCtx.Hostport, canRetarget) {
 			if !canRetarget {
 				writeHTTP1ErrorResponse(srcConn, http.StatusMisdirectedRequest)
 				return fmt.Errorf("http keep-alive target changed from %s to %s", reqCtx.Hostport, nextReqCtx.Request.Host)
@@ -2091,13 +2096,69 @@ func requestMatchesHostport(req *http.Request, hostport string) bool {
 	if !strings.EqualFold(requestHost, host) {
 		return false
 	}
-	if requestPort == "" {
-		requestPort = "80"
-		if req.TLS != nil || (req.URL != nil && (strings.EqualFold(req.URL.Scheme, "https") || strings.EqualFold(req.URL.Scheme, "wss"))) {
-			requestPort = "443"
-		}
+	return port == effectiveRequestPort(req, requestPort)
+}
+
+func effectiveRequestPort(req *http.Request, port string) string {
+	if port != "" {
+		return port
 	}
-	return port == requestPort
+	if req.TLS != nil || (req.URL != nil && (strings.EqualFold(req.URL.Scheme, "https") || strings.EqualFold(req.URL.Scheme, "wss"))) {
+		return "443"
+	}
+	return "80"
+}
+
+// requestMatchesTarget keeps plain proxy routing strict while allowing an IP
+// tunnel's HTTP authority to name the virtual host at that address. The alias
+// is used only for validation: dialing, filtering and metadata retain hostport.
+func (c *biConnContext) requestMatchesTarget(req *http.Request, hostport string, canRetarget bool) bool {
+	if requestMatchesHostport(req, hostport) {
+		return true
+	}
+	if canRetarget || req == nil {
+		return false
+	}
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil || net.ParseIP(host) == nil {
+		return false
+	}
+	domain, requestPort := requestDomainAuthority(req)
+	if domain == "" || requestPort != port {
+		return false
+	}
+	if c.clientHello != nil && c.clientHello.info != nil && c.clientHello.info.ServerName != "" {
+		serverName, err := canonicalizeDomainHost(c.clientHello.info.ServerName)
+		return err == nil && domain == serverName
+	}
+	c.tunnelAuthorityMu.Lock()
+	defer c.tunnelAuthorityMu.Unlock()
+	if c.tunnelAuthority == "" {
+		c.tunnelAuthority = domain
+	}
+	return domain == c.tunnelAuthority
+}
+
+// requestDomainAuthority parses a domain with an optional port. Unlike
+// SplitHostPort, it retains brackets so domain validation rejects [example.com].
+// An empty domain signals an invalid authority or an IP literal.
+func requestDomainAuthority(req *http.Request) (domain, port string) {
+	authority := req.Host
+	if authority == "" && req.URL != nil {
+		authority = req.URL.Host
+	}
+	host, port, explicitPort := strings.Cut(authority, ":")
+	if (explicitPort && port == "") || host != strings.TrimSpace(host) {
+		return "", ""
+	}
+	domain, err := canonicalizeDomainHost(host)
+	if err != nil {
+		return "", ""
+	}
+	if _, err := netip.ParseAddr(domain); err == nil {
+		return "", ""
+	}
+	return domain, effectiveRequestPort(req, port)
 }
 
 func splitHostOptionalPort(hostport string) (string, string) {
@@ -2973,7 +3034,7 @@ func (r *mitmProxyHandler) serveHTTP2Handler(ctx context.Context) http.Handler {
 		streamCtx := cloneMetadataContext(ctx)
 		md, _ := metadata.FromContext(streamCtx)
 		md.SetRequestReceivedTs(timingClockFromContext(streamCtx).Now())
-		if !requestMatchesHostport(req, reqCtx.Hostport) {
+		if !connCtx.requestMatchesTarget(req, reqCtx.Hostport, false) {
 			err := fmt.Errorf("http2 authority %q does not match connection target %q", req.Host, reqCtx.Hostport)
 			handleErrorWithConfig(connCtx.config, ErrorContext{
 				Hostport:   reqCtx.Hostport,

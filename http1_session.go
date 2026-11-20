@@ -486,7 +486,7 @@ func (r *mitmProxyHandler) serveHTTP1Pipeline(
 
 		nextReqCtx, _ := FromRequestContext(nextCtx)
 		hostport := baseReqCtx.Hostport
-		if !requestMatchesHostport(nextReqCtx.Request, hostport) {
+		if !connCtx.requestMatchesTarget(nextReqCtx.Request, hostport, canRetarget) {
 			if !canRetarget {
 				<-slots
 				_ = waitWriter()
